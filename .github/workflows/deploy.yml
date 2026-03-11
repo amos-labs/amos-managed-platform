@@ -109,6 +109,7 @@ jobs:
           cache-on-failure: true
 
       - name: Wait for PostgreSQL to be ready
+        timeout-minutes: 2
         run: |
           until pg_isready -h localhost -p 5432 -U amos; do
             echo "Waiting for PostgreSQL..."
@@ -117,10 +118,21 @@ jobs:
         env:
           PGPASSWORD: amos_test_password
 
+      - name: Install Redis CLI
+        run: sudo apt-get update && sudo apt-get install -y redis-tools
+
       - name: Wait for Redis to be ready
+        timeout-minutes: 2
         run: |
-          until redis-cli -h localhost -p 6379 ping; do
-            echo "Waiting for Redis..."
+          RETRIES=0
+          MAX_RETRIES=30
+          until redis-cli -h localhost -p 6379 ping 2>/dev/null; do
+            RETRIES=$((RETRIES + 1))
+            if [ $RETRIES -ge $MAX_RETRIES ]; then
+              echo "Redis failed to become ready after $MAX_RETRIES attempts"
+              exit 1
+            fi
+            echo "Waiting for Redis... ($RETRIES/$MAX_RETRIES)"
             sleep 2
           done
 
