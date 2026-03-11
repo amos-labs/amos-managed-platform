@@ -1,4 +1,8 @@
 //! Solana RPC client for on-chain integration.
+//!
+//! The Solana client error type is large (264 bytes) but comes from an external
+//! crate we can't control. Suppressing the lint at the module level.
+#![allow(clippy::result_large_err)]
 
 use amos_core::{AmosError, Result};
 use chrono::{DateTime, Utc};
