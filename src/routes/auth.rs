@@ -2,21 +2,14 @@
 //!
 //! All endpoints return structured JSON with clear error messages for agent consumption.
 
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    routing::post,
-    Json, Router,
-};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router};
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    auth::{self, TokenPair},
+    auth::{self},
     state::PlatformState,
 };
 
@@ -120,7 +113,10 @@ async fn register(
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(AuthError {
-                error: format!("Invalid plan '{}'. Valid plans: {:?}.", req.plan, valid_plans),
+                error: format!(
+                    "Invalid plan '{}'. Valid plans: {:?}.",
+                    req.plan, valid_plans
+                ),
                 code: "validation_error",
                 field: Some("plan"),
                 hint: Some("Use one of: free, starter, growth, enterprise.".into()),
@@ -162,7 +158,7 @@ async fn register(
     // ── Create tenant ───────────────────────────────────────────────
     let tenant_id = Uuid::new_v4();
     let result = sqlx::query(
-        "INSERT INTO tenants (id, name, slug, plan, subdomain) VALUES ($1, $2, $3, $4, $5)"
+        "INSERT INTO tenants (id, name, slug, plan, subdomain) VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(tenant_id)
     .bind(&req.organization_name)
@@ -207,7 +203,7 @@ async fn register(
     let user_id = Uuid::new_v4();
     let user_result = sqlx::query(
         "INSERT INTO users (id, tenant_id, email, name, password_hash, role, email_verified)
-         VALUES ($1, $2, $3, $4, $5, 'owner', TRUE)"
+         VALUES ($1, $2, $3, $4, $5, 'owner', TRUE)",
     )
     .bind(user_id)
     .bind(tenant_id)
@@ -228,10 +224,15 @@ async fn register(
             return Err((
                 StatusCode::CONFLICT,
                 Json(AuthError {
-                    error: format!("Email '{}' is already registered for this organization.", req.email),
+                    error: format!(
+                        "Email '{}' is already registered for this organization.",
+                        req.email
+                    ),
                     code: "email_conflict",
                     field: Some("email"),
-                    hint: Some("Use POST /api/v1/auth/login to sign in, or use a different email.".into()),
+                    hint: Some(
+                        "Use POST /api/v1/auth/login to sign in, or use a different email.".into(),
+                    ),
                 }),
             ));
         }
@@ -256,7 +257,7 @@ async fn register(
     let harness_id = Uuid::new_v4();
     let _ = sqlx::query(
         "INSERT INTO harness_instances (id, tenant_id, subdomain, status)
-         VALUES ($1, $2, $3, 'pending')"
+         VALUES ($1, $2, $3, 'pending')",
     )
     .bind(harness_id)
     .bind(tenant_id)
@@ -321,7 +322,12 @@ async fn register(
     let access_expiry = state.config.auth.access_token_expiry_secs as i64;
 
     let access_token = auth::create_access_token(
-        user_id, tenant_id, "owner", &slug, &jwt_secret, access_expiry,
+        user_id,
+        tenant_id,
+        "owner",
+        &slug,
+        &jwt_secret,
+        access_expiry,
     )
     .map_err(|e| {
         error!("Token creation failed: {}", e);
@@ -342,7 +348,7 @@ async fn register(
 
     // Store refresh token hash
     let _ = sqlx::query(
-        "INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)"
+        "INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)",
     )
     .bind(user_id)
     .bind(&refresh_hash)
@@ -407,7 +413,7 @@ async fn login(
         "SELECT u.id, u.tenant_id, u.password_hash, u.role, t.slug, u.is_active
          FROM users u JOIN tenants t ON u.tenant_id = t.id
          WHERE u.email = $1
-         LIMIT 1"
+         LIMIT 1",
     )
     .bind(&req.email)
     .fetch_optional(&state.db)
@@ -490,7 +496,12 @@ async fn login(
     let refresh_expiry = state.config.auth.refresh_token_expiry_secs as i64;
 
     let access_token = auth::create_access_token(
-        user_id, tenant_id, &role, &tenant_slug, &jwt_secret, access_expiry,
+        user_id,
+        tenant_id,
+        &role,
+        &tenant_slug,
+        &jwt_secret,
+        access_expiry,
     )
     .map_err(|e| {
         error!("Token creation failed: {}", e);
@@ -509,7 +520,7 @@ async fn login(
     let refresh_hash = auth::hash_token(&refresh_token);
 
     let _ = sqlx::query(
-        "INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)"
+        "INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)",
     )
     .bind(user_id)
     .bind(&refresh_hash)
@@ -549,7 +560,7 @@ async fn refresh(
         "SELECT rt.user_id, rt.id, rt.revoked
          FROM refresh_tokens rt
          WHERE rt.token_hash = $1 AND rt.expires_at > NOW()
-         LIMIT 1"
+         LIMIT 1",
     )
     .bind(&token_hash)
     .fetch_optional(&state.db)
@@ -611,7 +622,7 @@ async fn refresh(
     let user_row = sqlx::query_as::<_, (Uuid, String, String)>(
         "SELECT u.tenant_id, u.role, t.slug
          FROM users u JOIN tenants t ON u.tenant_id = t.id
-         WHERE u.id = $1 AND u.is_active = TRUE"
+         WHERE u.id = $1 AND u.is_active = TRUE",
     )
     .bind(user_id)
     .fetch_optional(&state.db)
@@ -650,7 +661,12 @@ async fn refresh(
     let refresh_expiry = state.config.auth.refresh_token_expiry_secs as i64;
 
     let access_token = auth::create_access_token(
-        user_id, tenant_id, &role, &tenant_slug, &jwt_secret, access_expiry,
+        user_id,
+        tenant_id,
+        &role,
+        &tenant_slug,
+        &jwt_secret,
+        access_expiry,
     )
     .map_err(|e| {
         error!("Token creation failed: {}", e);
@@ -669,7 +685,7 @@ async fn refresh(
     let new_refresh_hash = auth::hash_token(&new_refresh_token);
 
     let _ = sqlx::query(
-        "INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)"
+        "INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)",
     )
     .bind(user_id)
     .bind(&new_refresh_hash)
@@ -722,10 +738,5 @@ async fn logout(
 
 fn get_jwt_secret(state: &PlatformState) -> String {
     use secrecy::ExposeSecret;
-    state
-        .config
-        .auth
-        .jwt_secret
-        .expose_secret()
-        .to_string()
+    state.config.auth.jwt_secret.expose_secret().to_string()
 }

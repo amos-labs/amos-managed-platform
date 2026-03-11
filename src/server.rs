@@ -2,7 +2,7 @@
 
 use crate::{middleware, routes, state::PlatformState, Result};
 use axum::{
-    http::{header, Method},
+    http::{header, Method, StatusCode},
     Router,
 };
 use std::time::Duration;
@@ -56,7 +56,10 @@ pub fn build_http_router(state: PlatformState) -> Router {
             ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())
                 .layer(CompressionLayer::new())
-                .layer(TimeoutLayer::new(Duration::from_secs(30)))
+                .layer(TimeoutLayer::with_status_code(
+                    StatusCode::REQUEST_TIMEOUT,
+                    Duration::from_secs(30),
+                ))
                 .layer(
                     CorsLayer::new()
                         .allow_origin(Any)
@@ -73,7 +76,10 @@ pub fn build_http_router(state: PlatformState) -> Router {
 /// TODO: Implement gRPC service definitions using tonic.
 /// For now, this is a placeholder that binds the port.
 pub async fn start_grpc_server(state: PlatformState) -> Result<()> {
-    let addr = format!("{}:{}", state.config.server.host, state.config.server.grpc_port);
+    let addr = format!(
+        "{}:{}",
+        state.config.server.host, state.config.server.grpc_port
+    );
     info!("gRPC server would start on {} (not yet implemented)", addr);
 
     // TODO: Add tonic server with HarnessService implementation

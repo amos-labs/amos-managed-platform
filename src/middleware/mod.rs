@@ -19,10 +19,7 @@ use crate::state::PlatformState;
 /// Global error handler middleware.
 ///
 /// Maps AmosError variants to appropriate HTTP status codes and JSON responses.
-pub async fn error_handler(
-    req: Request<axum::body::Body>,
-    next: Next,
-) -> Response {
+pub async fn error_handler(req: Request<axum::body::Body>, next: Next) -> Response {
     next.run(req).await
 }
 
@@ -42,8 +39,8 @@ impl IntoResponse for ErrorResponse {
 }
 
 pub fn amos_error_to_response(err: &AmosError) -> (StatusCode, Json<ErrorResponse>) {
-    let status = StatusCode::from_u16(err.status_code())
-        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let status =
+        StatusCode::from_u16(err.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
     let code = match &err {
         AmosError::Unauthorized(_) => "unauthorized",
@@ -94,7 +91,8 @@ pub async fn require_api_key(
                     code: "unauthorized".into(),
                     details: Some("Provide 'Authorization: Bearer <token>' header".into()),
                 }),
-            ).into_response();
+            )
+                .into_response();
         }
     };
 
@@ -108,7 +106,10 @@ pub async fn require_api_key(
         }
         Err(e) => {
             // JWT validation failed, log and try API key
-            error!("JWT validation failed: {}, attempting API key validation", e);
+            error!(
+                "JWT validation failed: {}, attempting API key validation",
+                e
+            );
         }
     }
 
@@ -118,7 +119,7 @@ pub async fn require_api_key(
     let api_key_result = sqlx::query_as::<_, (Uuid, Uuid, Uuid)>(
         "SELECT id, tenant_id, created_by FROM api_keys
          WHERE key_hash = $1 AND is_active = TRUE
-         AND (expires_at IS NULL OR expires_at > NOW())"
+         AND (expires_at IS NULL OR expires_at > NOW())",
     )
     .bind(&key_hash)
     .fetch_optional(&state.db)
@@ -130,9 +131,9 @@ pub async fn require_api_key(
             let user_result = sqlx::query_as::<_, (String, String)>(
                 "SELECT u.role, t.slug FROM users u
                  JOIN tenants t ON u.tenant_id = t.id
-                 WHERE u.id = $1"
+                 WHERE u.id = $1",
             )
-            .bind(&created_by_user_id)
+            .bind(created_by_user_id)
             .fetch_optional(&state.db)
             .await;
 
@@ -142,12 +143,11 @@ pub async fn require_api_key(
                     let db_clone = state.db.clone();
                     let key_id = api_key_id;
                     tokio::spawn(async move {
-                        let _ = sqlx::query(
-                            "UPDATE api_keys SET last_used_at = NOW() WHERE id = $1"
-                        )
-                        .bind(key_id)
-                        .execute(&db_clone)
-                        .await;
+                        let _ =
+                            sqlx::query("UPDATE api_keys SET last_used_at = NOW() WHERE id = $1")
+                                .bind(key_id)
+                                .execute(&db_clone)
+                                .await;
                     });
 
                     // Create synthetic Claims for API key
@@ -164,7 +164,10 @@ pub async fn require_api_key(
                     return next.run(req).await;
                 }
                 Ok(None) => {
-                    error!("API key references non-existent user: {}", created_by_user_id);
+                    error!(
+                        "API key references non-existent user: {}",
+                        created_by_user_id
+                    );
                 }
                 Err(e) => {
                     error!("Database error fetching user for API key: {}", e);
@@ -187,17 +190,15 @@ pub async fn require_api_key(
             code: "unauthorized".into(),
             details: Some("Provide a valid JWT access token or API key".into()),
         }),
-    ).into_response()
+    )
+        .into_response()
 }
 
 /// Admin authentication middleware.
 ///
 /// Requires that the user has admin or owner role.
 /// Must be chained after `require_api_key` which injects Claims.
-pub async fn require_admin(
-    mut req: Request<axum::body::Body>,
-    next: Next,
-) -> Response {
+pub async fn require_admin(req: Request<axum::body::Body>, next: Next) -> Response {
     // Extract Claims from request extensions (inserted by require_api_key)
     let claims = match req.extensions().get::<Claims>() {
         Some(c) => c.clone(),
@@ -210,7 +211,8 @@ pub async fn require_admin(
                     code: "unauthorized".into(),
                     details: Some("Missing authentication credentials".into()),
                 }),
-            ).into_response();
+            )
+                .into_response();
         }
     };
 
@@ -221,9 +223,13 @@ pub async fn require_admin(
             Json(ErrorResponse {
                 error: "Insufficient permissions".into(),
                 code: "forbidden".into(),
-                details: Some(format!("Requires 'admin' or 'owner' role, but user has '{}' role", claims.role)),
+                details: Some(format!(
+                    "Requires 'admin' or 'owner' role, but user has '{}' role",
+                    claims.role
+                )),
             }),
-        ).into_response();
+        )
+            .into_response();
     }
 
     // User is admin/owner, proceed
@@ -255,7 +261,8 @@ pub async fn require_harness_auth(
                     code: "unauthorized".into(),
                     details: Some("Provide 'X-Harness-Token' header".into()),
                 }),
-            ).into_response();
+            )
+                .into_response();
         }
     };
 
@@ -272,7 +279,8 @@ pub async fn require_harness_auth(
                     code: "unauthorized".into(),
                     details: Some(format!("Token validation error: {}", e)),
                 }),
-            ).into_response();
+            )
+                .into_response();
         }
     };
 
@@ -288,13 +296,14 @@ pub async fn require_harness_auth(
                     code: "unauthorized".into(),
                     details: None,
                 }),
-            ).into_response();
+            )
+                .into_response();
         }
     };
 
     let harness_check = sqlx::query_as::<_, (i64,)>(
         "SELECT 1 FROM harness_instances
-         WHERE tenant_id = $1 AND status != 'deprovisioned'"
+         WHERE tenant_id = $1 AND status != 'deprovisioned'",
     )
     .bind(tenant_id)
     .fetch_optional(&state.db)
@@ -307,7 +316,10 @@ pub async fn require_harness_auth(
             next.run(req).await
         }
         Ok(None) => {
-            error!("Harness token references non-existent or deprovisioned harness for tenant {}", tenant_id);
+            error!(
+                "Harness token references non-existent or deprovisioned harness for tenant {}",
+                tenant_id
+            );
             (
                 StatusCode::UNAUTHORIZED,
                 Json(ErrorResponse {
@@ -315,7 +327,8 @@ pub async fn require_harness_auth(
                     code: "unauthorized".into(),
                     details: None,
                 }),
-            ).into_response()
+            )
+                .into_response()
         }
         Err(e) => {
             error!("Database error verifying harness instance: {}", e);
@@ -326,7 +339,8 @@ pub async fn require_harness_auth(
                     code: "internal_error".into(),
                     details: None,
                 }),
-            ).into_response()
+            )
+                .into_response()
         }
     }
 }

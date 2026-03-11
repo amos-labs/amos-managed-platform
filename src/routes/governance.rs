@@ -18,7 +18,10 @@ use crate::{governance::*, state::PlatformState};
 
 pub fn routes() -> Router<PlatformState> {
     Router::new()
-        .route("/governance/proposals", get(list_proposals).post(create_proposal))
+        .route(
+            "/governance/proposals",
+            get(list_proposals).post(create_proposal),
+        )
         .route("/governance/proposals/{id}", get(get_proposal))
         .route("/governance/proposals/{id}/vote", post(cast_vote))
         .route("/governance/proposals/{id}/gates", get(get_gates))
@@ -60,7 +63,10 @@ async fn list_proposals(State(state): State<PlatformState>) -> impl IntoResponse
     {
         Ok(rows) => rows,
         Err(e) => {
-            warn!("Failed to query proposals from DB (table may not exist): {}", e);
+            warn!(
+                "Failed to query proposals from DB (table may not exist): {}",
+                e
+            );
             vec![]
         }
     };
@@ -180,7 +186,10 @@ async fn create_proposal(
                 return Err(StatusCode::FORBIDDEN);
             }
             Err(e) => {
-                warn!("Failed to fetch stake record for {}: {}", req.proposer_wallet, e);
+                warn!(
+                    "Failed to fetch stake record for {}: {}",
+                    req.proposer_wallet, e
+                );
                 // Continue in dev mode even if Solana fails
             }
         }
@@ -217,7 +226,10 @@ async fn create_proposal(
     {
         Ok(_) => {}
         Err(e) => {
-            warn!("Failed to insert proposal into DB (table may not exist): {}", e);
+            warn!(
+                "Failed to insert proposal into DB (table may not exist): {}",
+                e
+            );
             // Continue anyway in dev mode
         }
     }
@@ -281,7 +293,10 @@ async fn get_proposal(
         Ok(Some(row)) => row,
         Ok(None) => return Err(StatusCode::NOT_FOUND),
         Err(e) => {
-            warn!("Failed to query proposal from DB (table may not exist): {}", e);
+            warn!(
+                "Failed to query proposal from DB (table may not exist): {}",
+                e
+            );
             return Err(StatusCode::NOT_FOUND);
         }
     };
@@ -413,7 +428,10 @@ async fn cast_vote(
                 return Err(StatusCode::FORBIDDEN);
             }
             Err(e) => {
-                warn!("Failed to fetch stake record for {}: {}", req.voter_wallet, e);
+                warn!(
+                    "Failed to fetch stake record for {}: {}",
+                    req.voter_wallet, e
+                );
                 // In dev mode, assign default weight
                 1000
             }
@@ -451,7 +469,10 @@ async fn cast_vote(
         .unwrap_or(ProposalStatus::Draft);
 
     if status != ProposalStatus::Active {
-        warn!("Proposal {} is not in Active status: {:?}", proposal_id, status);
+        warn!(
+            "Proposal {} is not in Active status: {:?}",
+            proposal_id, status
+        );
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -609,7 +630,7 @@ async fn get_gates(
     }
 
     // Define all required gates
-    let all_gate_types = vec![
+    let all_gate_types = [
         ("benchmark", QualityGate::Benchmark),
         ("ab_test", QualityGate::AbTest),
         ("feedback", QualityGate::CustomerFeedback),

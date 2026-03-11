@@ -102,7 +102,7 @@ pub struct Vote {
     pub id: Uuid,
     pub proposal_id: Uuid,
     pub voter_wallet: String,
-    pub weight: u64, // Voting power (stake amount)
+    pub weight: u64,   // Voting power (stake amount)
     pub support: bool, // true = for, false = against
     pub timestamp: DateTime<Utc>,
     /// If this vote was delegated.
@@ -168,7 +168,7 @@ impl Proposal {
     /// Check if proposal has passed quorum and majority.
     pub fn has_passed(&self) -> bool {
         // TODO: Load quorum/threshold from on-chain config
-        const QUORUM_BPS: u64 = 1_000; // 10% of total stake must vote
+        const _QUORUM_BPS: u64 = 1_000; // 10% of total stake must vote
         const THRESHOLD_BPS: u64 = 5_000; // 50% of votes must be for
 
         let total_votes = self.votes_for + self.votes_against;
@@ -192,7 +192,7 @@ mod tests {
 
     #[test]
     fn proposal_status_transitions() {
-        let mut proposal = Proposal {
+        let proposal = Proposal {
             id: Uuid::new_v4(),
             title: "Test Proposal".into(),
             description: "Test".into(),
@@ -210,7 +210,9 @@ mod tests {
             milestone_plan: None,
         };
 
-        assert!(proposal.can_transition_to(ProposalStatus::Submitted).is_ok());
+        assert!(proposal
+            .can_transition_to(ProposalStatus::Submitted)
+            .is_ok());
         assert!(proposal.can_transition_to(ProposalStatus::Merged).is_err());
     }
 

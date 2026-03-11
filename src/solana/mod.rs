@@ -50,10 +50,8 @@ impl SolanaClient {
         governance_program_id: &str,
         bounty_program_id: &str,
     ) -> Result<Self> {
-        let rpc = RpcClient::new_with_commitment(
-            rpc_url.to_string(),
-            CommitmentConfig::confirmed(),
-        );
+        let rpc =
+            RpcClient::new_with_commitment(rpc_url.to_string(), CommitmentConfig::confirmed());
 
         let treasury_program_id = Pubkey::from_str(treasury_program_id)
             .map_err(|e| AmosError::SolanaRpc(format!("Invalid treasury program ID: {}", e)))?;
@@ -83,10 +81,7 @@ impl SolanaClient {
         // Spawn blocking since RPC client is sync
         let rpc_url = self.rpc_url.clone();
         tokio::task::spawn_blocking(move || {
-            let rpc = RpcClient::new_with_commitment(
-                rpc_url,
-                CommitmentConfig::confirmed(),
-            );
+            let rpc = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
             rpc.get_health()
                 .map_err(|e| AmosError::SolanaRpc(format!("Health check failed: {}", e)))
         })
@@ -107,10 +102,7 @@ impl SolanaClient {
     ///
     /// PDA = findProgramAddress([b"stake_record", wallet_pubkey], treasury_program_id)
     pub fn derive_stake_record_pda(&self, wallet: &Pubkey) -> (Pubkey, u8) {
-        Pubkey::find_program_address(
-            &[STAKE_RECORD, wallet.as_ref()],
-            &self.treasury_program_id,
-        )
+        Pubkey::find_program_address(&[STAKE_RECORD, wallet.as_ref()], &self.treasury_program_id)
     }
 
     /// Get the treasury state from on-chain program.
@@ -130,12 +122,10 @@ impl SolanaClient {
         let (treasury_config_pda, _bump) = self.derive_treasury_config_pda();
 
         let rpc = self.rpc.clone();
-        let account = tokio::task::spawn_blocking(move || {
-            rpc.get_account(&treasury_config_pda)
-        })
-        .await
-        .map_err(|e| AmosError::Internal(format!("Tokio join error: {}", e)))?
-        .map_err(|e| AmosError::SolanaRpc(format!("Failed to fetch treasury config: {}", e)))?;
+        let account = tokio::task::spawn_blocking(move || rpc.get_account(&treasury_config_pda))
+            .await
+            .map_err(|e| AmosError::Internal(format!("Tokio join error: {}", e)))?
+            .map_err(|e| AmosError::SolanaRpc(format!("Failed to fetch treasury config: {}", e)))?;
 
         // Verify the account has enough data (8-byte discriminator + 7 * 8 bytes)
         const MIN_SIZE: usize = 8 + 7 * 8;
@@ -181,11 +171,10 @@ impl SolanaClient {
         let (stake_record_pda, _bump) = self.derive_stake_record_pda(&wallet_pubkey);
 
         let rpc = self.rpc.clone();
-        let account_result = tokio::task::spawn_blocking(move || {
-            rpc.get_account(&stake_record_pda)
-        })
-        .await
-        .map_err(|e| AmosError::Internal(format!("Tokio join error: {}", e)))?;
+        let account_result =
+            tokio::task::spawn_blocking(move || rpc.get_account(&stake_record_pda))
+                .await
+                .map_err(|e| AmosError::Internal(format!("Tokio join error: {}", e)))?;
 
         // If account doesn't exist, return None
         let account = match account_result {
@@ -225,8 +214,9 @@ impl SolanaClient {
             amount,
             staked_at: DateTime::from_timestamp(staked_at, 0)
                 .ok_or_else(|| AmosError::SolanaRpc("Invalid staked_at timestamp".to_string()))?,
-            last_decay_at: DateTime::from_timestamp(last_decay_at, 0)
-                .ok_or_else(|| AmosError::SolanaRpc("Invalid last_decay_at timestamp".to_string()))?,
+            last_decay_at: DateTime::from_timestamp(last_decay_at, 0).ok_or_else(|| {
+                AmosError::SolanaRpc("Invalid last_decay_at timestamp".to_string())
+            })?,
             vault_tier,
             delegated_to,
         }))
@@ -271,7 +261,9 @@ impl SolanaClient {
         })
         .await
         .map_err(|e| AmosError::Internal(format!("Tokio join error: {}", e)))?
-        .map_err(|e| AmosError::SolanaRpc(format!("Failed to fetch governance proposals: {}", e)))?;
+        .map_err(|e| {
+            AmosError::SolanaRpc(format!("Failed to fetch governance proposals: {}", e))
+        })?;
 
         let mut proposals = Vec::new();
 
@@ -335,7 +327,9 @@ impl SolanaClient {
         contributor: &str,
         evidence_hash: [u8; 32],
     ) -> Result<String> {
-        let authority = self.authority_keypair.as_ref()
+        let authority = self
+            .authority_keypair
+            .as_ref()
             .ok_or_else(|| AmosError::SolanaRpc("Authority keypair not set".to_string()))?;
 
         let contributor_pubkey = Pubkey::from_str(contributor)
@@ -375,12 +369,10 @@ impl SolanaClient {
         let authority_pubkey = authority.pubkey();
 
         // Get recent blockhash
-        let recent_blockhash = tokio::task::spawn_blocking(move || {
-            rpc.get_latest_blockhash()
-        })
-        .await
-        .map_err(|e| AmosError::Internal(format!("Tokio join error: {}", e)))?
-        .map_err(|e| AmosError::SolanaRpc(format!("Failed to get recent blockhash: {}", e)))?;
+        let recent_blockhash = tokio::task::spawn_blocking(move || rpc.get_latest_blockhash())
+            .await
+            .map_err(|e| AmosError::Internal(format!("Tokio join error: {}", e)))?
+            .map_err(|e| AmosError::SolanaRpc(format!("Failed to get recent blockhash: {}", e)))?;
 
         // Build and sign transaction
         let message = Message::new(&[instruction], Some(&authority_pubkey));
@@ -389,12 +381,13 @@ impl SolanaClient {
 
         // Send transaction
         let rpc = self.rpc.clone();
-        let signature = tokio::task::spawn_blocking(move || {
-            rpc.send_and_confirm_transaction(&transaction)
-        })
-        .await
-        .map_err(|e| AmosError::Internal(format!("Tokio join error: {}", e)))?
-        .map_err(|e| AmosError::SolanaRpc(format!("Failed to submit bounty proof: {}", e)))?;
+        let signature =
+            tokio::task::spawn_blocking(move || rpc.send_and_confirm_transaction(&transaction))
+                .await
+                .map_err(|e| AmosError::Internal(format!("Tokio join error: {}", e)))?
+                .map_err(|e| {
+                    AmosError::SolanaRpc(format!("Failed to submit bounty proof: {}", e))
+                })?;
 
         Ok(signature.to_string())
     }
@@ -484,8 +477,8 @@ mod tests {
         assert_eq!(pda, pda2);
         assert_eq!(bump, bump2);
 
-        // Verify bump is valid (0-255)
-        assert!(bump <= 255);
+        // Verify bump is valid (u8 is inherently 0-255)
+        let _ = bump; // bump is a u8, so always valid
     }
 
     #[test]

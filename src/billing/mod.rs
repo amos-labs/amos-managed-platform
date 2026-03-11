@@ -75,7 +75,7 @@ impl Plan {
         match self {
             Plan::Free => 0,
             Plan::Starter => 99_00,
-            Plan::Growth => 499_00,
+            Plan::Growth => 49_900,
             Plan::Enterprise => 0, // Custom pricing
         }
     }
@@ -176,8 +176,8 @@ pub struct ComputeUsageRecord {
     pub model_name: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
-    pub cost_usd_cents: u64,     // Raw AWS cost
-    pub charge_usd_cents: u64,   // Customer charge (cost * 1.20)
+    pub cost_usd_cents: u64,        // Raw AWS cost
+    pub charge_usd_cents: u64,      // Customer charge (cost * 1.20)
     pub customer_owned_model: bool, // Sovereign AI: true if customer-owned infrastructure
     pub timestamp: DateTime<Utc>,
 }
@@ -200,11 +200,7 @@ pub struct BillingSummary {
 
 /// Calculate AI cost from token usage.
 /// Returns cost in USD cents.
-pub fn calculate_ai_cost(
-    input_tokens: u64,
-    output_tokens: u64,
-    pricing: &ModelPricing,
-) -> u64 {
+pub fn calculate_ai_cost(input_tokens: u64, output_tokens: u64, pricing: &ModelPricing) -> u64 {
     let input_cost = (input_tokens as f64 / 1_000_000.0) * pricing.input_rate_per_million;
     let output_cost = (output_tokens as f64 / 1_000_000.0) * pricing.output_rate_per_million;
     let total_usd = input_cost + output_cost;
@@ -235,10 +231,7 @@ pub fn calculate_billing_summary(
     let subscription_charge_cents = subscription.plan.monthly_price_cents();
 
     // Calculate total compute charges
-    let compute_charges_cents: u64 = compute_records
-        .iter()
-        .map(|r| r.charge_usd_cents)
-        .sum();
+    let compute_charges_cents: u64 = compute_records.iter().map(|r| r.charge_usd_cents).sum();
 
     // Total before discount
     let total_charges_cents = subscription_charge_cents + compute_charges_cents;
@@ -246,7 +239,8 @@ pub fn calculate_billing_summary(
     // Apply AMOS discount if paying with tokens
     let (discount_amount_cents, final_amount_cents) = if pay_with_amos {
         // AMOS_DISCOUNT_BPS is 2000 (20%) - apply to total
-        let discount = (total_charges_cents as f64 * (AMOS_DISCOUNT_BPS as f64 / 10_000.0)).round() as u64;
+        let discount =
+            (total_charges_cents as f64 * (AMOS_DISCOUNT_BPS as f64 / 10_000.0)).round() as u64;
         let final_amount = total_charges_cents.saturating_sub(discount);
         (discount, final_amount)
     } else {
@@ -483,31 +477,32 @@ mod tests {
             cancel_at: None,
         };
 
-        let compute_records = vec![
-            ComputeUsageRecord {
-                id: Uuid::new_v4(),
-                customer_id: customer.id,
-                model_name: "claude-3.5-sonnet".into(),
-                input_tokens: 10_000_000,
-                output_tokens: 5_000_000,
-                cost_usd_cents: 10_000,
-                charge_usd_cents: 12_000,
-                customer_owned_model: false,
-                timestamp: Utc::now(),
-            },
-        ];
+        let compute_records = vec![ComputeUsageRecord {
+            id: Uuid::new_v4(),
+            customer_id: customer.id,
+            model_name: "claude-3.5-sonnet".into(),
+            input_tokens: 10_000_000,
+            output_tokens: 5_000_000,
+            cost_usd_cents: 10_000,
+            charge_usd_cents: 12_000,
+            customer_owned_model: false,
+            timestamp: Utc::now(),
+        }];
 
         let summary = calculate_billing_summary(&customer, &subscription, &compute_records, true);
 
-        assert_eq!(summary.subscription_charge_cents, 499_00); // Growth plan
+        assert_eq!(summary.subscription_charge_cents, 49_900); // Growth plan
         assert_eq!(summary.compute_charges_cents, 12_000);
-        assert_eq!(summary.total_charges_cents, 499_00 + 12_000);
+        assert_eq!(summary.total_charges_cents, 49_900 + 12_000);
         assert!(summary.amos_discount_applied);
 
         // 20% discount on total (AMOS_DISCOUNT_BPS = 2000 = 20%)
-        let expected_discount = ((499_00 + 12_000) as f64 * 0.20).round() as u64;
+        let expected_discount = ((49_900 + 12_000) as f64 * 0.20).round() as u64;
         assert_eq!(summary.discount_amount_cents, expected_discount);
-        assert_eq!(summary.final_amount_cents, (499_00 + 12_000) - expected_discount);
+        assert_eq!(
+            summary.final_amount_cents,
+            (49_900 + 12_000) - expected_discount
+        );
     }
 
     #[test]

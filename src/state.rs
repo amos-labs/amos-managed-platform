@@ -40,7 +40,7 @@ impl PlatformState {
             .max_connections(config.database.pool_size)
             .connect(config.database.url.expose_secret())
             .await
-            .map_err(|e| AmosError::Database(e.into()))?;
+            .map_err(AmosError::Database)?;
         info!("PostgreSQL connection pool established");
 
         // Connect to Redis
@@ -132,7 +132,7 @@ impl PlatformState {
         sqlx::query("SELECT 1")
             .execute(&self.db)
             .await
-            .map_err(|e| AmosError::Database(e.into()))?;
+            .map_err(AmosError::Database)?;
 
         // Check Redis
         use redis::AsyncCommands;

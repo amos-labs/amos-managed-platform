@@ -97,10 +97,7 @@ pub fn create_refresh_token() -> String {
 }
 
 /// Validate an access token and return claims.
-pub fn validate_access_token(
-    token: &str,
-    jwt_secret: &str,
-) -> Result<Claims, AmosError> {
+pub fn validate_access_token(token: &str, jwt_secret: &str) -> Result<Claims, AmosError> {
     let mut validation = Validation::default();
     validation.leeway = 0; // Strict expiration checking, no grace period
     let token_data = decode::<Claims>(
@@ -184,10 +181,8 @@ mod tests {
         let user_id = Uuid::new_v4();
         let tenant_id = Uuid::new_v4();
 
-        let token = create_access_token(
-            user_id, tenant_id, "admin", "test-org", secret, 3600,
-        )
-        .unwrap();
+        let token =
+            create_access_token(user_id, tenant_id, "admin", "test-org", secret, 3600).unwrap();
 
         let claims = validate_access_token(&token, secret).unwrap();
         assert_eq!(claims.sub, user_id.to_string());
@@ -203,10 +198,8 @@ mod tests {
         let tenant_id = Uuid::new_v4();
 
         // Create token that expired 1 second ago
-        let token = create_access_token(
-            user_id, tenant_id, "member", "expired-org", secret, -1,
-        )
-        .unwrap();
+        let token =
+            create_access_token(user_id, tenant_id, "member", "expired-org", secret, -1).unwrap();
 
         let result = validate_access_token(&token, secret);
         assert!(result.is_err());

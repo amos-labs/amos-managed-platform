@@ -2,25 +2,22 @@
 //!
 //! These endpoints are protected by JWT auth and scoped to the authenticated tenant.
 
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    routing::get,
-    Json, Router,
-};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Json, Router};
 use serde::Serialize;
 use tracing::error;
 use uuid::Uuid;
 
-use crate::{auth, middleware, state::PlatformState};
+use crate::{auth, state::PlatformState};
 
 pub fn routes() -> Router<PlatformState> {
     Router::new()
         .route("/tenants/me", get(get_current_tenant))
         .route("/tenants/me/users", get(list_tenant_users))
         .route("/tenants/me/harness", get(get_tenant_harness))
-        .route("/tenants/me/api-keys", get(list_api_keys).post(create_api_key))
+        .route(
+            "/tenants/me/api-keys",
+            get(list_api_keys).post(create_api_key),
+        )
 }
 
 // ── Shared error response ───────────────────────────────────────────────
@@ -55,7 +52,7 @@ async fn get_current_tenant(
 
     let row = sqlx::query_as::<_, (Uuid, String, String, String, String, Option<String>, String)>(
         "SELECT id, name, slug, plan, deployment_mode, subdomain, created_at::text
-         FROM tenants WHERE id = $1"
+         FROM tenants WHERE id = $1",
     )
     .bind(tenant_id)
     .fetch_optional(&state.db)
@@ -68,7 +65,13 @@ async fn get_current_tenant(
     match row {
         Some((id, name, slug, plan, deployment_mode, subdomain, created_at)) => {
             Ok(Json(TenantResponse {
-                id, name, slug, plan, deployment_mode, subdomain, created_at,
+                id,
+                name,
+                slug,
+                plan,
+                deployment_mode,
+                subdomain,
+                created_at,
             }))
         }
         None => Err((
@@ -108,9 +111,20 @@ async fn list_tenant_users(
     let claims = extract_claims(&state, &headers)?;
     let tenant_id: Uuid = claims.tenant_id.parse().map_err(|_| auth_error())?;
 
-    let rows = sqlx::query_as::<_, (Uuid, String, Option<String>, String, bool, Option<String>, String)>(
+    let rows = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            String,
+            Option<String>,
+            String,
+            bool,
+            Option<String>,
+            String,
+        ),
+    >(
         "SELECT id, email, name, role, is_active, last_login_at::text, created_at::text
-         FROM users WHERE tenant_id = $1 ORDER BY created_at ASC"
+         FROM users WHERE tenant_id = $1 ORDER BY created_at ASC",
     )
     .bind(tenant_id)
     .fetch_all(&state.db)
@@ -123,9 +137,17 @@ async fn list_tenant_users(
     let total = rows.len() as i64;
     let users: Vec<UserResponse> = rows
         .into_iter()
-        .map(|(id, email, name, role, is_active, last_login_at, created_at)| UserResponse {
-            id, email, name, role, is_active, last_login_at, created_at,
-        })
+        .map(
+            |(id, email, name, role, is_active, last_login_at, created_at)| UserResponse {
+                id,
+                email,
+                name,
+                role,
+                is_active,
+                last_login_at,
+                created_at,
+            },
+        )
         .collect();
 
     Ok(Json(UsersListResponse { users, total }))
@@ -160,10 +182,24 @@ async fn get_tenant_harness(
     let claims = extract_claims(&state, &headers)?;
     let tenant_id: Uuid = claims.tenant_id.parse().map_err(|_| auth_error())?;
 
-    let rows = sqlx::query_as::<_, (Uuid, String, Option<String>, String, String, Option<String>, bool, Option<String>, Option<String>, String)>(
+    let rows = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            String,
+            Option<String>,
+            String,
+            String,
+            Option<String>,
+            bool,
+            Option<String>,
+            Option<String>,
+            String,
+        ),
+    >(
         "SELECT id, status, subdomain, region, instance_size, harness_version, healthy,
                 last_heartbeat::text, provisioned_at::text, created_at::text
-         FROM harness_instances WHERE tenant_id = $1 ORDER BY created_at DESC"
+         FROM harness_instances WHERE tenant_id = $1 ORDER BY created_at DESC",
     )
     .bind(tenant_id)
     .fetch_all(&state.db)
@@ -176,11 +212,33 @@ async fn get_tenant_harness(
     let total = rows.len() as i64;
     let instances: Vec<HarnessResponse> = rows
         .into_iter()
-        .map(|(id, status, subdomain, region, instance_size, harness_version, healthy, last_heartbeat, provisioned_at, created_at)| {
-            HarnessResponse {
-                id, status, subdomain, region, instance_size, harness_version, healthy, last_heartbeat, provisioned_at, created_at,
-            }
-        })
+        .map(
+            |(
+                id,
+                status,
+                subdomain,
+                region,
+                instance_size,
+                harness_version,
+                healthy,
+                last_heartbeat,
+                provisioned_at,
+                created_at,
+            )| {
+                HarnessResponse {
+                    id,
+                    status,
+                    subdomain,
+                    region,
+                    instance_size,
+                    harness_version,
+                    healthy,
+                    last_heartbeat,
+                    provisioned_at,
+                    created_at,
+                }
+            },
+        )
         .collect();
 
     Ok(Json(HarnessListResponse { instances, total }))
@@ -214,9 +272,20 @@ async fn list_api_keys(
     let claims = extract_claims(&state, &headers)?;
     let tenant_id: Uuid = claims.tenant_id.parse().map_err(|_| auth_error())?;
 
-    let rows = sqlx::query_as::<_, (Uuid, String, String, Vec<String>, bool, Option<String>, String)>(
+    let rows = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            String,
+            String,
+            Vec<String>,
+            bool,
+            Option<String>,
+            String,
+        ),
+    >(
         "SELECT id, name, key_prefix, scopes, is_active, last_used_at::text, created_at::text
-         FROM api_keys WHERE tenant_id = $1 ORDER BY created_at DESC"
+         FROM api_keys WHERE tenant_id = $1 ORDER BY created_at DESC",
     )
     .bind(tenant_id)
     .fetch_all(&state.db)
@@ -229,9 +298,18 @@ async fn list_api_keys(
     let total = rows.len() as i64;
     let api_keys: Vec<ApiKeyResponse> = rows
         .into_iter()
-        .map(|(id, name, key_prefix, scopes, is_active, last_used_at, created_at)| ApiKeyResponse {
-            id, name, key_prefix, full_key: None, scopes, is_active, last_used_at, created_at,
-        })
+        .map(
+            |(id, name, key_prefix, scopes, is_active, last_used_at, created_at)| ApiKeyResponse {
+                id,
+                name,
+                key_prefix,
+                full_key: None,
+                scopes,
+                is_active,
+                last_used_at,
+                created_at,
+            },
+        )
         .collect();
 
     Ok(Json(ApiKeysListResponse { api_keys, total }))
@@ -281,7 +359,7 @@ async fn create_api_key(
 
     sqlx::query(
         "INSERT INTO api_keys (id, tenant_id, created_by, name, key_prefix, key_hash, scopes)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)"
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(key_id)
     .bind(tenant_id)
@@ -336,14 +414,19 @@ fn extract_claims(
         state.config.auth.jwt_secret.expose_secret().to_string()
     };
 
-    auth::validate_access_token(auth_header, &jwt_secret).map_err(|e| (
-        StatusCode::UNAUTHORIZED,
-        Json(TenantError {
-            error: format!("Authentication failed: {}", e),
-            code: "unauthorized",
-            hint: Some("Token may be expired. Use POST /api/v1/auth/refresh to get a new token.".into()),
-        }),
-    ))
+    auth::validate_access_token(auth_header, &jwt_secret).map_err(|e| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(TenantError {
+                error: format!("Authentication failed: {}", e),
+                code: "unauthorized",
+                hint: Some(
+                    "Token may be expired. Use POST /api/v1/auth/refresh to get a new token."
+                        .into(),
+                ),
+            }),
+        )
+    })
 }
 
 fn auth_error() -> (StatusCode, Json<TenantError>) {

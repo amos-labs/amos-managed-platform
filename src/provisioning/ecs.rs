@@ -6,9 +6,9 @@
 
 use aws_sdk_ecs::{
     types::{
-        AssignPublicIp, AwsVpcConfiguration, Compatibility, ContainerDefinition,
-        KeyValuePair, LaunchType, LogConfiguration, LogDriver, NetworkConfiguration,
-        NetworkMode, PortMapping, TransportProtocol,
+        AssignPublicIp, AwsVpcConfiguration, Compatibility, ContainerDefinition, KeyValuePair,
+        LaunchType, LogConfiguration, LogDriver, NetworkConfiguration, NetworkMode, PortMapping,
+        TransportProtocol,
     },
     Client as EcsClient,
 };
@@ -66,9 +66,7 @@ impl EcsProvisionerConfig {
             .unwrap_or_else(|_| "swarm-infrastructure-cluster".to_string());
 
         let subnets = std::env::var("ECS_SUBNETS")
-            .unwrap_or_else(|_| {
-                "subnet-0cfcbfd1c0ef057e7,subnet-0c5928d36478a1be4".to_string()
-            })
+            .unwrap_or_else(|_| "subnet-0cfcbfd1c0ef057e7,subnet-0c5928d36478a1be4".to_string())
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
@@ -96,8 +94,7 @@ impl EcsProvisionerConfig {
             .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
             .unwrap_or_else(|_| "us-east-1".to_string());
 
-        let harness_database_url =
-            std::env::var("ECS_HARNESS_DATABASE_URL").unwrap_or_default();
+        let harness_database_url = std::env::var("ECS_HARNESS_DATABASE_URL").unwrap_or_default();
 
         let harness_redis_url = std::env::var("ECS_HARNESS_REDIS_URL")
             .or_else(|_| std::env::var("AMOS__REDIS__URL"))
@@ -177,11 +174,7 @@ impl EcsProvisioner {
     /// Provision a new harness as an ECS Fargate task.
     ///
     /// Returns the ECS task ARN (stored as `container_id` in the DB).
-    pub async fn provision(
-        &self,
-        config: &HarnessConfig,
-        tenant_slug: &str,
-    ) -> Result<String> {
+    pub async fn provision(&self, config: &HarnessConfig, tenant_slug: &str) -> Result<String> {
         let family = format!("amos-harness-{}", tenant_slug);
 
         let (cpu, memory) = fargate_resources(config.instance_size);
@@ -213,10 +206,7 @@ impl EcsProvisioner {
         let mut log_options = std::collections::HashMap::new();
         log_options.insert("awslogs-group".to_string(), self.log_group.clone());
         log_options.insert("awslogs-region".to_string(), self.aws_region.clone());
-        log_options.insert(
-            "awslogs-stream-prefix".to_string(),
-            tenant_slug.to_string(),
-        );
+        log_options.insert("awslogs-stream-prefix".to_string(), tenant_slug.to_string());
 
         // Register a task definition for this tenant.
         let task_def_result = self
@@ -247,7 +237,9 @@ impl EcsProvisioner {
                             .log_driver(LogDriver::Awslogs)
                             .set_options(Some(log_options))
                             .build()
-                            .map_err(|e| AmosError::Internal(format!("Failed to build log config: {}", e)))?,
+                            .map_err(|e| {
+                                AmosError::Internal(format!("Failed to build log config: {}", e))
+                            })?,
                     )
                     .build(),
             )
@@ -260,9 +252,7 @@ impl EcsProvisioner {
         let task_def_arn = task_def_result
             .task_definition()
             .and_then(|td| td.task_definition_arn())
-            .ok_or_else(|| {
-                AmosError::Internal("Task definition ARN missing from response".into())
-            })?
+            .ok_or_else(|| AmosError::Internal("Task definition ARN missing from response".into()))?
             .to_string();
 
         info!(family = %family, arn = %task_def_arn, "Task definition registered");
@@ -283,7 +273,9 @@ impl EcsProvisioner {
                             .set_security_groups(Some(self.security_groups.clone()))
                             .assign_public_ip(AssignPublicIp::Enabled)
                             .build()
-                            .map_err(|e| AmosError::Internal(format!("Failed to build VPC config: {}", e)))?,
+                            .map_err(|e| {
+                                AmosError::Internal(format!("Failed to build VPC config: {}", e))
+                            })?,
                     )
                     .build(),
             )
@@ -299,13 +291,7 @@ impl EcsProvisioner {
                 let reason = run_result
                     .failures()
                     .first()
-                    .map(|f| {
-                        format!(
-                            "{}: {}",
-                            f.arn().unwrap_or("?"),
-                            f.reason().unwrap_or("?")
-                        )
-                    })
+                    .map(|f| format!("{}: {}", f.arn().unwrap_or("?"), f.reason().unwrap_or("?")))
                     .unwrap_or_else(|| "Unknown failure".to_string());
                 AmosError::Internal(format!("ECS task failed to start: {}", reason))
             })?
@@ -317,10 +303,7 @@ impl EcsProvisioner {
     }
 
     /// Describe a task and return its status and private IP.
-    pub async fn describe_task(
-        &self,
-        task_arn: &str,
-    ) -> Result<(HarnessStatus, Option<String>)> {
+    pub async fn describe_task(&self, task_arn: &str) -> Result<(HarnessStatus, Option<String>)> {
         let result = self
             .client
             .describe_tasks()
@@ -344,7 +327,10 @@ impl EcsProvisioner {
                 // Check stop code for error vs normal stop.
                 let is_error = task
                     .stop_code()
-                    .map(|c| c.as_str() == "TaskFailedToStart" || c.as_str() == "EssentialContainerExited")
+                    .map(|c| {
+                        c.as_str() == "TaskFailedToStart"
+                            || c.as_str() == "EssentialContainerExited"
+                    })
                     .unwrap_or(false);
                 if is_error {
                     HarnessStatus::Error
@@ -402,10 +388,7 @@ fn fargate_resources(size: InstanceSize) -> (&'static str, &'static str) {
 
 /// Helper to build a `KeyValuePair` for ECS container environment.
 fn kv(name: &str, value: &str) -> KeyValuePair {
-    KeyValuePair::builder()
-        .name(name)
-        .value(value)
-        .build()
+    KeyValuePair::builder().name(name).value(value).build()
 }
 
 #[cfg(test)]

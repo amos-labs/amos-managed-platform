@@ -3,6 +3,7 @@
 //! Pages: login, register, dashboard, settings.
 //! Authentication is cookie-based (JWT stored in httponly cookie).
 
+use askama::Template;
 use axum::{
     extract::{Form, Path, State},
     http::{header, StatusCode},
@@ -10,7 +11,6 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use askama::Template;
 use serde::Deserialize;
 use std::collections::HashMap;
 use tracing::{error, info, warn};
@@ -64,6 +64,7 @@ struct SettingsTemplate {
 
 // ── View model types ────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 struct HarnessInfo {
     id: String,
     full_id: String,
@@ -136,16 +137,13 @@ async fn login_page() -> impl IntoResponse {
     HtmlTemplate(LoginTemplate { error: None })
 }
 
-async fn login_submit(
-    State(state): State<PlatformState>,
-    Form(form): Form<LoginForm>,
-) -> Response {
+async fn login_submit(State(state): State<PlatformState>, Form(form): Form<LoginForm>) -> Response {
     // Look up user by email
     let row = sqlx::query_as::<_, (Uuid, Uuid, String, String, String, bool)>(
         "SELECT u.id, u.tenant_id, u.password_hash, u.role, t.slug, u.is_active
          FROM users u JOIN tenants t ON u.tenant_id = t.id
          WHERE u.email = $1
-         LIMIT 1"
+         LIMIT 1",
     )
     .bind(&form.email)
     .fetch_optional(&state.db)
@@ -156,13 +154,15 @@ async fn login_submit(
         Ok(None) => {
             return HtmlTemplate(LoginTemplate {
                 error: Some("Invalid email or password.".into()),
-            }).into_response();
+            })
+            .into_response();
         }
         Err(e) => {
             error!("Login query failed: {}", e);
             return HtmlTemplate(LoginTemplate {
                 error: Some("An internal error occurred.".into()),
-            }).into_response();
+            })
+            .into_response();
         }
     };
 
@@ -171,7 +171,8 @@ async fn login_submit(
     if !is_active {
         return HtmlTemplate(LoginTemplate {
             error: Some("Account is deactivated.".into()),
-        }).into_response();
+        })
+        .into_response();
     }
 
     // Verify password
@@ -181,14 +182,16 @@ async fn login_submit(
             error!("Password verification error: {}", e);
             return HtmlTemplate(LoginTemplate {
                 error: Some("An internal error occurred.".into()),
-            }).into_response();
+            })
+            .into_response();
         }
     };
 
     if !valid {
         return HtmlTemplate(LoginTemplate {
             error: Some("Invalid email or password.".into()),
-        }).into_response();
+        })
+        .into_response();
     }
 
     // Create JWT
@@ -196,14 +199,20 @@ async fn login_submit(
     let access_expiry = state.config.auth.access_token_expiry_secs as i64;
 
     let token = match auth::create_access_token(
-        user_id, tenant_id, &role, &tenant_slug, &jwt_secret, access_expiry,
+        user_id,
+        tenant_id,
+        &role,
+        &tenant_slug,
+        &jwt_secret,
+        access_expiry,
     ) {
         Ok(t) => t,
         Err(e) => {
             error!("Token creation failed: {}", e);
             return HtmlTemplate(LoginTemplate {
                 error: Some("An internal error occurred.".into()),
-            }).into_response();
+            })
+            .into_response();
         }
     };
 
@@ -219,10 +228,7 @@ async fn login_submit(
         SESSION_COOKIE, token, access_expiry
     );
 
-    (
-        [(header::SET_COOKIE, cookie)],
-        Redirect::to("/dashboard"),
-    ).into_response()
+    ([(header::SET_COOKIE, cookie)], Redirect::to("/dashboard")).into_response()
 }
 
 // ── Register ────────────────────────────────────────────────────────────
@@ -239,24 +245,28 @@ async fn register_submit(
     if form.organization_name.trim().is_empty() {
         return HtmlTemplate(RegisterTemplate {
             error: Some("Organization name is required.".into()),
-        }).into_response();
+        })
+        .into_response();
     }
     if form.email.trim().is_empty() || !form.email.contains('@') {
         return HtmlTemplate(RegisterTemplate {
             error: Some("A valid email address is required.".into()),
-        }).into_response();
+        })
+        .into_response();
     }
     if form.password.len() < 8 {
         return HtmlTemplate(RegisterTemplate {
             error: Some("Password must be at least 8 characters.".into()),
-        }).into_response();
+        })
+        .into_response();
     }
 
     let slug = auth::slugify(&form.organization_name);
     if slug.is_empty() {
         return HtmlTemplate(RegisterTemplate {
             error: Some("Organization name must contain alphanumeric characters.".into()),
-        }).into_response();
+        })
+        .into_response();
     }
 
     // Hash password
@@ -266,7 +276,8 @@ async fn register_submit(
             error!("Password hashing failed: {}", e);
             return HtmlTemplate(RegisterTemplate {
                 error: Some("An internal error occurred.".into()),
-            }).into_response();
+            })
+            .into_response();
         }
     };
 
@@ -275,7 +286,7 @@ async fn register_submit(
 
     // Create tenant
     let result = sqlx::query(
-        "INSERT INTO tenants (id, name, slug, plan, subdomain) VALUES ($1, $2, $3, $4, $5)"
+        "INSERT INTO tenants (id, name, slug, plan, subdomain) VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(tenant_id)
     .bind(&form.organization_name)
@@ -290,19 +301,21 @@ async fn register_submit(
         if err_str.contains("tenants_slug_key") || err_str.contains("tenants_subdomain_key") {
             return HtmlTemplate(RegisterTemplate {
                 error: Some(format!("Organization '{}' is already taken.", slug)),
-            }).into_response();
+            })
+            .into_response();
         }
         error!("Failed to create tenant: {}", e);
         return HtmlTemplate(RegisterTemplate {
             error: Some("Failed to create organization.".into()),
-        }).into_response();
+        })
+        .into_response();
     }
 
     // Create user (owner)
     let user_id = Uuid::new_v4();
     let user_result = sqlx::query(
         "INSERT INTO users (id, tenant_id, email, name, password_hash, role, email_verified)
-         VALUES ($1, $2, $3, $4, $5, 'owner', TRUE)"
+         VALUES ($1, $2, $3, $4, $5, 'owner', TRUE)",
     )
     .bind(user_id)
     .bind(tenant_id)
@@ -322,19 +335,21 @@ async fn register_submit(
         if err_str.contains("users_tenant_id_email_key") {
             return HtmlTemplate(RegisterTemplate {
                 error: Some(format!("Email '{}' is already registered.", form.email)),
-            }).into_response();
+            })
+            .into_response();
         }
         error!("Failed to create user: {}", e);
         return HtmlTemplate(RegisterTemplate {
             error: Some("Failed to create user account.".into()),
-        }).into_response();
+        })
+        .into_response();
     }
 
     // Create harness instance record
     let harness_id = Uuid::new_v4();
     let _ = sqlx::query(
         "INSERT INTO harness_instances (id, tenant_id, subdomain, status)
-         VALUES ($1, $2, $3, 'pending')"
+         VALUES ($1, $2, $3, 'pending')",
     )
     .bind(harness_id)
     .bind(tenant_id)
@@ -377,12 +392,10 @@ async fn register_submit(
         info!(tenant_id = %tenant_id, harness_id = %harness_id, "Provisioning harness container for new tenant");
 
         // Update status to provisioning
-        let _ = sqlx::query(
-            "UPDATE harness_instances SET status = 'provisioning' WHERE id = $1"
-        )
-        .bind(harness_id)
-        .execute(&state.db)
-        .await;
+        let _ = sqlx::query("UPDATE harness_instances SET status = 'provisioning' WHERE id = $1")
+            .bind(harness_id)
+            .execute(&state.db)
+            .await;
 
         match manager.provision(&config).await {
             Ok(container_id) => {
@@ -392,7 +405,7 @@ async fn register_submit(
                 let _ = sqlx::query(
                     "UPDATE harness_instances
                      SET container_id = $1, provisioned_at = NOW()
-                     WHERE id = $2"
+                     WHERE id = $2",
                 )
                 .bind(&container_id)
                 .bind(harness_id)
@@ -401,13 +414,15 @@ async fn register_submit(
 
                 // Start the container
                 if let Err(e) = manager.start(&container_id).await {
-                    warn!("Failed to auto-start harness container {}: {}", container_id, e);
-                    let _ = sqlx::query(
-                        "UPDATE harness_instances SET status = 'error' WHERE id = $1"
-                    )
-                    .bind(harness_id)
-                    .execute(&state.db)
-                    .await;
+                    warn!(
+                        "Failed to auto-start harness container {}: {}",
+                        container_id, e
+                    );
+                    let _ =
+                        sqlx::query("UPDATE harness_instances SET status = 'error' WHERE id = $1")
+                            .bind(harness_id)
+                            .execute(&state.db)
+                            .await;
                 } else {
                     info!(container_id = %container_id, "Harness container start issued");
 
@@ -425,7 +440,11 @@ async fn register_submit(
                                 // Container is alive, try to get the port
                                 match manager.inspect_host_port(&container_id).await {
                                     Ok(Some(port)) => {
-                                        info!(port = port, attempt = attempt, "Harness port detected");
+                                        info!(
+                                            port = port,
+                                            attempt = attempt,
+                                            "Harness port detected"
+                                        );
                                         external_port = Some(port as i32);
                                         final_status = "running";
                                         break;
@@ -467,7 +486,7 @@ async fn register_submit(
                          SET status = $2,
                              started_at = CASE WHEN $2 = 'running' THEN NOW() ELSE NULL END,
                              external_port = $4, internal_url = $5, healthy = $6
-                         WHERE id = $3"
+                         WHERE id = $3",
                     )
                     .bind(&container_id)
                     .bind(final_status)
@@ -481,24 +500,20 @@ async fn register_submit(
             }
             Err(e) => {
                 error!("Failed to provision harness container: {}", e);
-                let _ = sqlx::query(
-                    "UPDATE harness_instances SET status = 'error' WHERE id = $1"
-                )
-                .bind(harness_id)
-                .execute(&state.db)
-                .await;
+                let _ = sqlx::query("UPDATE harness_instances SET status = 'error' WHERE id = $1")
+                    .bind(harness_id)
+                    .execute(&state.db)
+                    .await;
             }
         }
     } else if let Some(ref ecs) = state.ecs_provisioner {
         // Production path: provision harness as an ECS Fargate task.
         info!(tenant_id = %tenant_id, harness_id = %harness_id, "Provisioning harness via ECS Fargate");
 
-        let _ = sqlx::query(
-            "UPDATE harness_instances SET status = 'provisioning' WHERE id = $1"
-        )
-        .bind(harness_id)
-        .execute(&state.db)
-        .await;
+        let _ = sqlx::query("UPDATE harness_instances SET status = 'provisioning' WHERE id = $1")
+            .bind(harness_id)
+            .execute(&state.db)
+            .await;
 
         let ecs_config = HarnessConfig {
             customer_id: tenant_id,
@@ -517,7 +532,7 @@ async fn register_submit(
                 let _ = sqlx::query(
                     "UPDATE harness_instances
                      SET container_id = $1, provisioned_at = NOW()
-                     WHERE id = $2"
+                     WHERE id = $2",
                 )
                 .bind(&task_arn)
                 .bind(harness_id)
@@ -537,9 +552,8 @@ async fn register_submit(
 
                         match ecs_bg.describe_task(&task_arn_bg).await {
                             Ok((crate::provisioning::HarnessStatus::Running, private_ip)) => {
-                                let internal_url = private_ip
-                                    .as_ref()
-                                    .map(|ip| format!("http://{}:3000", ip));
+                                let internal_url =
+                                    private_ip.as_ref().map(|ip| format!("http://{}:3000", ip));
 
                                 let _ = sqlx::query(
                                     "UPDATE harness_instances
@@ -547,7 +561,7 @@ async fn register_submit(
                                          started_at = NOW(),
                                          internal_url = $1,
                                          healthy = TRUE
-                                     WHERE id = $2"
+                                     WHERE id = $2",
                                 )
                                 .bind(&internal_url)
                                 .bind(harness_id)
@@ -564,7 +578,7 @@ async fn register_submit(
                             }
                             Ok((crate::provisioning::HarnessStatus::Error, _)) => {
                                 let _ = sqlx::query(
-                                    "UPDATE harness_instances SET status = 'error' WHERE id = $1"
+                                    "UPDATE harness_instances SET status = 'error' WHERE id = $1",
                                 )
                                 .bind(harness_id)
                                 .execute(&db_bg)
@@ -588,26 +602,25 @@ async fn register_submit(
 
                     // Timed out after 2 minutes — mark as error
                     warn!(harness_id = %harness_id, "ECS harness task timed out after 2 minutes");
-                    let _ = sqlx::query(
-                        "UPDATE harness_instances SET status = 'error' WHERE id = $1"
-                    )
-                    .bind(harness_id)
-                    .execute(&db_bg)
-                    .await;
+                    let _ =
+                        sqlx::query("UPDATE harness_instances SET status = 'error' WHERE id = $1")
+                            .bind(harness_id)
+                            .execute(&db_bg)
+                            .await;
                 });
             }
             Err(e) => {
                 error!("Failed to provision ECS harness task: {}", e);
-                let _ = sqlx::query(
-                    "UPDATE harness_instances SET status = 'error' WHERE id = $1"
-                )
-                .bind(harness_id)
-                .execute(&state.db)
-                .await;
+                let _ = sqlx::query("UPDATE harness_instances SET status = 'error' WHERE id = $1")
+                    .bind(harness_id)
+                    .execute(&state.db)
+                    .await;
             }
         }
     } else {
-        warn!("No provisioner available (Docker or ECS) — harness instance created as pending only");
+        warn!(
+            "No provisioner available (Docker or ECS) — harness instance created as pending only"
+        );
     }
 
     // Issue JWT and set cookie
@@ -615,7 +628,12 @@ async fn register_submit(
     let access_expiry = state.config.auth.access_token_expiry_secs as i64;
 
     let token = match auth::create_access_token(
-        user_id, tenant_id, "owner", &slug, &jwt_secret, access_expiry,
+        user_id,
+        tenant_id,
+        "owner",
+        &slug,
+        &jwt_secret,
+        access_expiry,
     ) {
         Ok(t) => t,
         Err(e) => {
@@ -629,10 +647,7 @@ async fn register_submit(
         SESSION_COOKIE, token, access_expiry
     );
 
-    (
-        [(header::SET_COOKIE, cookie)],
-        Redirect::to("/dashboard"),
-    ).into_response()
+    ([(header::SET_COOKIE, cookie)], Redirect::to("/dashboard")).into_response()
 }
 
 // ── Dashboard ───────────────────────────────────────────────────────────
@@ -653,7 +668,7 @@ async fn dashboard_page(
 
     // Fetch tenant info
     let tenant_row = sqlx::query_as::<_, (String, String, String)>(
-        "SELECT name, slug, plan FROM tenants WHERE id = $1"
+        "SELECT name, slug, plan FROM tenants WHERE id = $1",
     )
     .bind(tenant_id)
     .fetch_optional(&state.db)
@@ -661,9 +676,8 @@ async fn dashboard_page(
     .ok()
     .flatten();
 
-    let (tenant_name, tenant_slug, plan) = tenant_row.unwrap_or_else(|| {
-        ("Unknown".into(), claims.tenant_slug.clone(), "free".into())
-    });
+    let (tenant_name, tenant_slug, plan) =
+        tenant_row.unwrap_or_else(|| ("Unknown".into(), claims.tenant_slug.clone(), "free".into()));
 
     // Fetch harness instances (including endpoint info)
     let harness_rows = sqlx::query_as::<_, (Uuid, String, Option<String>, String, String, bool, Option<i32>, Option<String>, Option<String>)>(
@@ -677,35 +691,50 @@ async fn dashboard_page(
 
     let instances: Vec<HarnessInfo> = harness_rows
         .into_iter()
-        .map(|(id, status, subdomain, region, instance_size, healthy, _external_port, internal_url, container_id)| HarnessInfo {
-            id: id.to_string()[..8].to_string(),
-            full_id: id.to_string(),
-            status,
-            subdomain,
-            region,
-            instance_size,
-            healthy,
-            endpoint_url: internal_url,
-            container_id_short: container_id.map(|c| if c.len() > 12 { c[..12].to_string() } else { c }),
-        })
+        .map(
+            |(
+                id,
+                status,
+                subdomain,
+                region,
+                instance_size,
+                healthy,
+                _external_port,
+                internal_url,
+                container_id,
+            )| HarnessInfo {
+                id: id.to_string()[..8].to_string(),
+                full_id: id.to_string(),
+                status,
+                subdomain,
+                region,
+                instance_size,
+                healthy,
+                endpoint_url: internal_url,
+                container_id_short: container_id.map(|c| {
+                    if c.len() > 12 {
+                        c[..12].to_string()
+                    } else {
+                        c
+                    }
+                }),
+            },
+        )
         .collect();
 
     // Fetch counts
-    let user_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM users WHERE tenant_id = $1"
-    )
-    .bind(tenant_id)
-    .fetch_one(&state.db)
-    .await
-    .unwrap_or(0);
+    let user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE tenant_id = $1")
+        .bind(tenant_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or(0);
 
-    let api_key_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM api_keys WHERE tenant_id = $1"
-    )
-    .bind(tenant_id)
-    .fetch_one(&state.db)
-    .await
-    .unwrap_or(0);
+    let api_key_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE tenant_id = $1")
+            .bind(tenant_id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or(0);
 
     HtmlTemplate(DashboardTemplate {
         tenant_name,
@@ -716,7 +745,8 @@ async fn dashboard_page(
         api_key_count,
         flash_message: None,
         flash_error: None,
-    }).into_response()
+    })
+    .into_response()
 }
 
 // ── Settings ────────────────────────────────────────────────────────────
@@ -756,7 +786,7 @@ async fn settings_page_inner(
     // API keys
     let key_rows = sqlx::query_as::<_, (String, String, bool, String)>(
         "SELECT name, key_prefix, is_active, created_at::text
-         FROM api_keys WHERE tenant_id = $1 ORDER BY created_at DESC"
+         FROM api_keys WHERE tenant_id = $1 ORDER BY created_at DESC",
     )
     .bind(tenant_id)
     .fetch_all(&state.db)
@@ -766,14 +796,17 @@ async fn settings_page_inner(
     let api_keys: Vec<ApiKeyInfo> = key_rows
         .into_iter()
         .map(|(name, key_prefix, is_active, created_at)| ApiKeyInfo {
-            name, key_prefix, is_active, created_at,
+            name,
+            key_prefix,
+            is_active,
+            created_at,
         })
         .collect();
 
     // Users
     let user_rows = sqlx::query_as::<_, (String, Option<String>, String, bool)>(
         "SELECT email, name, role, is_active
-         FROM users WHERE tenant_id = $1 ORDER BY created_at ASC"
+         FROM users WHERE tenant_id = $1 ORDER BY created_at ASC",
     )
     .bind(tenant_id)
     .fetch_all(&state.db)
@@ -783,7 +816,10 @@ async fn settings_page_inner(
     let users: Vec<UserInfo> = user_rows
         .into_iter()
         .map(|(email, name, role, is_active)| UserInfo {
-            email, name, role, is_active,
+            email,
+            name,
+            role,
+            is_active,
         })
         .collect();
 
@@ -794,7 +830,8 @@ async fn settings_page_inner(
         users,
         new_api_key,
         flash_message,
-    }).into_response()
+    })
+    .into_response()
 }
 
 async fn create_api_key_submit(
@@ -809,9 +846,12 @@ async fn create_api_key_submit(
 
     if claims.role != "owner" && claims.role != "admin" {
         return settings_page_inner(
-            &state, &headers, None,
+            &state,
+            &headers,
+            None,
             Some("Only owner or admin can create API keys.".into()),
-        ).await;
+        )
+        .await;
     }
 
     let tenant_id: Uuid = match claims.tenant_id.parse() {
@@ -825,9 +865,12 @@ async fn create_api_key_submit(
 
     if form.name.trim().is_empty() {
         return settings_page_inner(
-            &state, &headers, None,
+            &state,
+            &headers,
+            None,
             Some("API key name is required.".into()),
-        ).await;
+        )
+        .await;
     }
 
     let (full_key, prefix, key_hash) = auth::generate_api_key();
@@ -836,7 +879,7 @@ async fn create_api_key_submit(
     let scopes: Vec<String> = vec![];
     let result = sqlx::query(
         "INSERT INTO api_keys (id, tenant_id, created_by, name, key_prefix, key_hash, scopes)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)"
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(key_id)
     .bind(tenant_id)
@@ -851,16 +894,22 @@ async fn create_api_key_submit(
     match result {
         Ok(_) => {
             settings_page_inner(
-                &state, &headers, Some(full_key),
+                &state,
+                &headers,
+                Some(full_key),
                 Some("API key created successfully.".into()),
-            ).await
+            )
+            .await
         }
         Err(e) => {
             error!("Failed to create API key: {}", e);
             settings_page_inner(
-                &state, &headers, None,
+                &state,
+                &headers,
+                None,
                 Some("Failed to create API key.".into()),
-            ).await
+            )
+            .await
         }
     }
 }
@@ -876,15 +925,18 @@ async fn verify_harness_ownership(
     let claims = extract_session_claims(state, headers)
         .ok_or_else(|| Redirect::to("/login").into_response())?;
 
-    let tenant_id: Uuid = claims.tenant_id.parse()
+    let tenant_id: Uuid = claims
+        .tenant_id
+        .parse()
         .map_err(|_| Redirect::to("/login").into_response())?;
 
-    let harness_uuid: Uuid = harness_id.parse()
+    let harness_uuid: Uuid = harness_id
+        .parse()
         .map_err(|_| Redirect::to("/dashboard").into_response())?;
 
     // Verify the instance belongs to this tenant and get container_id
     let row = sqlx::query_as::<_, (Option<String>,)>(
-        "SELECT container_id FROM harness_instances WHERE id = $1 AND tenant_id = $2"
+        "SELECT container_id FROM harness_instances WHERE id = $1 AND tenant_id = $2",
     )
     .bind(harness_uuid)
     .bind(tenant_id)
@@ -906,10 +958,11 @@ async fn harness_start(
     Path(id): Path<String>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    let (_claims, harness_id, container_id) = match verify_harness_ownership(&state, &headers, &id).await {
-        Ok(v) => v,
-        Err(r) => return r,
-    };
+    let (_claims, harness_id, container_id) =
+        match verify_harness_ownership(&state, &headers, &id).await {
+            Ok(v) => v,
+            Err(r) => return r,
+        };
 
     let container_id = match container_id {
         Some(cid) => cid,
@@ -974,10 +1027,11 @@ async fn harness_stop(
     Path(id): Path<String>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    let (_claims, harness_id, container_id) = match verify_harness_ownership(&state, &headers, &id).await {
-        Ok(v) => v,
-        Err(r) => return r,
-    };
+    let (_claims, harness_id, container_id) =
+        match verify_harness_ownership(&state, &headers, &id).await {
+            Ok(v) => v,
+            Err(r) => return r,
+        };
 
     let container_id = match container_id {
         Some(cid) => cid,
@@ -1020,10 +1074,11 @@ async fn harness_restart(
     Path(id): Path<String>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    let (_claims, harness_id, container_id) = match verify_harness_ownership(&state, &headers, &id).await {
-        Ok(v) => v,
-        Err(r) => return r,
-    };
+    let (_claims, harness_id, container_id) =
+        match verify_harness_ownership(&state, &headers, &id).await {
+            Ok(v) => v,
+            Err(r) => return r,
+        };
 
     let container_id = match container_id {
         Some(cid) => cid,
@@ -1044,10 +1099,12 @@ async fn harness_restart(
             }
             Err(e) => {
                 error!("Failed to restart harness {}: {}", harness_id, e);
-                let _ = sqlx::query("UPDATE harness_instances SET status = 'error', healthy = FALSE WHERE id = $1")
-                    .bind(harness_id)
-                    .execute(&state.db)
-                    .await;
+                let _ = sqlx::query(
+                    "UPDATE harness_instances SET status = 'error', healthy = FALSE WHERE id = $1",
+                )
+                .bind(harness_id)
+                .execute(&state.db)
+                .await;
             }
         }
     } else if let Some(ref ecs) = state.ecs_provisioner {
@@ -1096,10 +1153,11 @@ async fn harness_redeploy(
     Path(id): Path<String>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    let (_claims, harness_id, container_id) = match verify_harness_ownership(&state, &headers, &id).await {
-        Ok(v) => v,
-        Err(r) => return r,
-    };
+    let (_claims, harness_id, container_id) =
+        match verify_harness_ownership(&state, &headers, &id).await {
+            Ok(v) => v,
+            Err(r) => return r,
+        };
 
     // Stop old container/task if it exists
     if let Some(cid) = &container_id {
@@ -1125,23 +1183,37 @@ async fn harness_redeploy(
         None => return Redirect::to("/dashboard").into_response(),
     };
 
-    let _ = sqlx::query("UPDATE harness_instances SET status = 'provisioning', healthy = FALSE WHERE id = $1")
-        .bind(harness_id)
-        .execute(&state.db)
-        .await;
+    let _ = sqlx::query(
+        "UPDATE harness_instances SET status = 'provisioning', healthy = FALSE WHERE id = $1",
+    )
+    .bind(harness_id)
+    .execute(&state.db)
+    .await;
 
     if let Some(ref manager) = state.harness_manager {
         let mut harness_env = HashMap::new();
-        harness_env.insert("AMOS__DATABASE__URL".to_string(), "postgres://rickbarkley@host.docker.internal:5432/amos_dev".to_string());
-        harness_env.insert("AMOS__REDIS__URL".to_string(), "redis://host.docker.internal:6379".to_string());
-        harness_env.insert("AMOS__PLATFORM__URL".to_string(), format!("http://host.docker.internal:{}", state.config.server.port));
+        harness_env.insert(
+            "AMOS__DATABASE__URL".to_string(),
+            "postgres://rickbarkley@host.docker.internal:5432/amos_dev".to_string(),
+        );
+        harness_env.insert(
+            "AMOS__REDIS__URL".to_string(),
+            "redis://host.docker.internal:6379".to_string(),
+        );
+        harness_env.insert(
+            "AMOS__PLATFORM__URL".to_string(),
+            format!("http://host.docker.internal:{}", state.config.server.port),
+        );
 
         let config = HarnessConfig {
             customer_id: tenant_id,
             region: "us-west-2".to_string(),
             instance_size: InstanceSize::Small,
             environment: "development".to_string(),
-            platform_grpc_url: format!("http://{}:{}", state.config.server.host, state.config.server.port),
+            platform_grpc_url: format!(
+                "http://{}:{}",
+                state.config.server.host, state.config.server.port
+            ),
             env_vars: harness_env,
         };
 
@@ -1155,14 +1227,19 @@ async fn harness_redeploy(
 
                 if let Err(e) = manager.start(&new_container_id).await {
                     warn!("Failed to start redeployed harness: {}", e);
-                    let _ = sqlx::query("UPDATE harness_instances SET status = 'error' WHERE id = $1")
-                        .bind(harness_id)
-                        .execute(&state.db)
-                        .await;
+                    let _ =
+                        sqlx::query("UPDATE harness_instances SET status = 'error' WHERE id = $1")
+                            .bind(harness_id)
+                            .execute(&state.db)
+                            .await;
                 } else {
                     // Quick port detection
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                    let port = manager.inspect_host_port(&new_container_id).await.ok().flatten();
+                    let port = manager
+                        .inspect_host_port(&new_container_id)
+                        .await
+                        .ok()
+                        .flatten();
                     let internal_url = port.map(|p| format!("http://localhost:{}", p));
                     let _ = sqlx::query("UPDATE harness_instances SET status = 'running', started_at = NOW(), external_port = $1, internal_url = $2, healthy = TRUE WHERE id = $3")
                         .bind(port.map(|p| p as i32))
@@ -1218,10 +1295,11 @@ async fn harness_delete(
     Path(id): Path<String>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    let (_claims, harness_id, container_id) = match verify_harness_ownership(&state, &headers, &id).await {
-        Ok(v) => v,
-        Err(r) => return r,
-    };
+    let (_claims, harness_id, container_id) =
+        match verify_harness_ownership(&state, &headers, &id).await {
+            Ok(v) => v,
+            Err(r) => return r,
+        };
 
     // Remove the container/task
     if let Some(cid) = &container_id {
@@ -1257,13 +1335,17 @@ async fn deploy_new_harness(
     };
 
     let tenant_slug = claims.tenant_slug.clone();
-    let subdomain = Some(format!("{}-{}", tenant_slug, &Uuid::new_v4().to_string()[..4]));
+    let subdomain = Some(format!(
+        "{}-{}",
+        tenant_slug,
+        &Uuid::new_v4().to_string()[..4]
+    ));
 
     // Create harness instance record
     let harness_id = Uuid::new_v4();
     let _ = sqlx::query(
         "INSERT INTO harness_instances (id, tenant_id, subdomain, status)
-         VALUES ($1, $2, $3, 'pending')"
+         VALUES ($1, $2, $3, 'pending')",
     )
     .bind(harness_id)
     .bind(tenant_id)
@@ -1279,16 +1361,28 @@ async fn deploy_new_harness(
             .await;
 
         let mut harness_env = HashMap::new();
-        harness_env.insert("AMOS__DATABASE__URL".to_string(), "postgres://rickbarkley@host.docker.internal:5432/amos_dev".to_string());
-        harness_env.insert("AMOS__REDIS__URL".to_string(), "redis://host.docker.internal:6379".to_string());
-        harness_env.insert("AMOS__PLATFORM__URL".to_string(), format!("http://host.docker.internal:{}", state.config.server.port));
+        harness_env.insert(
+            "AMOS__DATABASE__URL".to_string(),
+            "postgres://rickbarkley@host.docker.internal:5432/amos_dev".to_string(),
+        );
+        harness_env.insert(
+            "AMOS__REDIS__URL".to_string(),
+            "redis://host.docker.internal:6379".to_string(),
+        );
+        harness_env.insert(
+            "AMOS__PLATFORM__URL".to_string(),
+            format!("http://host.docker.internal:{}", state.config.server.port),
+        );
 
         let config = HarnessConfig {
             customer_id: tenant_id,
             region: "us-west-2".to_string(),
             instance_size: InstanceSize::Small,
             environment: "development".to_string(),
-            platform_grpc_url: format!("http://{}:{}", state.config.server.host, state.config.server.port),
+            platform_grpc_url: format!(
+                "http://{}:{}",
+                state.config.server.host, state.config.server.port
+            ),
             env_vars: harness_env,
         };
 
@@ -1302,13 +1396,18 @@ async fn deploy_new_harness(
 
                 if let Err(e) = manager.start(&container_id).await {
                     warn!("Failed to start new harness: {}", e);
-                    let _ = sqlx::query("UPDATE harness_instances SET status = 'error' WHERE id = $1")
-                        .bind(harness_id)
-                        .execute(&state.db)
-                        .await;
+                    let _ =
+                        sqlx::query("UPDATE harness_instances SET status = 'error' WHERE id = $1")
+                            .bind(harness_id)
+                            .execute(&state.db)
+                            .await;
                 } else {
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                    let port = manager.inspect_host_port(&container_id).await.ok().flatten();
+                    let port = manager
+                        .inspect_host_port(&container_id)
+                        .await
+                        .ok()
+                        .flatten();
                     let internal_url = port.map(|p| format!("http://localhost:{}", p));
                     let _ = sqlx::query("UPDATE harness_instances SET status = 'running', started_at = NOW(), external_port = $1, internal_url = $2, healthy = TRUE WHERE id = $3")
                         .bind(port.map(|p| p as i32))
@@ -1374,10 +1473,7 @@ async fn logout_submit() -> Response {
         SESSION_COOKIE
     );
 
-    (
-        [(header::SET_COOKIE, cookie)],
-        Redirect::to("/login"),
-    ).into_response()
+    ([(header::SET_COOKIE, cookie)], Redirect::to("/login")).into_response()
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -1418,7 +1514,8 @@ impl<T: Template> IntoResponse for HtmlTemplate<T> {
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
                 html,
-            ).into_response(),
+            )
+                .into_response(),
             Err(e) => {
                 error!("Template render error: {}", e);
                 (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response()

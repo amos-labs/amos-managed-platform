@@ -100,15 +100,13 @@ impl HarnessManager {
 
         // Create container with host port bindings so it's reachable from the host.
         // Empty host_port ("") means Docker auto-assigns a random available port.
-        let port_bindings = HashMap::from([
-            (
-                "3000/tcp".to_string(),
-                Some(vec![PortBinding {
-                    host_ip: Some("0.0.0.0".to_string()),
-                    host_port: Some("".to_string()), // auto-assign
-                }]),
-            ),
-        ]);
+        let port_bindings = HashMap::from([(
+            "3000/tcp".to_string(),
+            Some(vec![PortBinding {
+                host_ip: Some("0.0.0.0".to_string()),
+                host_port: Some("".to_string()), // auto-assign
+            }]),
+        )]);
 
         let container_config = Config {
             image: Some(image.to_string()),
@@ -164,7 +162,7 @@ impl HarnessManager {
     /// Remove a harness container and volumes.
     pub async fn deprovision(&self, container_id: &str) -> Result<()> {
         let options = RemoveContainerOptions {
-            v: true,    // Remove volumes
+            v: true,     // Remove volumes
             force: true, // Force removal even if running
             ..Default::default()
         };
@@ -239,9 +237,7 @@ impl HarnessManager {
         while let Some(result) = stream.next().await {
             match result {
                 Ok(output) => logs.push(output.to_string()),
-                Err(e) => {
-                    return Err(AmosError::Internal(format!("Failed to read logs: {}", e)))
-                }
+                Err(e) => return Err(AmosError::Internal(format!("Failed to read logs: {}", e))),
             }
         }
 

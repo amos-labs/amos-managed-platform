@@ -5,7 +5,6 @@
 
 use axum::{
     extract::State,
-    http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -13,7 +12,6 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
-use uuid::Uuid;
 
 use crate::state::PlatformState;
 
@@ -28,6 +26,7 @@ pub fn routes() -> Router<PlatformState> {
 // ── Heartbeat ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct HeartbeatPayload {
     harness_version: String,
     deployment_mode: String,
@@ -50,8 +49,11 @@ async fn receive_heartbeat(
 ) -> impl IntoResponse {
     debug!(
         "Heartbeat received: version={}, mode={}, uptime={}s, healthy={}, tenant_id={:?}",
-        payload.harness_version, payload.deployment_mode,
-        payload.uptime_secs, payload.healthy, payload.tenant_id,
+        payload.harness_version,
+        payload.deployment_mode,
+        payload.uptime_secs,
+        payload.healthy,
+        payload.tenant_id,
     );
 
     // Update harness status in database if tenant_id is provided
@@ -64,7 +66,7 @@ async fn receive_heartbeat(
                     harness_version = $1,
                     healthy = $2
                 WHERE tenant_id = $3 AND status != 'deprovisioned'
-                "#
+                "#,
             )
             .bind(&payload.harness_version)
             .bind(payload.healthy)
@@ -77,7 +79,10 @@ async fn receive_heartbeat(
                     if result.rows_affected() > 0 {
                         debug!("Updated harness status for tenant {}", tenant_id);
                     } else {
-                        debug!("No harness instance found for tenant {} (may not be provisioned yet)", tenant_id);
+                        debug!(
+                            "No harness instance found for tenant {} (may not be provisioned yet)",
+                            tenant_id
+                        );
                     }
                 }
                 Err(e) => {
@@ -130,7 +135,10 @@ async fn get_config(
     State(state): State<PlatformState>,
     axum::extract::Query(query): axum::extract::Query<ConfigQuery>,
 ) -> impl IntoResponse {
-    debug!("Config request: version={:?}, tenant_id={:?}", query.version, query.tenant_id);
+    debug!(
+        "Config request: version={:?}, tenant_id={:?}",
+        query.version, query.tenant_id
+    );
 
     // Default config values
     let mut enabled = true;
@@ -146,7 +154,7 @@ async fn get_config(
                 SELECT enabled, feature_flags
                 FROM harness_configs
                 WHERE tenant_id = $1
-                "#
+                "#,
             )
             .bind(tenant_id)
             .fetch_optional(&state.db)
@@ -166,10 +174,16 @@ async fn get_config(
                     debug!("Loaded config from database for tenant {}", tenant_id);
                 }
                 Ok(None) => {
-                    debug!("No config found in database for tenant {}, using defaults", tenant_id);
+                    debug!(
+                        "No config found in database for tenant {}, using defaults",
+                        tenant_id
+                    );
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to fetch config from database: {}, using defaults", e);
+                    tracing::warn!(
+                        "Failed to fetch config from database: {}, using defaults",
+                        e
+                    );
                 }
             }
         }
@@ -187,6 +201,7 @@ async fn get_config(
 // ── Activity Ingest ─────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ActivityReport {
     period_start: String,
     period_end: String,
@@ -236,7 +251,7 @@ async fn receive_activity(
                     (tenant_id, period_start, period_end, conversations, messages,
                      tokens_input, tokens_output, tools_executed, models_used, received_at)
                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
-                    "#
+                    "#,
                 )
                 .bind(tenant_id)
                 .bind(period_start_utc)

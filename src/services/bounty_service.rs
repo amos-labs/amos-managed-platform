@@ -269,7 +269,7 @@ impl BountyService {
                     );
                     Ok(())
                 } else {
-                    Err(AmosError::Database(e.into()))
+                    Err(AmosError::Database(e))
                 }
             }
         }
@@ -304,8 +304,7 @@ impl BountyService {
         .fetch_all(&self.state.db)
         .await
         .unwrap_or_else(|e| {
-            if e.to_string().contains("does not exist") || e.to_string().contains("no such table")
-            {
+            if e.to_string().contains("does not exist") || e.to_string().contains("no such table") {
                 warn!("emission_records table does not exist, returning empty summary");
                 vec![]
             } else {
@@ -354,7 +353,7 @@ impl BountyService {
                     warn!("contribution_activities table does not exist, returning empty list");
                     Ok(vec![])
                 } else {
-                    Err(AmosError::Database(e.into()))
+                    Err(AmosError::Database(e))
                 }
             }
         }
@@ -424,7 +423,7 @@ impl BountyService {
                     warn!("emission_records table does not exist, skipping record");
                     Ok(())
                 } else {
-                    Err(AmosError::Database(e.into()))
+                    Err(AmosError::Database(e))
                 }
             }
         }
