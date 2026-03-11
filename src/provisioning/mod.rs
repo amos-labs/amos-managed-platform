@@ -1,5 +1,7 @@
 //! Harness provisioning and lifecycle management.
 
+pub mod ecs;
+
 use bollard::{
     container::{
         Config, CreateContainerOptions, RemoveContainerOptions, StartContainerOptions,

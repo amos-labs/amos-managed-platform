@@ -1,0 +1,429 @@
+//! ECS Fargate-based harness provisioning for production.
+//!
+//! When running in AWS (no Docker socket available), the platform
+//! provisions harness containers as ECS Fargate tasks instead of
+//! local Docker containers.
+
+use aws_sdk_ecs::{
+    types::{
+        AssignPublicIp, AwsVpcConfiguration, Compatibility, ContainerDefinition,
+        KeyValuePair, LaunchType, LogConfiguration, LogDriver, NetworkConfiguration,
+        NetworkMode, PortMapping, TransportProtocol,
+    },
+    Client as EcsClient,
+};
+
+use amos_core::{AmosError, Result};
+use tracing::info;
+
+use super::{HarnessConfig, HarnessStatus, InstanceSize};
+
+/// ECS Fargate-based harness provisioner.
+pub struct EcsProvisioner {
+    client: EcsClient,
+    cluster: String,
+    harness_image: String,
+    subnets: Vec<String>,
+    security_groups: Vec<String>,
+    execution_role_arn: String,
+    task_role_arn: String,
+    log_group: String,
+    aws_region: String,
+    /// Database URL for harness containers (shared DB for now).
+    harness_database_url: String,
+    /// Redis URL for harness containers.
+    harness_redis_url: String,
+    /// Platform URL that harness containers use for sync/heartbeat.
+    platform_url: String,
+}
+
+/// Configuration for the ECS provisioner, loaded from environment variables.
+#[derive(Debug, Clone)]
+pub struct EcsProvisionerConfig {
+    pub cluster: String,
+    pub harness_image: String,
+    pub subnets: Vec<String>,
+    pub security_groups: Vec<String>,
+    pub execution_role_arn: String,
+    pub task_role_arn: String,
+    pub log_group: String,
+    pub aws_region: String,
+    pub harness_database_url: String,
+    pub harness_redis_url: String,
+    pub platform_url: String,
+}
+
+impl EcsProvisionerConfig {
+    /// Load config from environment variables.
+    ///
+    /// Returns `None` if `ECS_HARNESS_IMAGE` is not set, which means
+    /// ECS provisioning is not configured (i.e., local dev mode).
+    pub fn from_env() -> Option<Self> {
+        // ECS_HARNESS_IMAGE is the gate: if not set, ECS provisioning is disabled.
+        let harness_image = std::env::var("ECS_HARNESS_IMAGE").ok()?;
+
+        let cluster = std::env::var("ECS_CLUSTER")
+            .unwrap_or_else(|_| "swarm-infrastructure-cluster".to_string());
+
+        let subnets = std::env::var("ECS_SUBNETS")
+            .unwrap_or_else(|_| {
+                "subnet-0cfcbfd1c0ef057e7,subnet-0c5928d36478a1be4".to_string()
+            })
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let security_groups = std::env::var("ECS_SECURITY_GROUPS")
+            .unwrap_or_else(|_| "sg-0967e26d543a5ce47".to_string())
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let execution_role_arn = std::env::var("ECS_EXECUTION_ROLE_ARN").unwrap_or_else(|_| {
+            "arn:aws:iam::637423327454:role/swarm-infrastructure-ecs-execution-role".to_string()
+        });
+
+        let task_role_arn = std::env::var("ECS_TASK_ROLE_ARN").unwrap_or_else(|_| {
+            "arn:aws:iam::637423327454:role/swarm-infrastructure-rails-task-role".to_string()
+        });
+
+        let log_group = std::env::var("ECS_HARNESS_LOG_GROUP")
+            .unwrap_or_else(|_| "/ecs/amos-harness".to_string());
+
+        let aws_region = std::env::var("AWS_REGION")
+            .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+            .unwrap_or_else(|_| "us-east-1".to_string());
+
+        let harness_database_url =
+            std::env::var("ECS_HARNESS_DATABASE_URL").unwrap_or_default();
+
+        let harness_redis_url = std::env::var("ECS_HARNESS_REDIS_URL")
+            .or_else(|_| std::env::var("AMOS__REDIS__URL"))
+            .unwrap_or_else(|_| "redis://localhost:6379/2".to_string());
+
+        let platform_url = std::env::var("ECS_PLATFORM_URL")
+            .unwrap_or_else(|_| "https://app.amoslabs.com".to_string());
+
+        Some(Self {
+            cluster,
+            harness_image,
+            subnets,
+            security_groups,
+            execution_role_arn,
+            task_role_arn,
+            log_group,
+            aws_region,
+            harness_database_url,
+            harness_redis_url,
+            platform_url,
+        })
+    }
+}
+
+impl EcsProvisioner {
+    /// Create a new ECS provisioner and verify connectivity.
+    pub async fn new(config: EcsProvisionerConfig) -> Result<Self> {
+        let aws_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .region(aws_config::Region::new(config.aws_region.clone()))
+            .load()
+            .await;
+
+        let client = EcsClient::new(&aws_config);
+
+        // Verify connectivity by describing the cluster.
+        let result = client
+            .describe_clusters()
+            .clusters(&config.cluster)
+            .send()
+            .await
+            .map_err(|e| AmosError::Internal(format!("Failed to connect to ECS: {}", e)))?;
+
+        let active = result
+            .clusters()
+            .iter()
+            .any(|c| c.status() == Some("ACTIVE"));
+
+        if !active {
+            return Err(AmosError::Internal(format!(
+                "ECS cluster '{}' not found or not active",
+                config.cluster
+            )));
+        }
+
+        info!(
+            cluster = %config.cluster,
+            image = %config.harness_image,
+            "ECS provisioner connected"
+        );
+
+        Ok(Self {
+            client,
+            cluster: config.cluster,
+            harness_image: config.harness_image,
+            subnets: config.subnets,
+            security_groups: config.security_groups,
+            execution_role_arn: config.execution_role_arn,
+            task_role_arn: config.task_role_arn,
+            log_group: config.log_group,
+            aws_region: config.aws_region,
+            harness_database_url: config.harness_database_url,
+            harness_redis_url: config.harness_redis_url,
+            platform_url: config.platform_url,
+        })
+    }
+
+    /// Provision a new harness as an ECS Fargate task.
+    ///
+    /// Returns the ECS task ARN (stored as `container_id` in the DB).
+    pub async fn provision(
+        &self,
+        config: &HarnessConfig,
+        tenant_slug: &str,
+    ) -> Result<String> {
+        let family = format!("amos-harness-{}", tenant_slug);
+
+        let (cpu, memory) = fargate_resources(config.instance_size);
+
+        // Build environment variables for the harness container.
+        let mut env_vars = vec![
+            kv("CUSTOMER_ID", &config.customer_id.to_string()),
+            kv("AMOS_ENV", &config.environment),
+            kv("AMOS__SERVER__PORT", "3000"),
+            kv("AMOS__SERVER__HOST", "0.0.0.0"),
+            kv("AMOS__PLATFORM__URL", &self.platform_url),
+            kv("RUST_LOG", "info,amos_harness=debug"),
+            kv("RUST_BACKTRACE", "1"),
+        ];
+
+        if !self.harness_database_url.is_empty() {
+            env_vars.push(kv("AMOS__DATABASE__URL", &self.harness_database_url));
+        }
+        if !self.harness_redis_url.is_empty() {
+            env_vars.push(kv("AMOS__REDIS__URL", &self.harness_redis_url));
+        }
+
+        // Forward any extra env vars from HarnessConfig.
+        for (key, value) in &config.env_vars {
+            env_vars.push(kv(key, value));
+        }
+
+        // Build log configuration.
+        let mut log_options = std::collections::HashMap::new();
+        log_options.insert("awslogs-group".to_string(), self.log_group.clone());
+        log_options.insert("awslogs-region".to_string(), self.aws_region.clone());
+        log_options.insert(
+            "awslogs-stream-prefix".to_string(),
+            tenant_slug.to_string(),
+        );
+
+        // Register a task definition for this tenant.
+        let task_def_result = self
+            .client
+            .register_task_definition()
+            .family(&family)
+            .requires_compatibilities(Compatibility::Fargate)
+            .network_mode(NetworkMode::Awsvpc)
+            .cpu(cpu)
+            .memory(memory)
+            .execution_role_arn(&self.execution_role_arn)
+            .task_role_arn(&self.task_role_arn)
+            .container_definitions(
+                ContainerDefinition::builder()
+                    .name("amos-harness")
+                    .image(&self.harness_image)
+                    .essential(true)
+                    .port_mappings(
+                        PortMapping::builder()
+                            .container_port(3000)
+                            .host_port(3000)
+                            .protocol(TransportProtocol::Tcp)
+                            .build(),
+                    )
+                    .set_environment(Some(env_vars))
+                    .log_configuration(
+                        LogConfiguration::builder()
+                            .log_driver(LogDriver::Awslogs)
+                            .set_options(Some(log_options))
+                            .build()
+                            .map_err(|e| AmosError::Internal(format!("Failed to build log config: {}", e)))?,
+                    )
+                    .build(),
+            )
+            .send()
+            .await
+            .map_err(|e| {
+                AmosError::Internal(format!("Failed to register task definition: {}", e))
+            })?;
+
+        let task_def_arn = task_def_result
+            .task_definition()
+            .and_then(|td| td.task_definition_arn())
+            .ok_or_else(|| {
+                AmosError::Internal("Task definition ARN missing from response".into())
+            })?
+            .to_string();
+
+        info!(family = %family, arn = %task_def_arn, "Task definition registered");
+
+        // Run the task.
+        let run_result = self
+            .client
+            .run_task()
+            .cluster(&self.cluster)
+            .task_definition(&task_def_arn)
+            .launch_type(LaunchType::Fargate)
+            .count(1)
+            .network_configuration(
+                NetworkConfiguration::builder()
+                    .awsvpc_configuration(
+                        AwsVpcConfiguration::builder()
+                            .set_subnets(Some(self.subnets.clone()))
+                            .set_security_groups(Some(self.security_groups.clone()))
+                            .assign_public_ip(AssignPublicIp::Enabled)
+                            .build()
+                            .map_err(|e| AmosError::Internal(format!("Failed to build VPC config: {}", e)))?,
+                    )
+                    .build(),
+            )
+            .send()
+            .await
+            .map_err(|e| AmosError::Internal(format!("Failed to run ECS task: {}", e)))?;
+
+        let task_arn = run_result
+            .tasks()
+            .first()
+            .and_then(|t| t.task_arn())
+            .ok_or_else(|| {
+                let reason = run_result
+                    .failures()
+                    .first()
+                    .map(|f| {
+                        format!(
+                            "{}: {}",
+                            f.arn().unwrap_or("?"),
+                            f.reason().unwrap_or("?")
+                        )
+                    })
+                    .unwrap_or_else(|| "Unknown failure".to_string());
+                AmosError::Internal(format!("ECS task failed to start: {}", reason))
+            })?
+            .to_string();
+
+        info!(task_arn = %task_arn, family = %family, "ECS task launched");
+
+        Ok(task_arn)
+    }
+
+    /// Describe a task and return its status and private IP.
+    pub async fn describe_task(
+        &self,
+        task_arn: &str,
+    ) -> Result<(HarnessStatus, Option<String>)> {
+        let result = self
+            .client
+            .describe_tasks()
+            .cluster(&self.cluster)
+            .tasks(task_arn)
+            .send()
+            .await
+            .map_err(|e| AmosError::Internal(format!("Failed to describe task: {}", e)))?;
+
+        let task = result
+            .tasks()
+            .first()
+            .ok_or_else(|| AmosError::Internal("Task not found in ECS".into()))?;
+
+        let status = match task.last_status() {
+            Some("RUNNING") => HarnessStatus::Running,
+            Some("PROVISIONING") | Some("PENDING") | Some("ACTIVATING") => {
+                HarnessStatus::Provisioning
+            }
+            Some("STOPPED") | Some("DEACTIVATING") | Some("STOPPING") => {
+                // Check stop code for error vs normal stop.
+                let is_error = task
+                    .stop_code()
+                    .map(|c| c.as_str() == "TaskFailedToStart" || c.as_str() == "EssentialContainerExited")
+                    .unwrap_or(false);
+                if is_error {
+                    HarnessStatus::Error
+                } else {
+                    HarnessStatus::Stopped
+                }
+            }
+            _ => HarnessStatus::Provisioning,
+        };
+
+        // Extract private IP from ENI attachment details.
+        let private_ip = task
+            .attachments()
+            .iter()
+            .filter(|a| a.r#type() == Some("ElasticNetworkInterface"))
+            .flat_map(|a| a.details())
+            .find(|d| d.name() == Some("privateIPv4Address"))
+            .and_then(|d| d.value().map(|v| v.to_string()));
+
+        Ok((status, private_ip))
+    }
+
+    /// Stop a running ECS task.
+    pub async fn stop(&self, task_arn: &str) -> Result<()> {
+        self.client
+            .stop_task()
+            .cluster(&self.cluster)
+            .task(task_arn)
+            .reason("Stopped by AMOS Platform")
+            .send()
+            .await
+            .map_err(|e| AmosError::Internal(format!("Failed to stop ECS task: {}", e)))?;
+
+        info!(task_arn = %task_arn, "ECS task stopped");
+        Ok(())
+    }
+
+    /// Get logs hint — ECS logs are in CloudWatch, not fetchable inline.
+    pub fn logs_hint(&self, tenant_slug: &str) -> String {
+        format!(
+            "Logs are in CloudWatch: {} (stream prefix: {})",
+            self.log_group, tenant_slug
+        )
+    }
+}
+
+/// Map `InstanceSize` to valid Fargate CPU/memory strings.
+fn fargate_resources(size: InstanceSize) -> (&'static str, &'static str) {
+    match size {
+        InstanceSize::Small => ("512", "1024"),   // 0.5 vCPU, 1 GB
+        InstanceSize::Medium => ("1024", "2048"), // 1 vCPU, 2 GB
+        InstanceSize::Large => ("2048", "4096"),  // 2 vCPU, 4 GB
+    }
+}
+
+/// Helper to build a `KeyValuePair` for ECS container environment.
+fn kv(name: &str, value: &str) -> KeyValuePair {
+    KeyValuePair::builder()
+        .name(name)
+        .value(value)
+        .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fargate_resources_valid_combos() {
+        // Verify all combos are valid Fargate CPU/memory pairs.
+        assert_eq!(fargate_resources(InstanceSize::Small), ("512", "1024"));
+        assert_eq!(fargate_resources(InstanceSize::Medium), ("1024", "2048"));
+        assert_eq!(fargate_resources(InstanceSize::Large), ("2048", "4096"));
+    }
+
+    #[test]
+    fn config_from_env_disabled_without_image() {
+        // Without ECS_HARNESS_IMAGE, config returns None.
+        std::env::remove_var("ECS_HARNESS_IMAGE");
+        assert!(EcsProvisionerConfig::from_env().is_none());
+    }
+}

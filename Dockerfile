@@ -9,8 +9,8 @@ WORKDIR /app
 # Copy everything
 COPY . .
 
-# Build the platform binary
-RUN cargo build --release --bin amos-platform
+# Build the platform binary (SQLX_OFFLINE since no live DB in Docker build)
+RUN SQLX_OFFLINE=true cargo build --release --bin amos-platform
 
 # Stage 2: Runtime
 FROM debian:bookworm-slim

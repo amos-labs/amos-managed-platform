@@ -7,6 +7,7 @@ use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::sync::Arc;
 use tracing::{info, warn};
 
+use crate::provisioning::ecs::{EcsProvisioner, EcsProvisionerConfig};
 use crate::provisioning::HarnessManager;
 use crate::solana::SolanaClient;
 
@@ -24,8 +25,10 @@ pub struct PlatformState {
     pub config: Arc<AppConfig>,
     /// Optional Solana RPC client (None if feature disabled).
     pub solana: Option<Arc<SolanaClient>>,
-    /// Harness provisioning manager (Docker API).
+    /// Harness provisioning manager (Docker API — local dev).
     pub harness_manager: Option<Arc<HarnessManager>>,
+    /// ECS Fargate provisioner (production — used when Docker unavailable).
+    pub ecs_provisioner: Option<Arc<EcsProvisioner>>,
 }
 
 impl PlatformState {
@@ -78,12 +81,37 @@ impl PlatformState {
             }
         };
 
+        // Initialize ECS provisioner (production — used when Docker is not available).
+        // Only activates when ECS_HARNESS_IMAGE env var is set.
+        let ecs_provisioner = if harness_manager.is_none() {
+            match EcsProvisionerConfig::from_env() {
+                Some(ecs_config) => match EcsProvisioner::new(ecs_config).await {
+                    Ok(provisioner) => {
+                        info!("ECS provisioner initialized (Fargate mode)");
+                        Some(Arc::new(provisioner))
+                    }
+                    Err(e) => {
+                        warn!("ECS provisioner initialization failed (optional): {}", e);
+                        None
+                    }
+                },
+                None => {
+                    info!("ECS provisioner not configured (ECS_HARNESS_IMAGE not set)");
+                    None
+                }
+            }
+        } else {
+            // Docker is available, no need for ECS provisioner.
+            None
+        };
+
         Ok(Self {
             db,
             redis,
             config: Arc::new(config),
             solana,
             harness_manager,
+            ecs_provisioner,
         })
     }
 

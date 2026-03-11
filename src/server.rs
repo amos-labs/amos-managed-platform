@@ -37,7 +37,9 @@ pub async fn start_http_server(state: PlatformState) -> Result<()> {
 }
 
 /// Build the Axum router with all routes and middleware.
-fn build_http_router(state: PlatformState) -> Router {
+///
+/// Public so integration tests can construct the app without binding to a port.
+pub fn build_http_router(state: PlatformState) -> Router {
     let api_routes = routes::api_routes();
 
     let ui_routes = routes::ui::routes();

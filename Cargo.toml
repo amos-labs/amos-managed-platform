@@ -60,8 +60,12 @@ opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 
-# Docker/container provisioning
+# Docker/container provisioning (local dev)
 bollard = "0.18"
+
+# AWS ECS provisioning (production Fargate)
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-ecs = "1"
 
 # Misc
 secrecy = { version = "0.10", features = ["serde"] }
@@ -82,8 +86,13 @@ askama = "0.15"
 askama_web = { version = "0.15", features = ["axum-0.8"] }
 
 [dev-dependencies]
-tokio = { version = "1.43", features = ["test-util"] }
+tokio = { version = "1.43", features = ["full", "test-util"] }
 pretty_assertions = "1.4"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+hyper = "1"
+uuid = { version = "1.11", features = ["v4"] }
+serde_json = "1.0"
 
 [profile.release]
 opt-level = 3

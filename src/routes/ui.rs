@@ -4,7 +4,7 @@
 //! Authentication is cookie-based (JWT stored in httponly cookie).
 
 use axum::{
-    extract::{Form, State},
+    extract::{Form, Path, State},
     http::{header, StatusCode},
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -47,6 +47,8 @@ struct DashboardTemplate {
     instances: Vec<HarnessInfo>,
     user_count: i64,
     api_key_count: i64,
+    flash_message: Option<String>,
+    flash_error: Option<String>,
 }
 
 #[derive(Template)]
@@ -64,6 +66,7 @@ struct SettingsTemplate {
 
 struct HarnessInfo {
     id: String,
+    full_id: String,
     status: String,
     subdomain: Option<String>,
     region: String,
@@ -118,6 +121,12 @@ pub fn routes() -> Router<PlatformState> {
         .route("/dashboard", get(dashboard_page))
         .route("/settings", get(settings_page))
         .route("/settings/api-keys", post(create_api_key_submit))
+        .route("/dashboard/harness/new", post(deploy_new_harness))
+        .route("/dashboard/harness/{id}/start", post(harness_start))
+        .route("/dashboard/harness/{id}/stop", post(harness_stop))
+        .route("/dashboard/harness/{id}/restart", post(harness_restart))
+        .route("/dashboard/harness/{id}/redeploy", post(harness_redeploy))
+        .route("/dashboard/harness/{id}/delete", post(harness_delete))
         .route("/logout", post(logout_submit))
 }
 
@@ -480,8 +489,125 @@ async fn register_submit(
                 .await;
             }
         }
+    } else if let Some(ref ecs) = state.ecs_provisioner {
+        // Production path: provision harness as an ECS Fargate task.
+        info!(tenant_id = %tenant_id, harness_id = %harness_id, "Provisioning harness via ECS Fargate");
+
+        let _ = sqlx::query(
+            "UPDATE harness_instances SET status = 'provisioning' WHERE id = $1"
+        )
+        .bind(harness_id)
+        .execute(&state.db)
+        .await;
+
+        let ecs_config = HarnessConfig {
+            customer_id: tenant_id,
+            region: "us-east-1".to_string(),
+            instance_size: InstanceSize::Small,
+            environment: "production".to_string(),
+            platform_grpc_url: String::new(), // Not used by ECS provisioner
+            env_vars: HashMap::new(),         // ECS provisioner sets its own env
+        };
+
+        match ecs.provision(&ecs_config, &slug).await {
+            Ok(task_arn) => {
+                info!(task_arn = %task_arn, "ECS task launched for tenant");
+
+                // Store the task ARN as container_id
+                let _ = sqlx::query(
+                    "UPDATE harness_instances
+                     SET container_id = $1, provisioned_at = NOW()
+                     WHERE id = $2"
+                )
+                .bind(&task_arn)
+                .bind(harness_id)
+                .execute(&state.db)
+                .await;
+
+                // Spawn a background task to poll ECS for RUNNING status.
+                // The registration response returns immediately; the dashboard
+                // will show "provisioning" until this background poller updates the row.
+                let ecs_bg = state.ecs_provisioner.clone().unwrap();
+                let db_bg = state.db.clone();
+                let task_arn_bg = task_arn.clone();
+
+                tokio::spawn(async move {
+                    for attempt in 1..=24 {
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+                        match ecs_bg.describe_task(&task_arn_bg).await {
+                            Ok((crate::provisioning::HarnessStatus::Running, private_ip)) => {
+                                let internal_url = private_ip
+                                    .as_ref()
+                                    .map(|ip| format!("http://{}:3000", ip));
+
+                                let _ = sqlx::query(
+                                    "UPDATE harness_instances
+                                     SET status = 'running',
+                                         started_at = NOW(),
+                                         internal_url = $1,
+                                         healthy = TRUE
+                                     WHERE id = $2"
+                                )
+                                .bind(&internal_url)
+                                .bind(harness_id)
+                                .execute(&db_bg)
+                                .await;
+
+                                info!(
+                                    harness_id = %harness_id,
+                                    ip = ?private_ip,
+                                    attempt = attempt,
+                                    "ECS harness task is running"
+                                );
+                                return;
+                            }
+                            Ok((crate::provisioning::HarnessStatus::Error, _)) => {
+                                let _ = sqlx::query(
+                                    "UPDATE harness_instances SET status = 'error' WHERE id = $1"
+                                )
+                                .bind(harness_id)
+                                .execute(&db_bg)
+                                .await;
+
+                                warn!(harness_id = %harness_id, "ECS harness task failed");
+                                return;
+                            }
+                            Ok((status, _)) => {
+                                info!(
+                                    attempt = attempt,
+                                    status = ?status,
+                                    "ECS harness task not yet running"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(attempt = attempt, "Failed to describe ECS task: {}", e);
+                            }
+                        }
+                    }
+
+                    // Timed out after 2 minutes — mark as error
+                    warn!(harness_id = %harness_id, "ECS harness task timed out after 2 minutes");
+                    let _ = sqlx::query(
+                        "UPDATE harness_instances SET status = 'error' WHERE id = $1"
+                    )
+                    .bind(harness_id)
+                    .execute(&db_bg)
+                    .await;
+                });
+            }
+            Err(e) => {
+                error!("Failed to provision ECS harness task: {}", e);
+                let _ = sqlx::query(
+                    "UPDATE harness_instances SET status = 'error' WHERE id = $1"
+                )
+                .bind(harness_id)
+                .execute(&state.db)
+                .await;
+            }
+        }
     } else {
-        warn!("Docker not available — harness instance created as pending only");
+        warn!("No provisioner available (Docker or ECS) — harness instance created as pending only");
     }
 
     // Issue JWT and set cookie
@@ -553,6 +679,7 @@ async fn dashboard_page(
         .into_iter()
         .map(|(id, status, subdomain, region, instance_size, healthy, _external_port, internal_url, container_id)| HarnessInfo {
             id: id.to_string()[..8].to_string(),
+            full_id: id.to_string(),
             status,
             subdomain,
             region,
@@ -587,6 +714,8 @@ async fn dashboard_page(
         instances,
         user_count,
         api_key_count,
+        flash_message: None,
+        flash_error: None,
     }).into_response()
 }
 
@@ -734,6 +863,507 @@ async fn create_api_key_submit(
             ).await
         }
     }
+}
+
+// ── Harness Management ────────────────────────────────────────────────
+
+/// Helper: verify the session and that the harness instance belongs to the tenant.
+async fn verify_harness_ownership(
+    state: &PlatformState,
+    headers: &axum::http::HeaderMap,
+    harness_id: &str,
+) -> Result<(auth::Claims, Uuid, Option<String>), Response> {
+    let claims = extract_session_claims(state, headers)
+        .ok_or_else(|| Redirect::to("/login").into_response())?;
+
+    let tenant_id: Uuid = claims.tenant_id.parse()
+        .map_err(|_| Redirect::to("/login").into_response())?;
+
+    let harness_uuid: Uuid = harness_id.parse()
+        .map_err(|_| Redirect::to("/dashboard").into_response())?;
+
+    // Verify the instance belongs to this tenant and get container_id
+    let row = sqlx::query_as::<_, (Option<String>,)>(
+        "SELECT container_id FROM harness_instances WHERE id = $1 AND tenant_id = $2"
+    )
+    .bind(harness_uuid)
+    .bind(tenant_id)
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten();
+
+    let container_id = match row {
+        Some((cid,)) => cid,
+        None => return Err(Redirect::to("/dashboard").into_response()),
+    };
+
+    Ok((claims, harness_uuid, container_id))
+}
+
+async fn harness_start(
+    State(state): State<PlatformState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let (_claims, harness_id, container_id) = match verify_harness_ownership(&state, &headers, &id).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+
+    let container_id = match container_id {
+        Some(cid) => cid,
+        None => return Redirect::to("/dashboard").into_response(),
+    };
+
+    if let Some(ref manager) = state.harness_manager {
+        match manager.start(&container_id).await {
+            Ok(()) => {
+                let _ = sqlx::query("UPDATE harness_instances SET status = 'running', started_at = NOW(), healthy = TRUE WHERE id = $1")
+                    .bind(harness_id)
+                    .execute(&state.db)
+                    .await;
+                info!(harness_id = %harness_id, "Harness started via dashboard");
+            }
+            Err(e) => {
+                error!("Failed to start harness {}: {}", harness_id, e);
+            }
+        }
+    } else if let Some(ref ecs) = state.ecs_provisioner {
+        // ECS tasks can't be "started" — they must be re-provisioned.
+        // For ECS, treat start as a redeploy.
+        let tenant_slug: String = sqlx::query_scalar(
+            "SELECT t.slug FROM tenants t JOIN harness_instances h ON h.tenant_id = t.id WHERE h.id = $1"
+        )
+        .bind(harness_id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "unknown".into());
+
+        let ecs_config = HarnessConfig {
+            customer_id: Uuid::nil(),
+            region: "us-east-1".to_string(),
+            instance_size: InstanceSize::Small,
+            environment: "production".to_string(),
+            platform_grpc_url: String::new(),
+            env_vars: HashMap::new(),
+        };
+
+        match ecs.provision(&ecs_config, &tenant_slug).await {
+            Ok(task_arn) => {
+                let _ = sqlx::query("UPDATE harness_instances SET container_id = $1, status = 'provisioning', provisioned_at = NOW() WHERE id = $2")
+                    .bind(&task_arn)
+                    .bind(harness_id)
+                    .execute(&state.db)
+                    .await;
+                info!(task_arn = %task_arn, "ECS harness re-provisioned via dashboard");
+            }
+            Err(e) => {
+                error!("Failed to re-provision ECS harness {}: {}", harness_id, e);
+            }
+        }
+    }
+
+    Redirect::to("/dashboard").into_response()
+}
+
+async fn harness_stop(
+    State(state): State<PlatformState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let (_claims, harness_id, container_id) = match verify_harness_ownership(&state, &headers, &id).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+
+    let container_id = match container_id {
+        Some(cid) => cid,
+        None => return Redirect::to("/dashboard").into_response(),
+    };
+
+    if let Some(ref manager) = state.harness_manager {
+        match manager.stop(&container_id).await {
+            Ok(()) => {
+                let _ = sqlx::query("UPDATE harness_instances SET status = 'stopped', healthy = FALSE WHERE id = $1")
+                    .bind(harness_id)
+                    .execute(&state.db)
+                    .await;
+                info!(harness_id = %harness_id, "Harness stopped via dashboard");
+            }
+            Err(e) => {
+                error!("Failed to stop harness {}: {}", harness_id, e);
+            }
+        }
+    } else if let Some(ref ecs) = state.ecs_provisioner {
+        match ecs.stop(&container_id).await {
+            Ok(()) => {
+                let _ = sqlx::query("UPDATE harness_instances SET status = 'stopped', healthy = FALSE WHERE id = $1")
+                    .bind(harness_id)
+                    .execute(&state.db)
+                    .await;
+                info!(harness_id = %harness_id, "ECS harness stopped via dashboard");
+            }
+            Err(e) => {
+                error!("Failed to stop ECS harness {}: {}", harness_id, e);
+            }
+        }
+    }
+
+    Redirect::to("/dashboard").into_response()
+}
+
+async fn harness_restart(
+    State(state): State<PlatformState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let (_claims, harness_id, container_id) = match verify_harness_ownership(&state, &headers, &id).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+
+    let container_id = match container_id {
+        Some(cid) => cid,
+        None => return Redirect::to("/dashboard").into_response(),
+    };
+
+    if let Some(ref manager) = state.harness_manager {
+        // Stop then start
+        let _ = manager.stop(&container_id).await;
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        match manager.start(&container_id).await {
+            Ok(()) => {
+                let _ = sqlx::query("UPDATE harness_instances SET status = 'running', started_at = NOW() WHERE id = $1")
+                    .bind(harness_id)
+                    .execute(&state.db)
+                    .await;
+                info!(harness_id = %harness_id, "Harness restarted via dashboard");
+            }
+            Err(e) => {
+                error!("Failed to restart harness {}: {}", harness_id, e);
+                let _ = sqlx::query("UPDATE harness_instances SET status = 'error', healthy = FALSE WHERE id = $1")
+                    .bind(harness_id)
+                    .execute(&state.db)
+                    .await;
+            }
+        }
+    } else if let Some(ref ecs) = state.ecs_provisioner {
+        // ECS: stop old task, provision new one
+        let _ = ecs.stop(&container_id).await;
+
+        let tenant_slug: String = sqlx::query_scalar(
+            "SELECT t.slug FROM tenants t JOIN harness_instances h ON h.tenant_id = t.id WHERE h.id = $1"
+        )
+        .bind(harness_id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "unknown".into());
+
+        let ecs_config = HarnessConfig {
+            customer_id: Uuid::nil(),
+            region: "us-east-1".to_string(),
+            instance_size: InstanceSize::Small,
+            environment: "production".to_string(),
+            platform_grpc_url: String::new(),
+            env_vars: HashMap::new(),
+        };
+
+        match ecs.provision(&ecs_config, &tenant_slug).await {
+            Ok(task_arn) => {
+                let _ = sqlx::query("UPDATE harness_instances SET container_id = $1, status = 'provisioning', provisioned_at = NOW() WHERE id = $2")
+                    .bind(&task_arn)
+                    .bind(harness_id)
+                    .execute(&state.db)
+                    .await;
+                info!(task_arn = %task_arn, "ECS harness restarted via dashboard");
+            }
+            Err(e) => {
+                error!("Failed to restart ECS harness {}: {}", harness_id, e);
+            }
+        }
+    }
+
+    Redirect::to("/dashboard").into_response()
+}
+
+async fn harness_redeploy(
+    State(state): State<PlatformState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let (_claims, harness_id, container_id) = match verify_harness_ownership(&state, &headers, &id).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+
+    // Stop old container/task if it exists
+    if let Some(cid) = &container_id {
+        if let Some(ref manager) = state.harness_manager {
+            let _ = manager.deprovision(cid).await;
+        } else if let Some(ref ecs) = state.ecs_provisioner {
+            let _ = ecs.stop(cid).await;
+        }
+    }
+
+    // Get tenant info for provisioning
+    let tenant_row = sqlx::query_as::<_, (Uuid, String)>(
+        "SELECT t.id, t.slug FROM tenants t JOIN harness_instances h ON h.tenant_id = t.id WHERE h.id = $1"
+    )
+    .bind(harness_id)
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten();
+
+    let (tenant_id, tenant_slug) = match tenant_row {
+        Some(r) => r,
+        None => return Redirect::to("/dashboard").into_response(),
+    };
+
+    let _ = sqlx::query("UPDATE harness_instances SET status = 'provisioning', healthy = FALSE WHERE id = $1")
+        .bind(harness_id)
+        .execute(&state.db)
+        .await;
+
+    if let Some(ref manager) = state.harness_manager {
+        let mut harness_env = HashMap::new();
+        harness_env.insert("AMOS__DATABASE__URL".to_string(), "postgres://rickbarkley@host.docker.internal:5432/amos_dev".to_string());
+        harness_env.insert("AMOS__REDIS__URL".to_string(), "redis://host.docker.internal:6379".to_string());
+        harness_env.insert("AMOS__PLATFORM__URL".to_string(), format!("http://host.docker.internal:{}", state.config.server.port));
+
+        let config = HarnessConfig {
+            customer_id: tenant_id,
+            region: "us-west-2".to_string(),
+            instance_size: InstanceSize::Small,
+            environment: "development".to_string(),
+            platform_grpc_url: format!("http://{}:{}", state.config.server.host, state.config.server.port),
+            env_vars: harness_env,
+        };
+
+        match manager.provision(&config).await {
+            Ok(new_container_id) => {
+                let _ = sqlx::query("UPDATE harness_instances SET container_id = $1, provisioned_at = NOW() WHERE id = $2")
+                    .bind(&new_container_id)
+                    .bind(harness_id)
+                    .execute(&state.db)
+                    .await;
+
+                if let Err(e) = manager.start(&new_container_id).await {
+                    warn!("Failed to start redeployed harness: {}", e);
+                    let _ = sqlx::query("UPDATE harness_instances SET status = 'error' WHERE id = $1")
+                        .bind(harness_id)
+                        .execute(&state.db)
+                        .await;
+                } else {
+                    // Quick port detection
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    let port = manager.inspect_host_port(&new_container_id).await.ok().flatten();
+                    let internal_url = port.map(|p| format!("http://localhost:{}", p));
+                    let _ = sqlx::query("UPDATE harness_instances SET status = 'running', started_at = NOW(), external_port = $1, internal_url = $2, healthy = TRUE WHERE id = $3")
+                        .bind(port.map(|p| p as i32))
+                        .bind(&internal_url)
+                        .bind(harness_id)
+                        .execute(&state.db)
+                        .await;
+                    info!(harness_id = %harness_id, "Harness redeployed via dashboard");
+                }
+            }
+            Err(e) => {
+                error!("Failed to redeploy harness {}: {}", harness_id, e);
+                let _ = sqlx::query("UPDATE harness_instances SET status = 'error' WHERE id = $1")
+                    .bind(harness_id)
+                    .execute(&state.db)
+                    .await;
+            }
+        }
+    } else if let Some(ref ecs) = state.ecs_provisioner {
+        let ecs_config = HarnessConfig {
+            customer_id: tenant_id,
+            region: "us-east-1".to_string(),
+            instance_size: InstanceSize::Small,
+            environment: "production".to_string(),
+            platform_grpc_url: String::new(),
+            env_vars: HashMap::new(),
+        };
+
+        match ecs.provision(&ecs_config, &tenant_slug).await {
+            Ok(task_arn) => {
+                let _ = sqlx::query("UPDATE harness_instances SET container_id = $1, provisioned_at = NOW() WHERE id = $2")
+                    .bind(&task_arn)
+                    .bind(harness_id)
+                    .execute(&state.db)
+                    .await;
+                info!(task_arn = %task_arn, "ECS harness redeployed via dashboard");
+            }
+            Err(e) => {
+                error!("Failed to redeploy ECS harness {}: {}", harness_id, e);
+                let _ = sqlx::query("UPDATE harness_instances SET status = 'error' WHERE id = $1")
+                    .bind(harness_id)
+                    .execute(&state.db)
+                    .await;
+            }
+        }
+    }
+
+    Redirect::to("/dashboard").into_response()
+}
+
+async fn harness_delete(
+    State(state): State<PlatformState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let (_claims, harness_id, container_id) = match verify_harness_ownership(&state, &headers, &id).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+
+    // Remove the container/task
+    if let Some(cid) = &container_id {
+        if let Some(ref manager) = state.harness_manager {
+            let _ = manager.deprovision(cid).await;
+        } else if let Some(ref ecs) = state.ecs_provisioner {
+            let _ = ecs.stop(cid).await;
+        }
+    }
+
+    // Delete from database
+    let _ = sqlx::query("DELETE FROM harness_instances WHERE id = $1")
+        .bind(harness_id)
+        .execute(&state.db)
+        .await;
+
+    info!(harness_id = %harness_id, "Harness deleted via dashboard");
+    Redirect::to("/dashboard").into_response()
+}
+
+async fn deploy_new_harness(
+    State(state): State<PlatformState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let claims = match extract_session_claims(&state, &headers) {
+        Some(c) => c,
+        None => return Redirect::to("/login").into_response(),
+    };
+
+    let tenant_id: Uuid = match claims.tenant_id.parse() {
+        Ok(id) => id,
+        Err(_) => return Redirect::to("/login").into_response(),
+    };
+
+    let tenant_slug = claims.tenant_slug.clone();
+    let subdomain = Some(format!("{}-{}", tenant_slug, &Uuid::new_v4().to_string()[..4]));
+
+    // Create harness instance record
+    let harness_id = Uuid::new_v4();
+    let _ = sqlx::query(
+        "INSERT INTO harness_instances (id, tenant_id, subdomain, status)
+         VALUES ($1, $2, $3, 'pending')"
+    )
+    .bind(harness_id)
+    .bind(tenant_id)
+    .bind(&subdomain)
+    .execute(&state.db)
+    .await;
+
+    // Provision via Docker or ECS
+    if let Some(ref manager) = state.harness_manager {
+        let _ = sqlx::query("UPDATE harness_instances SET status = 'provisioning' WHERE id = $1")
+            .bind(harness_id)
+            .execute(&state.db)
+            .await;
+
+        let mut harness_env = HashMap::new();
+        harness_env.insert("AMOS__DATABASE__URL".to_string(), "postgres://rickbarkley@host.docker.internal:5432/amos_dev".to_string());
+        harness_env.insert("AMOS__REDIS__URL".to_string(), "redis://host.docker.internal:6379".to_string());
+        harness_env.insert("AMOS__PLATFORM__URL".to_string(), format!("http://host.docker.internal:{}", state.config.server.port));
+
+        let config = HarnessConfig {
+            customer_id: tenant_id,
+            region: "us-west-2".to_string(),
+            instance_size: InstanceSize::Small,
+            environment: "development".to_string(),
+            platform_grpc_url: format!("http://{}:{}", state.config.server.host, state.config.server.port),
+            env_vars: harness_env,
+        };
+
+        match manager.provision(&config).await {
+            Ok(container_id) => {
+                let _ = sqlx::query("UPDATE harness_instances SET container_id = $1, provisioned_at = NOW() WHERE id = $2")
+                    .bind(&container_id)
+                    .bind(harness_id)
+                    .execute(&state.db)
+                    .await;
+
+                if let Err(e) = manager.start(&container_id).await {
+                    warn!("Failed to start new harness: {}", e);
+                    let _ = sqlx::query("UPDATE harness_instances SET status = 'error' WHERE id = $1")
+                        .bind(harness_id)
+                        .execute(&state.db)
+                        .await;
+                } else {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    let port = manager.inspect_host_port(&container_id).await.ok().flatten();
+                    let internal_url = port.map(|p| format!("http://localhost:{}", p));
+                    let _ = sqlx::query("UPDATE harness_instances SET status = 'running', started_at = NOW(), external_port = $1, internal_url = $2, healthy = TRUE WHERE id = $3")
+                        .bind(port.map(|p| p as i32))
+                        .bind(&internal_url)
+                        .bind(harness_id)
+                        .execute(&state.db)
+                        .await;
+                    info!(harness_id = %harness_id, "New harness deployed via dashboard");
+                }
+            }
+            Err(e) => {
+                error!("Failed to deploy new harness: {}", e);
+                let _ = sqlx::query("UPDATE harness_instances SET status = 'error' WHERE id = $1")
+                    .bind(harness_id)
+                    .execute(&state.db)
+                    .await;
+            }
+        }
+    } else if let Some(ref ecs) = state.ecs_provisioner {
+        let _ = sqlx::query("UPDATE harness_instances SET status = 'provisioning' WHERE id = $1")
+            .bind(harness_id)
+            .execute(&state.db)
+            .await;
+
+        let ecs_config = HarnessConfig {
+            customer_id: tenant_id,
+            region: "us-east-1".to_string(),
+            instance_size: InstanceSize::Small,
+            environment: "production".to_string(),
+            platform_grpc_url: String::new(),
+            env_vars: HashMap::new(),
+        };
+
+        match ecs.provision(&ecs_config, &tenant_slug).await {
+            Ok(task_arn) => {
+                let _ = sqlx::query("UPDATE harness_instances SET container_id = $1, provisioned_at = NOW() WHERE id = $2")
+                    .bind(&task_arn)
+                    .bind(harness_id)
+                    .execute(&state.db)
+                    .await;
+                info!(task_arn = %task_arn, "New ECS harness deployed via dashboard");
+            }
+            Err(e) => {
+                error!("Failed to deploy new ECS harness: {}", e);
+                let _ = sqlx::query("UPDATE harness_instances SET status = 'error' WHERE id = $1")
+                    .bind(harness_id)
+                    .execute(&state.db)
+                    .await;
+            }
+        }
+    } else {
+        warn!("No provisioner available — harness created as pending only");
+    }
+
+    Redirect::to("/dashboard").into_response()
 }
 
 // ── Logout ──────────────────────────────────────────────────────────────

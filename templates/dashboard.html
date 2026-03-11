@@ -25,10 +25,34 @@
 
   <!-- Main content -->
   <main class="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
-    <div class="mb-8">
-      <h1 class="text-2xl font-bold text-gray-900">Dashboard</h1>
-      <p class="mt-1 text-sm text-gray-500">Organization: {{ tenant_name }} ({{ tenant_slug }})</p>
+    <div class="mb-8 flex items-center justify-between">
+      <div>
+        <h1 class="text-2xl font-bold text-gray-900">Dashboard</h1>
+        <p class="mt-1 text-sm text-gray-500">Organization: {{ tenant_name }} ({{ tenant_slug }})</p>
+      </div>
+      <form action="/dashboard/harness/new" method="POST">
+        <button type="submit"
+                class="inline-flex items-center rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600">
+          + Deploy New Harness
+        </button>
+      </form>
     </div>
+
+    {% if let Some(msg) = flash_message %}
+    <div class="mb-6 rounded-md bg-blue-50 p-4">
+      <div class="flex">
+        <div class="text-sm text-blue-700">{{ msg }}</div>
+      </div>
+    </div>
+    {% endif %}
+
+    {% if let Some(err) = flash_error %}
+    <div class="mb-6 rounded-md bg-red-50 p-4">
+      <div class="flex">
+        <div class="text-sm text-red-700">{{ err }}</div>
+      </div>
+    </div>
+    {% endif %}
 
     <!-- Harness Instances -->
     <div class="mb-8">
@@ -36,7 +60,7 @@
       {% if instances.is_empty() %}
       <div class="rounded-lg border-2 border-dashed border-gray-300 p-8 text-center">
         <p class="text-sm text-gray-500">No harness instances yet.</p>
-        <p class="mt-1 text-xs text-gray-400">A harness is provisioned automatically during registration.</p>
+        <p class="mt-1 text-xs text-gray-400">Click "Deploy New Harness" above to provision one.</p>
       </div>
       {% else %}
       <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
@@ -48,6 +72,8 @@
             <span class="inline-flex items-center rounded-full bg-green-100 px-2.5 py-0.5 text-xs font-medium text-green-800">Running</span>
             {% elif inst.status == "pending" %}
             <span class="inline-flex items-center rounded-full bg-yellow-100 px-2.5 py-0.5 text-xs font-medium text-yellow-800">Pending</span>
+            {% elif inst.status == "provisioning" %}
+            <span class="inline-flex items-center rounded-full bg-blue-100 px-2.5 py-0.5 text-xs font-medium text-blue-800">Provisioning</span>
             {% elif inst.status == "stopped" %}
             <span class="inline-flex items-center rounded-full bg-gray-100 px-2.5 py-0.5 text-xs font-medium text-gray-800">Stopped</span>
             {% else %}
@@ -72,7 +98,7 @@
             {% if let Some(url) = inst.endpoint_url %}
             <div class="flex justify-between">
               <dt class="text-gray-500">Endpoint</dt>
-              <dd><a href="{{ url }}" target="_blank" class="text-indigo-600 hover:text-indigo-500 underline">{{ url }}</a></dd>
+              <dd><a href="{{ url }}" target="_blank" class="text-indigo-600 hover:text-indigo-500 underline text-xs">{{ url }}</a></dd>
             </div>
             {% endif %}
             <div class="flex justify-between">
@@ -80,14 +106,52 @@
               <dd class="text-gray-900">{% if inst.healthy %}Yes{% else %}No{% endif %}</dd>
             </div>
           </dl>
-          {% if let Some(url) = inst.endpoint_url %}
-          <div class="mt-3 pt-3 border-t border-gray-100">
-            <a href="{{ url }}" target="_blank"
-               class="inline-flex items-center rounded-md bg-indigo-50 px-3 py-1.5 text-xs font-medium text-indigo-700 hover:bg-indigo-100">
-              Open Harness API &rarr;
-            </a>
+
+          <!-- Action Buttons -->
+          <div class="mt-4 pt-3 border-t border-gray-100 flex flex-wrap gap-2">
+            {% if inst.status == "running" %}
+              <form action="/dashboard/harness/{{ inst.full_id }}/stop" method="POST" class="inline">
+                <button type="submit" class="inline-flex items-center rounded-md bg-gray-100 px-3 py-1.5 text-xs font-medium text-gray-700 hover:bg-gray-200">
+                  Stop
+                </button>
+              </form>
+              <form action="/dashboard/harness/{{ inst.full_id }}/restart" method="POST" class="inline">
+                <button type="submit" class="inline-flex items-center rounded-md bg-amber-50 px-3 py-1.5 text-xs font-medium text-amber-700 hover:bg-amber-100">
+                  Restart
+                </button>
+              </form>
+            {% elif inst.status == "stopped" || inst.status == "error" %}
+              <form action="/dashboard/harness/{{ inst.full_id }}/start" method="POST" class="inline">
+                <button type="submit" class="inline-flex items-center rounded-md bg-green-50 px-3 py-1.5 text-xs font-medium text-green-700 hover:bg-green-100">
+                  Start
+                </button>
+              </form>
+              <form action="/dashboard/harness/{{ inst.full_id }}/redeploy" method="POST" class="inline">
+                <button type="submit" class="inline-flex items-center rounded-md bg-indigo-50 px-3 py-1.5 text-xs font-medium text-indigo-700 hover:bg-indigo-100">
+                  Redeploy
+                </button>
+              </form>
+              <form action="/dashboard/harness/{{ inst.full_id }}/delete" method="POST"
+                    class="inline"
+                    onsubmit="return confirm('Are you sure you want to delete this harness instance? This cannot be undone.');">
+                <button type="submit" class="inline-flex items-center rounded-md bg-red-50 px-3 py-1.5 text-xs font-medium text-red-700 hover:bg-red-100">
+                  Delete
+                </button>
+              </form>
+            {% elif inst.status == "pending" || inst.status == "provisioning" %}
+              <form action="/dashboard/harness/{{ inst.full_id }}/redeploy" method="POST" class="inline">
+                <button type="submit" class="inline-flex items-center rounded-md bg-indigo-50 px-3 py-1.5 text-xs font-medium text-indigo-700 hover:bg-indigo-100">
+                  Retry Deploy
+                </button>
+              </form>
+            {% endif %}
+            {% if let Some(url) = inst.endpoint_url %}
+              <a href="{{ url }}" target="_blank"
+                 class="inline-flex items-center rounded-md bg-indigo-50 px-3 py-1.5 text-xs font-medium text-indigo-700 hover:bg-indigo-100">
+                Open API &rarr;
+              </a>
+            {% endif %}
           </div>
-          {% endif %}
         </div>
         {% endfor %}
       </div>
