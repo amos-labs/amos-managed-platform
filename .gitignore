@@ -1,0 +1,10 @@
+/target
+*.swp
+*.swo
+.env
+.env.*
+!.env.example
+keys/
+uploads/
+.claude/
+.DS_Store

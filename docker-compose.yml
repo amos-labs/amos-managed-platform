@@ -1,0 +1,92 @@
+# AMOS Platform - Development Environment
+# ========================================
+# Standalone development setup for the platform service.
+# For the full AMOS stack (harness + agent + relay), see amos-automate repo.
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: amos_platform_postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-amos}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-amos_dev_password}
+      POSTGRES_DB: amos_platform_dev
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U amos"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - platform_network
+
+  redis:
+    image: redis:7-alpine
+    container_name: amos_platform_redis
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - platform_network
+
+  platform:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: amos_platform
+    ports:
+      - "4000:4000"
+      - "4001:4001"
+    environment:
+      AMOS__ENVIRONMENT: ${ENVIRONMENT:-development}
+      AMOS__SERVER__HOST: 0.0.0.0
+      AMOS__SERVER__PORT: 4000
+      AMOS__SERVER__GRPC_PORT: 4001
+      AMOS__DATABASE__URL: postgresql://${POSTGRES_USER:-amos}:${POSTGRES_PASSWORD:-amos_dev_password}@postgres:5432/amos_platform_dev
+      AMOS__DATABASE__MAX_CONNECTIONS: 20
+      AMOS__REDIS__URL: redis://redis:6379/0
+      AMOS__SOLANA__NETWORK: ${SOLANA_NETWORK:-devnet}
+      AMOS__SOLANA__RPC_URL: ${SOLANA_RPC_URL:-https://api.devnet.solana.com}
+      AMOS__BEDROCK__AWS_REGION: ${AWS_REGION:-us-west-2}
+      AMOS__BEDROCK__AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AMOS__BEDROCK__AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      RUST_LOG: ${RUST_LOG:-info,amos_platform=debug}
+      RUST_BACKTRACE: ${RUST_BACKTRACE:-1}
+    volumes:
+      - ./keys:/app/keys:ro
+      - platform_data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - platform_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4000/api/v1/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  platform_data:
+    driver: local
+
+networks:
+  platform_network:
+    driver: bridge

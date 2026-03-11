@@ -1,0 +1,130 @@
+{% extends "base.html" %}
+
+{% block title %}Settings - AMOS Platform{% endblock %}
+
+{% block body %}
+<div class="min-h-full">
+  <!-- Navigation -->
+  <nav class="border-b border-gray-200 bg-white">
+    <div class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
+      <div class="flex h-14 justify-between">
+        <div class="flex items-center space-x-8">
+          <span class="text-lg font-bold text-gray-900">AMOS</span>
+          <a href="/dashboard" class="border-b-2 border-transparent px-1 pt-1 text-sm font-medium text-gray-500 hover:border-gray-300 hover:text-gray-700">Dashboard</a>
+          <a href="/settings" class="border-b-2 border-indigo-500 px-1 pt-1 text-sm font-medium text-gray-900">Settings</a>
+        </div>
+        <div class="flex items-center space-x-4">
+          <span class="text-sm text-gray-500">{{ tenant_name }}</span>
+          <form action="/logout" method="POST" class="inline">
+            <button type="submit" class="text-sm text-gray-500 hover:text-gray-700">Sign out</button>
+          </form>
+        </div>
+      </div>
+    </div>
+  </nav>
+
+  <main class="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
+    <h1 class="text-2xl font-bold text-gray-900 mb-8">Settings</h1>
+
+    {% if let Some(msg) = flash_message %}
+    <div class="mb-6 rounded-md bg-green-50 p-4">
+      <p class="text-sm text-green-700">{{ msg }}</p>
+    </div>
+    {% endif %}
+
+    <!-- API Keys Section -->
+    <section class="mb-10">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-lg font-semibold text-gray-900">API Keys</h2>
+        {% if role == "owner" || role == "admin" %}
+        <form action="/settings/api-keys" method="POST" class="flex items-center space-x-2">
+          <input name="name" type="text" required placeholder="Key name (e.g. Production)"
+                 class="rounded-md border border-gray-300 px-3 py-1.5 text-sm shadow-sm focus:border-indigo-500 focus:ring-indigo-500" />
+          <button type="submit"
+                  class="rounded-md bg-indigo-600 px-3 py-1.5 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500">
+            Create key
+          </button>
+        </form>
+        {% endif %}
+      </div>
+
+      {% if let Some(key) = new_api_key %}
+      <div class="mb-4 rounded-md bg-yellow-50 border border-yellow-200 p-4">
+        <p class="text-sm font-medium text-yellow-800">New API key created. Copy it now - it won't be shown again:</p>
+        <code class="mt-1 block rounded bg-yellow-100 px-3 py-2 text-sm font-mono text-yellow-900 select-all">{{ key }}</code>
+      </div>
+      {% endif %}
+
+      {% if api_keys.is_empty() %}
+      <p class="text-sm text-gray-500">No API keys yet.</p>
+      {% else %}
+      <div class="overflow-hidden rounded-lg border">
+        <table class="min-w-full divide-y divide-gray-200">
+          <thead class="bg-gray-50">
+            <tr>
+              <th class="px-4 py-3 text-left text-xs font-medium uppercase text-gray-500">Name</th>
+              <th class="px-4 py-3 text-left text-xs font-medium uppercase text-gray-500">Prefix</th>
+              <th class="px-4 py-3 text-left text-xs font-medium uppercase text-gray-500">Status</th>
+              <th class="px-4 py-3 text-left text-xs font-medium uppercase text-gray-500">Created</th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-gray-200 bg-white">
+            {% for key in &api_keys %}
+            <tr>
+              <td class="px-4 py-3 text-sm text-gray-900">{{ key.name }}</td>
+              <td class="px-4 py-3 text-sm font-mono text-gray-500">{{ key.key_prefix }}...</td>
+              <td class="px-4 py-3 text-sm">
+                {% if key.is_active %}
+                <span class="inline-flex items-center rounded-full bg-green-100 px-2 py-0.5 text-xs font-medium text-green-800">Active</span>
+                {% else %}
+                <span class="inline-flex items-center rounded-full bg-gray-100 px-2 py-0.5 text-xs font-medium text-gray-800">Inactive</span>
+                {% endif %}
+              </td>
+              <td class="px-4 py-3 text-sm text-gray-500">{{ key.created_at }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
+    </section>
+
+    <!-- Team Members Section -->
+    <section>
+      <h2 class="text-lg font-semibold text-gray-900 mb-4">Team Members</h2>
+      {% if users.is_empty() %}
+      <p class="text-sm text-gray-500">No team members.</p>
+      {% else %}
+      <div class="overflow-hidden rounded-lg border">
+        <table class="min-w-full divide-y divide-gray-200">
+          <thead class="bg-gray-50">
+            <tr>
+              <th class="px-4 py-3 text-left text-xs font-medium uppercase text-gray-500">Name</th>
+              <th class="px-4 py-3 text-left text-xs font-medium uppercase text-gray-500">Email</th>
+              <th class="px-4 py-3 text-left text-xs font-medium uppercase text-gray-500">Role</th>
+              <th class="px-4 py-3 text-left text-xs font-medium uppercase text-gray-500">Status</th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-gray-200 bg-white">
+            {% for user in &users %}
+            <tr>
+              <td class="px-4 py-3 text-sm text-gray-900">{{ user.name.as_deref().unwrap_or("-") }}</td>
+              <td class="px-4 py-3 text-sm text-gray-500">{{ user.email }}</td>
+              <td class="px-4 py-3 text-sm text-gray-500 capitalize">{{ user.role }}</td>
+              <td class="px-4 py-3 text-sm">
+                {% if user.is_active %}
+                <span class="inline-flex items-center rounded-full bg-green-100 px-2 py-0.5 text-xs font-medium text-green-800">Active</span>
+                {% else %}
+                <span class="inline-flex items-center rounded-full bg-gray-100 px-2 py-0.5 text-xs font-medium text-gray-800">Inactive</span>
+                {% endif %}
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
+    </section>
+  </main>
+</div>
+{% endblock %}

@@ -1,0 +1,114 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard - AMOS Platform{% endblock %}
+
+{% block body %}
+<div class="min-h-full">
+  <!-- Navigation -->
+  <nav class="border-b border-gray-200 bg-white">
+    <div class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
+      <div class="flex h-14 justify-between">
+        <div class="flex items-center space-x-8">
+          <span class="text-lg font-bold text-gray-900">AMOS</span>
+          <a href="/dashboard" class="border-b-2 border-indigo-500 px-1 pt-1 text-sm font-medium text-gray-900">Dashboard</a>
+          <a href="/settings" class="border-b-2 border-transparent px-1 pt-1 text-sm font-medium text-gray-500 hover:border-gray-300 hover:text-gray-700">Settings</a>
+        </div>
+        <div class="flex items-center space-x-4">
+          <span class="text-sm text-gray-500">{{ tenant_name }}</span>
+          <form action="/logout" method="POST" class="inline">
+            <button type="submit" class="text-sm text-gray-500 hover:text-gray-700">Sign out</button>
+          </form>
+        </div>
+      </div>
+    </div>
+  </nav>
+
+  <!-- Main content -->
+  <main class="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
+    <div class="mb-8">
+      <h1 class="text-2xl font-bold text-gray-900">Dashboard</h1>
+      <p class="mt-1 text-sm text-gray-500">Organization: {{ tenant_name }} ({{ tenant_slug }})</p>
+    </div>
+
+    <!-- Harness Instances -->
+    <div class="mb-8">
+      <h2 class="text-lg font-semibold text-gray-900 mb-4">Harness Instances</h2>
+      {% if instances.is_empty() %}
+      <div class="rounded-lg border-2 border-dashed border-gray-300 p-8 text-center">
+        <p class="text-sm text-gray-500">No harness instances yet.</p>
+        <p class="mt-1 text-xs text-gray-400">A harness is provisioned automatically during registration.</p>
+      </div>
+      {% else %}
+      <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+        {% for inst in &instances %}
+        <div class="rounded-lg border bg-white p-5 shadow-sm">
+          <div class="flex items-center justify-between mb-3">
+            <span class="text-sm font-medium text-gray-900">{{ inst.id }}</span>
+            {% if inst.status == "running" %}
+            <span class="inline-flex items-center rounded-full bg-green-100 px-2.5 py-0.5 text-xs font-medium text-green-800">Running</span>
+            {% elif inst.status == "pending" %}
+            <span class="inline-flex items-center rounded-full bg-yellow-100 px-2.5 py-0.5 text-xs font-medium text-yellow-800">Pending</span>
+            {% elif inst.status == "stopped" %}
+            <span class="inline-flex items-center rounded-full bg-gray-100 px-2.5 py-0.5 text-xs font-medium text-gray-800">Stopped</span>
+            {% else %}
+            <span class="inline-flex items-center rounded-full bg-red-100 px-2.5 py-0.5 text-xs font-medium text-red-800">{{ inst.status }}</span>
+            {% endif %}
+          </div>
+          <dl class="space-y-1 text-sm">
+            <div class="flex justify-between">
+              <dt class="text-gray-500">Region</dt>
+              <dd class="text-gray-900">{{ inst.region }}</dd>
+            </div>
+            <div class="flex justify-between">
+              <dt class="text-gray-500">Size</dt>
+              <dd class="text-gray-900">{{ inst.instance_size }}</dd>
+            </div>
+            {% if let Some(cid) = inst.container_id_short %}
+            <div class="flex justify-between">
+              <dt class="text-gray-500">Container</dt>
+              <dd class="font-mono text-gray-500 text-xs">{{ cid }}</dd>
+            </div>
+            {% endif %}
+            {% if let Some(url) = inst.endpoint_url %}
+            <div class="flex justify-between">
+              <dt class="text-gray-500">Endpoint</dt>
+              <dd><a href="{{ url }}" target="_blank" class="text-indigo-600 hover:text-indigo-500 underline">{{ url }}</a></dd>
+            </div>
+            {% endif %}
+            <div class="flex justify-between">
+              <dt class="text-gray-500">Healthy</dt>
+              <dd class="text-gray-900">{% if inst.healthy %}Yes{% else %}No{% endif %}</dd>
+            </div>
+          </dl>
+          {% if let Some(url) = inst.endpoint_url %}
+          <div class="mt-3 pt-3 border-t border-gray-100">
+            <a href="{{ url }}" target="_blank"
+               class="inline-flex items-center rounded-md bg-indigo-50 px-3 py-1.5 text-xs font-medium text-indigo-700 hover:bg-indigo-100">
+              Open Harness API &rarr;
+            </a>
+          </div>
+          {% endif %}
+        </div>
+        {% endfor %}
+      </div>
+      {% endif %}
+    </div>
+
+    <!-- Quick Info -->
+    <div class="grid gap-4 sm:grid-cols-3">
+      <div class="rounded-lg border bg-white p-5 shadow-sm">
+        <h3 class="text-sm font-medium text-gray-500">Plan</h3>
+        <p class="mt-1 text-xl font-semibold text-gray-900 capitalize">{{ plan }}</p>
+      </div>
+      <div class="rounded-lg border bg-white p-5 shadow-sm">
+        <h3 class="text-sm font-medium text-gray-500">Team Members</h3>
+        <p class="mt-1 text-xl font-semibold text-gray-900">{{ user_count }}</p>
+      </div>
+      <div class="rounded-lg border bg-white p-5 shadow-sm">
+        <h3 class="text-sm font-medium text-gray-500">API Keys</h3>
+        <p class="mt-1 text-xl font-semibold text-gray-900">{{ api_key_count }}</p>
+      </div>
+    </div>
+  </main>
+</div>
+{% endblock %}
