@@ -5,8 +5,8 @@
 
 use axum::{
     extract::OriginalUri,
-    http::StatusCode,
-    response::IntoResponse,
+    http::{header, HeaderMap, StatusCode},
+    response::{IntoResponse, Redirect, Response},
     Json,
 };
 use serde::Serialize;
@@ -37,7 +37,23 @@ pub struct Endpoint {
     auth: Option<&'static str>,
 }
 
-/// `GET /` and `GET /api/v1` — return the full API endpoint catalog.
+/// `GET /` — content-negotiated root: browsers redirect to /login,
+/// API clients get the JSON endpoint catalog.
+/// `GET /api/v1` always returns the JSON catalog.
+pub async fn root_handler(headers: HeaderMap) -> Response {
+    // If the client accepts text/html (browser), redirect to login page
+    if let Some(accept) = headers.get(header::ACCEPT) {
+        if let Ok(accept_str) = accept.to_str() {
+            if accept_str.contains("text/html") {
+                return Redirect::to("/login").into_response();
+            }
+        }
+    }
+    // API clients / curl / agents get the JSON catalog
+    Json(build_catalog()).into_response()
+}
+
+/// `GET /api/v1` — always returns the JSON API endpoint catalog.
 pub async fn api_catalog() -> impl IntoResponse {
     Json(build_catalog())
 }

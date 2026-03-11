@@ -46,7 +46,7 @@ fn build_http_router(state: PlatformState) -> Router {
         // UI routes (SSR pages: /login, /register, /dashboard, /settings)
         .merge(ui_routes)
         // Root path: redirect browsers to login, serve API catalog for agents
-        .route("/", axum::routing::get(routes::discovery::api_catalog))
+        .route("/", axum::routing::get(routes::discovery::root_handler))
         .nest("/api/v1", api_routes)
         // Fallback: agent-friendly 404 with suggestions
         .fallback(routes::discovery::not_found)
