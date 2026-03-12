@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use crate::{
     auth,
-    provisioning::{HarnessConfig, InstanceSize},
+    provisioning::{alb::AlbRouter, HarnessConfig, InstanceSize},
     state::PlatformState,
 };
 
@@ -30,12 +30,18 @@ const SESSION_COOKIE: &str = "amos_session";
 /// the harness task reaches RUNNING, then updates the `harness_instances`
 /// row with `status = 'running'`, the private IP URL, and `healthy = TRUE`.
 ///
+/// When an ALB router is available and a subdomain is set, this also creates
+/// a target group + ALB listener rule so the harness is reachable at
+/// `https://{subdomain}.custom.amoslabs.com`.
+///
 /// Called from: `register_submit`, `harness_redeploy`, `deploy_new_harness`.
 fn spawn_ecs_status_poller(
     ecs: std::sync::Arc<crate::provisioning::ecs::EcsProvisioner>,
     db: sqlx::PgPool,
     task_arn: String,
     harness_id: Uuid,
+    alb_router: Option<std::sync::Arc<AlbRouter>>,
+    subdomain: Option<String>,
 ) {
     tokio::spawn(async move {
         for attempt in 1..=24 {
@@ -46,16 +52,48 @@ fn spawn_ecs_status_poller(
                     let internal_url: Option<String> =
                         private_ip.as_ref().map(|ip| format!("http://{}:3000", ip));
 
+                    // Set up ALB subdomain routing if we have both a router and a subdomain.
+                    let mut tg_arn: Option<String> = None;
+                    let mut rule_arn: Option<String> = None;
+
+                    if let (Some(ref router), Some(ref sub), Some(ref ip)) =
+                        (&alb_router, &subdomain, &private_ip)
+                    {
+                        match router.setup_routing(sub, ip, 3000).await {
+                            Ok(result) => {
+                                info!(
+                                    subdomain = %sub,
+                                    public_url = %result.public_url,
+                                    "ALB routing configured for harness"
+                                );
+                                tg_arn = Some(result.target_group_arn);
+                                rule_arn = Some(result.listener_rule_arn);
+                            }
+                            Err(e) => {
+                                warn!(
+                                    harness_id = %harness_id,
+                                    subdomain = %sub,
+                                    "Failed to set up ALB routing (harness still reachable via internal URL): {}",
+                                    e
+                                );
+                            }
+                        }
+                    }
+
                     let _ = sqlx::query(
                         "UPDATE harness_instances
                          SET status = 'running',
                              started_at = NOW(),
                              internal_url = $1,
-                             healthy = TRUE
+                             healthy = TRUE,
+                             target_group_arn = $3,
+                             listener_rule_arn = $4
                          WHERE id = $2",
                     )
                     .bind(&internal_url)
                     .bind(harness_id)
+                    .bind(&tg_arn)
+                    .bind(&rule_arn)
                     .execute(&db)
                     .await;
 
@@ -97,6 +135,39 @@ fn spawn_ecs_status_poller(
             .execute(&db)
             .await;
     });
+}
+
+/// Helper: tear down ALB routing for a harness instance (used by stop/delete).
+async fn teardown_alb_routing(state: &PlatformState, harness_id: Uuid) {
+    if let Some(ref router) = state.alb_router {
+        // Fetch the stored ALB ARNs
+        let row = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "SELECT target_group_arn, listener_rule_arn FROM harness_instances WHERE id = $1",
+        )
+        .bind(harness_id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten();
+
+        if let Some((tg_arn, rule_arn)) = row {
+            if tg_arn.is_some() || rule_arn.is_some() {
+                router
+                    .teardown_routing(rule_arn.as_deref(), tg_arn.as_deref())
+                    .await;
+
+                // Clear the ARNs in the database
+                let _ = sqlx::query(
+                    "UPDATE harness_instances SET target_group_arn = NULL, listener_rule_arn = NULL WHERE id = $1",
+                )
+                .bind(harness_id)
+                .execute(&state.db)
+                .await;
+
+                info!(harness_id = %harness_id, "ALB routing torn down");
+            }
+        }
+    }
 }
 
 // ── Template Structs ────────────────────────────────────────────────────
@@ -620,6 +691,8 @@ async fn register_submit(
                     state.db.clone(),
                     task_arn,
                     harness_id,
+                    state.alb_router.clone(),
+                    subdomain.clone(),
                 );
             }
             Err(e) => {
@@ -715,22 +788,30 @@ async fn dashboard_page(
                 _external_port,
                 internal_url,
                 container_id,
-            )| HarnessInfo {
-                id: id.to_string()[..8].to_string(),
-                full_id: id.to_string(),
-                status,
-                subdomain,
-                region,
-                instance_size,
-                healthy,
-                endpoint_url: internal_url,
-                container_id_short: container_id.map(|c| {
-                    if c.len() > 12 {
-                        c[..12].to_string()
-                    } else {
-                        c
-                    }
-                }),
+            )| {
+                // Prefer public subdomain URL over internal IP for the endpoint display.
+                let endpoint_url = subdomain
+                    .as_deref()
+                    .map(|s| format!("https://{}.custom.amoslabs.com", s))
+                    .or(internal_url);
+
+                HarnessInfo {
+                    id: id.to_string()[..8].to_string(),
+                    full_id: id.to_string(),
+                    status,
+                    subdomain,
+                    region,
+                    instance_size,
+                    healthy,
+                    endpoint_url,
+                    container_id_short: container_id.map(|c| {
+                        if c.len() > 12 {
+                            c[..12].to_string()
+                        } else {
+                            c
+                        }
+                    }),
+                }
             },
         )
         .collect();
@@ -1065,6 +1146,9 @@ async fn harness_stop(
             }
         }
     } else if let Some(ref ecs) = state.ecs_provisioner {
+        // Tear down ALB routing before stopping.
+        teardown_alb_routing(&state, harness_id).await;
+
         match ecs.stop(&container_id).await {
             Ok(()) => {
                 let _ = sqlx::query("UPDATE harness_instances SET status = 'stopped', healthy = FALSE WHERE id = $1")
@@ -1272,6 +1356,9 @@ async fn harness_redeploy(
             }
         }
     } else if let Some(ref ecs) = state.ecs_provisioner {
+        // Tear down old ALB routing — the poller will set up new routing for the new task.
+        teardown_alb_routing(&state, harness_id).await;
+
         let ecs_config = HarnessConfig {
             customer_id: tenant_id,
             region: "us-east-1".to_string(),
@@ -1290,8 +1377,24 @@ async fn harness_redeploy(
                     .await;
                 info!(task_arn = %task_arn, "ECS harness redeployed via dashboard");
 
+                // Fetch subdomain from the harness instance for ALB routing.
+                let subdomain: Option<String> =
+                    sqlx::query_scalar("SELECT subdomain FROM harness_instances WHERE id = $1")
+                        .bind(harness_id)
+                        .fetch_optional(&state.db)
+                        .await
+                        .ok()
+                        .flatten();
+
                 // Poll ECS in the background until task reaches RUNNING.
-                spawn_ecs_status_poller(ecs.clone(), state.db.clone(), task_arn, harness_id);
+                spawn_ecs_status_poller(
+                    ecs.clone(),
+                    state.db.clone(),
+                    task_arn,
+                    harness_id,
+                    state.alb_router.clone(),
+                    subdomain,
+                );
             }
             Err(e) => {
                 error!("Failed to redeploy ECS harness {}: {}", harness_id, e);
@@ -1316,6 +1419,9 @@ async fn harness_delete(
             Ok(v) => v,
             Err(r) => return r,
         };
+
+    // Tear down ALB routing before removing the container/task.
+    teardown_alb_routing(&state, harness_id).await;
 
     // Remove the container/task
     if let Some(cid) = &container_id {
@@ -1467,7 +1573,14 @@ async fn deploy_new_harness(
                 info!(task_arn = %task_arn, "New ECS harness deployed via dashboard");
 
                 // Poll ECS in the background until task reaches RUNNING.
-                spawn_ecs_status_poller(ecs.clone(), state.db.clone(), task_arn, harness_id);
+                spawn_ecs_status_poller(
+                    ecs.clone(),
+                    state.db.clone(),
+                    task_arn,
+                    harness_id,
+                    state.alb_router.clone(),
+                    subdomain.clone(),
+                );
             }
             Err(e) => {
                 error!("Failed to deploy new ECS harness: {}", e);

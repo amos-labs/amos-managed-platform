@@ -63,9 +63,10 @@ metrics-exporter-prometheus = "0.16"
 # Docker/container provisioning (local dev)
 bollard = "0.18"
 
-# AWS ECS provisioning (production Fargate)
+# AWS ECS provisioning (production Fargate) + ALB routing
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-ecs = "1"
+aws-sdk-elasticloadbalancingv2 = "1"
 
 # Misc
 secrecy = { version = "0.10", features = ["serde"] }

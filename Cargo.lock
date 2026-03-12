@@ -135,6 +135,7 @@ dependencies = [
  "askama_web",
  "aws-config",
  "aws-sdk-ecs",
+ "aws-sdk-elasticloadbalancingv2",
  "axum",
  "axum-extra",
  "base64 0.22.1",
@@ -644,6 +645,31 @@ dependencies = [
  "aws-smithy-types",
  "aws-types",
  "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sdk-elasticloadbalancingv2"
+version = "1.109.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97d2254c6c1cec72b956352196525b0615ca9b8e2090a4abe9ccaba7cfa07991"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-query",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-smithy-xml",
+ "aws-types",
  "fastrand",
  "http 0.2.12",
  "http 1.4.0",

@@ -7,6 +7,7 @@ use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::sync::Arc;
 use tracing::{info, warn};
 
+use crate::provisioning::alb::{AlbRouter, AlbRouterConfig};
 use crate::provisioning::ecs::{EcsProvisioner, EcsProvisionerConfig};
 use crate::provisioning::HarnessManager;
 use crate::solana::SolanaClient;
@@ -29,6 +30,8 @@ pub struct PlatformState {
     pub harness_manager: Option<Arc<HarnessManager>>,
     /// ECS Fargate provisioner (production — used when Docker unavailable).
     pub ecs_provisioner: Option<Arc<EcsProvisioner>>,
+    /// ALB router for subdomain-based harness routing (production).
+    pub alb_router: Option<Arc<AlbRouter>>,
 }
 
 impl PlatformState {
@@ -105,6 +108,29 @@ impl PlatformState {
             None
         };
 
+        // Initialize ALB router for subdomain-based harness routing (production).
+        // Only activates when ALB_HTTPS_LISTENER_ARN env var is set.
+        let alb_router = if ecs_provisioner.is_some() {
+            match AlbRouterConfig::from_env() {
+                Some(alb_config) => match AlbRouter::new(alb_config).await {
+                    Ok(router) => {
+                        info!("ALB router initialized (subdomain routing enabled)");
+                        Some(Arc::new(router))
+                    }
+                    Err(e) => {
+                        warn!("ALB router initialization failed (optional): {}", e);
+                        None
+                    }
+                },
+                None => {
+                    info!("ALB router not configured (ALB_HTTPS_LISTENER_ARN not set)");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             db,
             redis,
@@ -112,6 +138,7 @@ impl PlatformState {
             solana,
             harness_manager,
             ecs_provisioner,
+            alb_router,
         })
     }
 
