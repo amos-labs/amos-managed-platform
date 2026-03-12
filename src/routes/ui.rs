@@ -24,6 +24,81 @@ use crate::{
 
 const SESSION_COOKIE: &str = "amos_session";
 
+// ── ECS Polling Helper ──────────────────────────────────────────────────
+
+/// Spawn a background task that polls ECS every 5 s (up to 2 min) until
+/// the harness task reaches RUNNING, then updates the `harness_instances`
+/// row with `status = 'running'`, the private IP URL, and `healthy = TRUE`.
+///
+/// Called from: `register_submit`, `harness_redeploy`, `deploy_new_harness`.
+fn spawn_ecs_status_poller(
+    ecs: std::sync::Arc<crate::provisioning::ecs::EcsProvisioner>,
+    db: sqlx::PgPool,
+    task_arn: String,
+    harness_id: Uuid,
+) {
+    tokio::spawn(async move {
+        for attempt in 1..=24 {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+            match ecs.describe_task(&task_arn).await {
+                Ok((crate::provisioning::HarnessStatus::Running, private_ip)) => {
+                    let internal_url: Option<String> =
+                        private_ip.as_ref().map(|ip| format!("http://{}:3000", ip));
+
+                    let _ = sqlx::query(
+                        "UPDATE harness_instances
+                         SET status = 'running',
+                             started_at = NOW(),
+                             internal_url = $1,
+                             healthy = TRUE
+                         WHERE id = $2",
+                    )
+                    .bind(&internal_url)
+                    .bind(harness_id)
+                    .execute(&db)
+                    .await;
+
+                    info!(
+                        harness_id = %harness_id,
+                        ip = ?private_ip,
+                        attempt = attempt,
+                        "ECS harness task is running"
+                    );
+                    return;
+                }
+                Ok((crate::provisioning::HarnessStatus::Error, _)) => {
+                    let _ =
+                        sqlx::query("UPDATE harness_instances SET status = 'error' WHERE id = $1")
+                            .bind(harness_id)
+                            .execute(&db)
+                            .await;
+
+                    warn!(harness_id = %harness_id, "ECS harness task failed");
+                    return;
+                }
+                Ok((status, _)) => {
+                    info!(
+                        attempt = attempt,
+                        status = ?status,
+                        "ECS harness task not yet running"
+                    );
+                }
+                Err(e) => {
+                    warn!(attempt = attempt, "Failed to describe ECS task: {}", e);
+                }
+            }
+        }
+
+        // Timed out after 2 minutes — mark as error
+        warn!(harness_id = %harness_id, "ECS harness task timed out after 2 minutes");
+        let _ = sqlx::query("UPDATE harness_instances SET status = 'error' WHERE id = $1")
+            .bind(harness_id)
+            .execute(&db)
+            .await;
+    });
+}
+
 // ── Template Structs ────────────────────────────────────────────────────
 
 #[derive(Template)]
@@ -539,75 +614,13 @@ async fn register_submit(
                 .execute(&state.db)
                 .await;
 
-                // Spawn a background task to poll ECS for RUNNING status.
-                // The registration response returns immediately; the dashboard
-                // will show "provisioning" until this background poller updates the row.
-                let ecs_bg = state.ecs_provisioner.clone().unwrap();
-                let db_bg = state.db.clone();
-                let task_arn_bg = task_arn.clone();
-
-                tokio::spawn(async move {
-                    for attempt in 1..=24 {
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-
-                        match ecs_bg.describe_task(&task_arn_bg).await {
-                            Ok((crate::provisioning::HarnessStatus::Running, private_ip)) => {
-                                let internal_url =
-                                    private_ip.as_ref().map(|ip| format!("http://{}:3000", ip));
-
-                                let _ = sqlx::query(
-                                    "UPDATE harness_instances
-                                     SET status = 'running',
-                                         started_at = NOW(),
-                                         internal_url = $1,
-                                         healthy = TRUE
-                                     WHERE id = $2",
-                                )
-                                .bind(&internal_url)
-                                .bind(harness_id)
-                                .execute(&db_bg)
-                                .await;
-
-                                info!(
-                                    harness_id = %harness_id,
-                                    ip = ?private_ip,
-                                    attempt = attempt,
-                                    "ECS harness task is running"
-                                );
-                                return;
-                            }
-                            Ok((crate::provisioning::HarnessStatus::Error, _)) => {
-                                let _ = sqlx::query(
-                                    "UPDATE harness_instances SET status = 'error' WHERE id = $1",
-                                )
-                                .bind(harness_id)
-                                .execute(&db_bg)
-                                .await;
-
-                                warn!(harness_id = %harness_id, "ECS harness task failed");
-                                return;
-                            }
-                            Ok((status, _)) => {
-                                info!(
-                                    attempt = attempt,
-                                    status = ?status,
-                                    "ECS harness task not yet running"
-                                );
-                            }
-                            Err(e) => {
-                                warn!(attempt = attempt, "Failed to describe ECS task: {}", e);
-                            }
-                        }
-                    }
-
-                    // Timed out after 2 minutes — mark as error
-                    warn!(harness_id = %harness_id, "ECS harness task timed out after 2 minutes");
-                    let _ =
-                        sqlx::query("UPDATE harness_instances SET status = 'error' WHERE id = $1")
-                            .bind(harness_id)
-                            .execute(&db_bg)
-                            .await;
-                });
+                // Poll ECS in the background until task reaches RUNNING.
+                spawn_ecs_status_poller(
+                    state.ecs_provisioner.clone().unwrap(),
+                    state.db.clone(),
+                    task_arn,
+                    harness_id,
+                );
             }
             Err(e) => {
                 error!("Failed to provision ECS harness task: {}", e);
@@ -1276,6 +1289,9 @@ async fn harness_redeploy(
                     .execute(&state.db)
                     .await;
                 info!(task_arn = %task_arn, "ECS harness redeployed via dashboard");
+
+                // Poll ECS in the background until task reaches RUNNING.
+                spawn_ecs_status_poller(ecs.clone(), state.db.clone(), task_arn, harness_id);
             }
             Err(e) => {
                 error!("Failed to redeploy ECS harness {}: {}", harness_id, e);
@@ -1449,6 +1465,9 @@ async fn deploy_new_harness(
                     .execute(&state.db)
                     .await;
                 info!(task_arn = %task_arn, "New ECS harness deployed via dashboard");
+
+                // Poll ECS in the background until task reaches RUNNING.
+                spawn_ecs_status_poller(ecs.clone(), state.db.clone(), task_arn, harness_id);
             }
             Err(e) => {
                 error!("Failed to deploy new ECS harness: {}", e);
