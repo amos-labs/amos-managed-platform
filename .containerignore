@@ -1,0 +1,8 @@
+target/
+.git/
+.env
+.env.*
+keys/
+uploads/
+.claude/
+.DS_Store
