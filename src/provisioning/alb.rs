@@ -121,7 +121,7 @@ impl AlbRouter {
             .vpc_id(&self.vpc_id)
             .target_type(TargetTypeEnum::Ip)
             .health_check_enabled(true)
-            .health_check_path("/api/v1/health")
+            .health_check_path("/health")
             .health_check_interval_seconds(30)
             .healthy_threshold_count(2)
             .unhealthy_threshold_count(3)
