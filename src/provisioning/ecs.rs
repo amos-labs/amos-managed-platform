@@ -40,6 +40,8 @@ pub struct EcsProvisioner {
     platform_url: String,
     /// Vault master key for credential encryption (base64-encoded 32 bytes).
     vault_master_key: String,
+    /// Brave Search API key for web search tools.
+    brave_api_key: String,
 }
 
 /// Configuration for the ECS provisioner, loaded from environment variables.
@@ -60,6 +62,7 @@ pub struct EcsProvisionerConfig {
     pub harness_redis_url: String,
     pub platform_url: String,
     pub vault_master_key: String,
+    pub brave_api_key: String,
 }
 
 impl EcsProvisionerConfig {
@@ -118,6 +121,10 @@ impl EcsProvisionerConfig {
             .or_else(|_| std::env::var("AMOS__VAULT__MASTER_KEY"))
             .unwrap_or_default();
 
+        let brave_api_key = std::env::var("ECS_HARNESS_BRAVE_API_KEY")
+            .or_else(|_| std::env::var("BRAVE_API_KEY"))
+            .unwrap_or_default();
+
         Some(Self {
             cluster,
             harness_image,
@@ -132,6 +139,7 @@ impl EcsProvisionerConfig {
             harness_redis_url,
             platform_url,
             vault_master_key,
+            brave_api_key,
         })
     }
 }
@@ -188,6 +196,7 @@ impl EcsProvisioner {
             harness_redis_url: config.harness_redis_url,
             platform_url: config.platform_url,
             vault_master_key: config.vault_master_key,
+            brave_api_key: config.brave_api_key,
         })
     }
 
@@ -228,6 +237,9 @@ impl EcsProvisioner {
         }
         if !self.vault_master_key.is_empty() {
             env_vars.push(kv("AMOS__VAULT__MASTER_KEY", &self.vault_master_key));
+        }
+        if !self.brave_api_key.is_empty() {
+            env_vars.push(kv("BRAVE_API_KEY", &self.brave_api_key));
         }
 
         // Forward any extra env vars from HarnessConfig.
@@ -291,13 +303,16 @@ impl EcsProvisioner {
                 format!("{}-agent", tenant_slug),
             );
 
-            let agent_env_vars = vec![
+            let mut agent_env_vars = vec![
                 kv("HARNESS_URL", "http://localhost:3000"),
                 kv("AGENT_PORT", "3100"),
                 kv("RUST_LOG", "info,amos_agent=debug"),
                 kv("RUST_BACKTRACE", "1"),
                 kv("AWS_REGION", &self.aws_region),
             ];
+            if !self.brave_api_key.is_empty() {
+                agent_env_vars.push(kv("BRAVE_API_KEY", &self.brave_api_key));
+            }
 
             let agent_container = ContainerDefinition::builder()
                 .name("amos-agent")
