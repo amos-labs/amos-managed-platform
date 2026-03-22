@@ -23,6 +23,9 @@ pub struct EcsProvisioner {
     client: EcsClient,
     cluster: String,
     harness_image: String,
+    /// Optional agent sidecar image. When set, the agent container is added
+    /// to the ECS task definition alongside the harness container.
+    agent_image: Option<String>,
     subnets: Vec<String>,
     security_groups: Vec<String>,
     execution_role_arn: String,
@@ -35,6 +38,8 @@ pub struct EcsProvisioner {
     harness_redis_url: String,
     /// Platform URL that harness containers use for sync/heartbeat.
     platform_url: String,
+    /// Vault master key for credential encryption (base64-encoded 32 bytes).
+    vault_master_key: String,
 }
 
 /// Configuration for the ECS provisioner, loaded from environment variables.
@@ -42,6 +47,9 @@ pub struct EcsProvisioner {
 pub struct EcsProvisionerConfig {
     pub cluster: String,
     pub harness_image: String,
+    /// Docker image for the agent sidecar (e.g., `637423327454.dkr.ecr.us-east-1.amazonaws.com/amos-agent:latest`).
+    /// If not set, harness tasks are deployed without an agent sidecar.
+    pub agent_image: Option<String>,
     pub subnets: Vec<String>,
     pub security_groups: Vec<String>,
     pub execution_role_arn: String,
@@ -51,6 +59,7 @@ pub struct EcsProvisionerConfig {
     pub harness_database_url: String,
     pub harness_redis_url: String,
     pub platform_url: String,
+    pub vault_master_key: String,
 }
 
 impl EcsProvisionerConfig {
@@ -103,9 +112,16 @@ impl EcsProvisionerConfig {
         let platform_url = std::env::var("ECS_PLATFORM_URL")
             .unwrap_or_else(|_| "https://app.amoslabs.com".to_string());
 
+        let agent_image = std::env::var("ECS_AGENT_IMAGE").ok();
+
+        let vault_master_key = std::env::var("ECS_HARNESS_VAULT_MASTER_KEY")
+            .or_else(|_| std::env::var("AMOS__VAULT__MASTER_KEY"))
+            .unwrap_or_default();
+
         Some(Self {
             cluster,
             harness_image,
+            agent_image,
             subnets,
             security_groups,
             execution_role_arn,
@@ -115,6 +131,7 @@ impl EcsProvisionerConfig {
             harness_database_url,
             harness_redis_url,
             platform_url,
+            vault_master_key,
         })
     }
 }
@@ -152,6 +169,7 @@ impl EcsProvisioner {
         info!(
             cluster = %config.cluster,
             image = %config.harness_image,
+            agent_image = ?config.agent_image,
             "ECS provisioner connected"
         );
 
@@ -159,6 +177,7 @@ impl EcsProvisioner {
             client,
             cluster: config.cluster,
             harness_image: config.harness_image,
+            agent_image: config.agent_image,
             subnets: config.subnets,
             security_groups: config.security_groups,
             execution_role_arn: config.execution_role_arn,
@@ -168,6 +187,7 @@ impl EcsProvisioner {
             harness_database_url: config.harness_database_url,
             harness_redis_url: config.harness_redis_url,
             platform_url: config.platform_url,
+            vault_master_key: config.vault_master_key,
         })
     }
 
@@ -177,7 +197,12 @@ impl EcsProvisioner {
     pub async fn provision(&self, config: &HarnessConfig, tenant_slug: &str) -> Result<String> {
         let family = format!("amos-harness-{}", tenant_slug);
 
-        let (cpu, memory) = fargate_resources(config.instance_size);
+        // If agent sidecar is configured, bump resources to accommodate both containers.
+        let (cpu, memory) = if self.agent_image.is_some() {
+            fargate_resources_with_agent(config.instance_size)
+        } else {
+            fargate_resources(config.instance_size)
+        };
 
         // Build environment variables for the harness container.
         let mut env_vars = vec![
@@ -190,11 +215,19 @@ impl EcsProvisioner {
             kv("RUST_BACKTRACE", "1"),
         ];
 
+        // Tell harness where the agent sidecar is (same task = localhost).
+        if self.agent_image.is_some() {
+            env_vars.push(kv("AGENT_URL", "http://localhost:3100"));
+        }
+
         if !self.harness_database_url.is_empty() {
             env_vars.push(kv("AMOS__DATABASE__URL", &self.harness_database_url));
         }
         if !self.harness_redis_url.is_empty() {
             env_vars.push(kv("AMOS__REDIS__URL", &self.harness_redis_url));
+        }
+        if !self.vault_master_key.is_empty() {
+            env_vars.push(kv("AMOS__VAULT__MASTER_KEY", &self.vault_master_key));
         }
 
         // Forward any extra env vars from HarnessConfig.
@@ -202,14 +235,41 @@ impl EcsProvisioner {
             env_vars.push(kv(key, value));
         }
 
-        // Build log configuration.
-        let mut log_options = std::collections::HashMap::new();
-        log_options.insert("awslogs-group".to_string(), self.log_group.clone());
-        log_options.insert("awslogs-region".to_string(), self.aws_region.clone());
-        log_options.insert("awslogs-stream-prefix".to_string(), tenant_slug.to_string());
+        // Build log configuration for harness container.
+        let mut harness_log_options = std::collections::HashMap::new();
+        harness_log_options.insert("awslogs-group".to_string(), self.log_group.clone());
+        harness_log_options.insert("awslogs-region".to_string(), self.aws_region.clone());
+        harness_log_options.insert(
+            "awslogs-stream-prefix".to_string(),
+            format!("{}-harness", tenant_slug),
+        );
+
+        // Build harness container definition.
+        let harness_container = ContainerDefinition::builder()
+            .name("amos-harness")
+            .image(&self.harness_image)
+            .essential(true)
+            .port_mappings(
+                PortMapping::builder()
+                    .container_port(3000)
+                    .host_port(3000)
+                    .protocol(TransportProtocol::Tcp)
+                    .build(),
+            )
+            .set_environment(Some(env_vars))
+            .log_configuration(
+                LogConfiguration::builder()
+                    .log_driver(LogDriver::Awslogs)
+                    .set_options(Some(harness_log_options))
+                    .build()
+                    .map_err(|e| {
+                        AmosError::Internal(format!("Failed to build log config: {}", e))
+                    })?,
+            )
+            .build();
 
         // Register a task definition for this tenant.
-        let task_def_result = self
+        let mut task_def_builder = self
             .client
             .register_task_definition()
             .family(&family)
@@ -219,35 +279,57 @@ impl EcsProvisioner {
             .memory(memory)
             .execution_role_arn(&self.execution_role_arn)
             .task_role_arn(&self.task_role_arn)
-            .container_definitions(
-                ContainerDefinition::builder()
-                    .name("amos-harness")
-                    .image(&self.harness_image)
-                    .essential(true)
-                    .port_mappings(
-                        PortMapping::builder()
-                            .container_port(3000)
-                            .host_port(3000)
-                            .protocol(TransportProtocol::Tcp)
-                            .build(),
-                    )
-                    .set_environment(Some(env_vars))
-                    .log_configuration(
-                        LogConfiguration::builder()
-                            .log_driver(LogDriver::Awslogs)
-                            .set_options(Some(log_options))
-                            .build()
-                            .map_err(|e| {
-                                AmosError::Internal(format!("Failed to build log config: {}", e))
-                            })?,
-                    )
-                    .build(),
-            )
-            .send()
-            .await
-            .map_err(|e| {
-                AmosError::Internal(format!("Failed to register task definition: {}", e))
-            })?;
+            .container_definitions(harness_container);
+
+        // Add agent sidecar container if configured.
+        if let Some(agent_image) = &self.agent_image {
+            let mut agent_log_options = std::collections::HashMap::new();
+            agent_log_options.insert("awslogs-group".to_string(), self.log_group.clone());
+            agent_log_options.insert("awslogs-region".to_string(), self.aws_region.clone());
+            agent_log_options.insert(
+                "awslogs-stream-prefix".to_string(),
+                format!("{}-agent", tenant_slug),
+            );
+
+            let agent_env_vars = vec![
+                kv("HARNESS_URL", "http://localhost:3000"),
+                kv("AGENT_PORT", "3100"),
+                kv("RUST_LOG", "info,amos_agent=debug"),
+                kv("RUST_BACKTRACE", "1"),
+                kv("AWS_REGION", &self.aws_region),
+            ];
+
+            let agent_container = ContainerDefinition::builder()
+                .name("amos-agent")
+                .image(agent_image)
+                .essential(false) // Agent crash shouldn't kill the harness
+                .port_mappings(
+                    PortMapping::builder()
+                        .container_port(3100)
+                        .host_port(3100)
+                        .protocol(TransportProtocol::Tcp)
+                        .build(),
+                )
+                .set_environment(Some(agent_env_vars))
+                .log_configuration(
+                    LogConfiguration::builder()
+                        .log_driver(LogDriver::Awslogs)
+                        .set_options(Some(agent_log_options))
+                        .build()
+                        .map_err(|e| {
+                            AmosError::Internal(format!("Failed to build agent log config: {}", e))
+                        })?,
+                )
+                .build();
+
+            task_def_builder = task_def_builder.container_definitions(agent_container);
+
+            info!(agent_image = %agent_image, "Including agent sidecar in task definition");
+        }
+
+        let task_def_result = task_def_builder.send().await.map_err(|e| {
+            AmosError::Internal(format!("Failed to register task definition: {}", e))
+        })?;
 
         let task_def_arn = task_def_result
             .task_definition()
@@ -377,12 +459,23 @@ impl EcsProvisioner {
     }
 }
 
-/// Map `InstanceSize` to valid Fargate CPU/memory strings.
+/// Map `InstanceSize` to valid Fargate CPU/memory strings (harness only).
 fn fargate_resources(size: InstanceSize) -> (&'static str, &'static str) {
     match size {
         InstanceSize::Small => ("512", "1024"),   // 0.5 vCPU, 1 GB
         InstanceSize::Medium => ("1024", "2048"), // 1 vCPU, 2 GB
         InstanceSize::Large => ("2048", "4096"),  // 2 vCPU, 4 GB
+    }
+}
+
+/// Map `InstanceSize` to valid Fargate CPU/memory strings when running
+/// harness + agent sidecar. Both containers share the task's CPU/memory,
+/// so we bump each tier up to accommodate the agent.
+fn fargate_resources_with_agent(size: InstanceSize) -> (&'static str, &'static str) {
+    match size {
+        InstanceSize::Small => ("1024", "2048"),  // 1 vCPU, 2 GB
+        InstanceSize::Medium => ("2048", "4096"), // 2 vCPU, 4 GB
+        InstanceSize::Large => ("4096", "8192"),  // 4 vCPU, 8 GB
     }
 }
 
@@ -401,6 +494,23 @@ mod tests {
         assert_eq!(fargate_resources(InstanceSize::Small), ("512", "1024"));
         assert_eq!(fargate_resources(InstanceSize::Medium), ("1024", "2048"));
         assert_eq!(fargate_resources(InstanceSize::Large), ("2048", "4096"));
+    }
+
+    #[test]
+    fn fargate_resources_with_agent_valid_combos() {
+        // With agent sidecar, resources are bumped up one tier.
+        assert_eq!(
+            fargate_resources_with_agent(InstanceSize::Small),
+            ("1024", "2048")
+        );
+        assert_eq!(
+            fargate_resources_with_agent(InstanceSize::Medium),
+            ("2048", "4096")
+        );
+        assert_eq!(
+            fargate_resources_with_agent(InstanceSize::Large),
+            ("4096", "8192")
+        );
     }
 
     #[test]
