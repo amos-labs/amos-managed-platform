@@ -1036,8 +1036,10 @@ async fn verify_harness_ownership(
     .bind(tenant_id)
     .fetch_optional(&state.db)
     .await
-    .ok()
-    .flatten();
+    .map_err(|e| {
+        error!("DB error in verify_harness_ownership: {}", e);
+        Redirect::to("/dashboard").into_response()
+    })?;
 
     let container_id = match row {
         Some((cid,)) => cid,
@@ -1423,20 +1425,39 @@ async fn harness_delete(
     // Tear down ALB routing before removing the container/task.
     teardown_alb_routing(&state, harness_id).await;
 
-    // Remove the container/task
+    // Stop and remove the container/task.
+    // For Docker, deprovision() force-removes even running containers.
+    // For ECS, stop() is the only option (tasks are ephemeral).
     if let Some(cid) = &container_id {
         if let Some(ref manager) = state.harness_manager {
-            let _ = manager.deprovision(cid).await;
+            // deprovision() uses force:true so it handles running containers
+            if let Err(e) = manager.deprovision(cid).await {
+                error!(
+                    "Failed to deprovision container {} for harness {}: {}",
+                    cid, harness_id, e
+                );
+            }
         } else if let Some(ref ecs) = state.ecs_provisioner {
-            let _ = ecs.stop(cid).await;
+            if let Err(e) = ecs.stop(cid).await {
+                error!(
+                    "Failed to stop ECS task {} for harness {}: {}",
+                    cid, harness_id, e
+                );
+            }
         }
     }
 
     // Delete from database
-    let _ = sqlx::query("DELETE FROM harness_instances WHERE id = $1")
+    if let Err(e) = sqlx::query("DELETE FROM harness_instances WHERE id = $1")
         .bind(harness_id)
         .execute(&state.db)
-        .await;
+        .await
+    {
+        error!(
+            "Failed to delete harness {} from database: {}",
+            harness_id, e
+        );
+    }
 
     info!(harness_id = %harness_id, "Harness deleted via dashboard");
     Redirect::to("/dashboard").into_response()

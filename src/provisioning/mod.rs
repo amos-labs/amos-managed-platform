@@ -151,13 +151,27 @@ impl HarnessManager {
     }
 
     /// Stop a harness container gracefully.
+    ///
+    /// Returns Ok(()) even if the container is already stopped (Bollard 304).
     pub async fn stop(&self, container_id: &str) -> Result<()> {
         let options = StopContainerOptions { t: 30 }; // 30 second timeout
-        self.docker
+        match self
+            .docker
             .stop_container(container_id, Some(options))
             .await
-            .map_err(|e| AmosError::Internal(format!("Failed to stop container: {}", e)))?;
-        Ok(())
+        {
+            Ok(()) => Ok(()),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 304, ..
+            }) => {
+                // Container is already stopped — not an error.
+                Ok(())
+            }
+            Err(e) => Err(AmosError::Internal(format!(
+                "Failed to stop container: {}",
+                e
+            ))),
+        }
     }
 
     /// Remove a harness container and volumes.
