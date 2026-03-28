@@ -223,6 +223,7 @@ struct SettingsTemplate {
 struct HarnessInfo {
     id: String,
     full_id: String,
+    name: Option<String>,
     status: String,
     subdomain: Option<String>,
     region: String,
@@ -792,8 +793,8 @@ async fn dashboard_page(
     .flatten();
 
     // Fetch harness instances (including endpoint info and version tracking).
-    let harness_rows = sqlx::query_as::<_, (Uuid, String, Option<String>, String, String, bool, Option<i32>, Option<String>, Option<String>, Option<String>, Option<String>)>(
-        "SELECT id, status, subdomain, region, instance_size, healthy, external_port, internal_url, container_id, image_tag, previous_image_tag
+    let harness_rows = sqlx::query_as::<_, (Uuid, String, Option<String>, String, String, bool, Option<i32>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)>(
+        "SELECT id, status, subdomain, region, instance_size, healthy, external_port, internal_url, container_id, image_tag, previous_image_tag, name
          FROM harness_instances WHERE tenant_id = $1 ORDER BY created_at DESC"
     )
     .bind(tenant_id)
@@ -816,6 +817,7 @@ async fn dashboard_page(
                 container_id,
                 image_tag,
                 previous_image_tag,
+                name,
             )| {
                 // Prefer public subdomain URL over internal IP for the endpoint display.
                 let endpoint_url = subdomain
@@ -835,6 +837,7 @@ async fn dashboard_page(
                 HarnessInfo {
                     id: id.to_string()[..8].to_string(),
                     full_id: id.to_string(),
+                    name,
                     status,
                     subdomain,
                     region,
@@ -1780,9 +1783,15 @@ async fn harness_delete(
     Redirect::to("/dashboard").into_response()
 }
 
+#[derive(Deserialize)]
+struct DeployHarnessForm {
+    name: Option<String>,
+}
+
 async fn deploy_new_harness(
     State(state): State<PlatformState>,
     headers: axum::http::HeaderMap,
+    Form(form): Form<DeployHarnessForm>,
 ) -> Response {
     let claims = match extract_session_claims(&state, &headers) {
         Some(c) => c,
@@ -1803,13 +1812,15 @@ async fn deploy_new_harness(
 
     // Create harness instance record
     let harness_id = Uuid::new_v4();
+    let harness_name = form.name.filter(|n| !n.trim().is_empty());
     let _ = sqlx::query(
-        "INSERT INTO harness_instances (id, tenant_id, subdomain, status)
-         VALUES ($1, $2, $3, 'pending')",
+        "INSERT INTO harness_instances (id, tenant_id, subdomain, name, status)
+         VALUES ($1, $2, $3, $4, 'pending')",
     )
     .bind(harness_id)
     .bind(tenant_id)
     .bind(&subdomain)
+    .bind(&harness_name)
     .execute(&state.db)
     .await;
 

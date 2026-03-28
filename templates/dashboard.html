@@ -30,7 +30,9 @@
         <h1 class="text-2xl font-bold text-gray-900">Dashboard</h1>
         <p class="mt-1 text-sm text-gray-500">Organization: {{ tenant_name }} ({{ tenant_slug }})</p>
       </div>
-      <form action="/dashboard/harness/new" method="POST">
+      <form action="/dashboard/harness/new" method="POST" class="flex items-center gap-2">
+        <input type="text" name="name" placeholder="Harness name (optional)"
+               class="rounded-md border border-gray-300 px-3 py-2 text-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500" />
         <button type="submit"
                 class="inline-flex items-center rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600">
           + Deploy New Harness
@@ -67,7 +69,7 @@
         {% for inst in &instances %}
         <div class="rounded-lg border bg-white p-5 shadow-sm">
           <div class="flex items-center justify-between mb-3">
-            <span class="text-sm font-medium text-gray-900">{{ inst.id }}</span>
+            <span class="text-sm font-medium text-gray-900">{% if let Some(n) = inst.name %}{{ n }}{% else %}{{ inst.id }}{% endif %}</span>
             {% if inst.status == "running" %}
             <span class="inline-flex items-center rounded-full bg-green-100 px-2.5 py-0.5 text-xs font-medium text-green-800">Running</span>
             {% elif inst.status == "pending" %}
