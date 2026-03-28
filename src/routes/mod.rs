@@ -10,6 +10,7 @@ pub mod discovery;
 pub mod governance;
 pub mod health;
 pub mod provisioning;
+pub mod releases;
 pub mod sync;
 pub mod tenants;
 pub mod token;
@@ -26,6 +27,7 @@ pub fn api_routes() -> Router<PlatformState> {
         .merge(billing::routes())
         .merge(provisioning::routes())
         .merge(sync::routes())
+        .merge(releases::routes())
         // Also serve the catalog at /api/v1 itself
         .route("/", get(discovery::api_catalog))
 }

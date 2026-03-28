@@ -200,14 +200,46 @@ impl EcsProvisioner {
         })
     }
 
-    /// Provision a new harness as an ECS Fargate task.
+    /// Provision a new harness as an ECS Fargate task using the default images
+    /// configured on this provisioner.
     ///
     /// Returns the ECS task ARN (stored as `container_id` in the DB).
     pub async fn provision(&self, config: &HarnessConfig, tenant_slug: &str) -> Result<String> {
+        self.provision_inner(
+            config,
+            tenant_slug,
+            &self.harness_image,
+            self.agent_image.as_deref(),
+        )
+        .await
+    }
+
+    /// Provision a new harness as an ECS Fargate task with caller-provided images.
+    ///
+    /// Used by the update/rollback flow to deploy a specific release version.
+    pub async fn provision_with_images(
+        &self,
+        config: &HarnessConfig,
+        tenant_slug: &str,
+        harness_image: &str,
+        agent_image: Option<&str>,
+    ) -> Result<String> {
+        self.provision_inner(config, tenant_slug, harness_image, agent_image)
+            .await
+    }
+
+    /// Inner provisioning logic shared by `provision()` and `provision_with_images()`.
+    async fn provision_inner(
+        &self,
+        config: &HarnessConfig,
+        tenant_slug: &str,
+        harness_image: &str,
+        agent_image: Option<&str>,
+    ) -> Result<String> {
         let family = format!("amos-harness-{}", tenant_slug);
 
         // If agent sidecar is configured, bump resources to accommodate both containers.
-        let (cpu, memory) = if self.agent_image.is_some() {
+        let (cpu, memory) = if agent_image.is_some() {
             fargate_resources_with_agent(config.instance_size)
         } else {
             fargate_resources(config.instance_size)
@@ -225,7 +257,7 @@ impl EcsProvisioner {
         ];
 
         // Tell harness where the agent sidecar is (same task = localhost).
-        if self.agent_image.is_some() {
+        if agent_image.is_some() {
             env_vars.push(kv("AGENT_URL", "http://localhost:3100"));
         }
 
@@ -259,7 +291,7 @@ impl EcsProvisioner {
         // Build harness container definition.
         let harness_container = ContainerDefinition::builder()
             .name("amos-harness")
-            .image(&self.harness_image)
+            .image(harness_image)
             .essential(true)
             .port_mappings(
                 PortMapping::builder()
@@ -294,7 +326,7 @@ impl EcsProvisioner {
             .container_definitions(harness_container);
 
         // Add agent sidecar container if configured.
-        if let Some(agent_image) = &self.agent_image {
+        if let Some(agent_image) = agent_image {
             let mut agent_log_options = std::collections::HashMap::new();
             agent_log_options.insert("awslogs-group".to_string(), self.log_group.clone());
             agent_log_options.insert("awslogs-region".to_string(), self.aws_region.clone());

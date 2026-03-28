@@ -24,6 +24,15 @@ use crate::{
 
 const SESSION_COOKIE: &str = "amos_session";
 
+/// Truncate a version/image tag for display (e.g., "sha-f73ede4..." → "sha-f73ed...").
+fn truncate_version(v: &str) -> String {
+    if v.len() > 16 {
+        format!("{}...", &v[..13])
+    } else {
+        v.to_string()
+    }
+}
+
 // ── ECS Polling Helper ──────────────────────────────────────────────────
 
 /// Spawn a background task that polls ECS every 5 s (up to 2 min) until
@@ -221,6 +230,12 @@ struct HarnessInfo {
     healthy: bool,
     endpoint_url: Option<String>,
     container_id_short: Option<String>,
+    image_tag: Option<String>,
+    image_tag_short: Option<String>,
+    previous_image_tag: Option<String>,
+    /// Set to the latest release version when it differs from image_tag.
+    update_available: Option<String>,
+    update_available_short: Option<String>,
 }
 
 struct ApiKeyInfo {
@@ -273,6 +288,8 @@ pub fn routes() -> Router<PlatformState> {
         .route("/dashboard/harness/{id}/stop", post(harness_stop))
         .route("/dashboard/harness/{id}/restart", post(harness_restart))
         .route("/dashboard/harness/{id}/redeploy", post(harness_redeploy))
+        .route("/dashboard/harness/{id}/update", post(harness_update))
+        .route("/dashboard/harness/{id}/rollback", post(harness_rollback))
         .route("/dashboard/harness/{id}/delete", post(harness_delete))
         .route("/logout", post(logout_submit))
 }
@@ -765,9 +782,18 @@ async fn dashboard_page(
     let (tenant_name, tenant_slug, plan) =
         tenant_row.unwrap_or_else(|| ("Unknown".into(), claims.tenant_slug.clone(), "free".into()));
 
-    // Fetch harness instances (including endpoint info)
-    let harness_rows = sqlx::query_as::<_, (Uuid, String, Option<String>, String, String, bool, Option<i32>, Option<String>, Option<String>)>(
-        "SELECT id, status, subdomain, region, instance_size, healthy, external_port, internal_url, container_id
+    // Fetch the latest available release version for update-available badge.
+    let latest_release_version: Option<String> = sqlx::query_scalar(
+        "SELECT version FROM releases WHERE status = 'available' ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten();
+
+    // Fetch harness instances (including endpoint info and version tracking).
+    let harness_rows = sqlx::query_as::<_, (Uuid, String, Option<String>, String, String, bool, Option<i32>, Option<String>, Option<String>, Option<String>, Option<String>)>(
+        "SELECT id, status, subdomain, region, instance_size, healthy, external_port, internal_url, container_id, image_tag, previous_image_tag
          FROM harness_instances WHERE tenant_id = $1 ORDER BY created_at DESC"
     )
     .bind(tenant_id)
@@ -788,12 +814,23 @@ async fn dashboard_page(
                 _external_port,
                 internal_url,
                 container_id,
+                image_tag,
+                previous_image_tag,
             )| {
                 // Prefer public subdomain URL over internal IP for the endpoint display.
                 let endpoint_url = subdomain
                     .as_deref()
                     .map(|s| format!("https://{}.custom.amoslabs.com", s))
                     .or(internal_url);
+
+                // Show update badge when latest release differs from current image_tag.
+                let update_available = match (&latest_release_version, &image_tag) {
+                    (Some(latest), Some(current)) if latest != current => Some(latest.clone()),
+                    _ => None,
+                };
+
+                let image_tag_short = image_tag.as_ref().map(|t| truncate_version(t));
+                let update_available_short = update_available.as_ref().map(|t| truncate_version(t));
 
                 HarnessInfo {
                     id: id.to_string()[..8].to_string(),
@@ -811,6 +848,11 @@ async fn dashboard_page(
                             c
                         }
                     }),
+                    image_tag,
+                    image_tag_short,
+                    previous_image_tag,
+                    update_available,
+                    update_available_short,
                 }
             },
         )
@@ -1400,6 +1442,270 @@ async fn harness_redeploy(
             }
             Err(e) => {
                 error!("Failed to redeploy ECS harness {}: {}", harness_id, e);
+                let _ = sqlx::query("UPDATE harness_instances SET status = 'error' WHERE id = $1")
+                    .bind(harness_id)
+                    .execute(&state.db)
+                    .await;
+            }
+        }
+    }
+
+    Redirect::to("/dashboard").into_response()
+}
+
+/// Update a harness to the latest available release.
+async fn harness_update(
+    State(state): State<PlatformState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let (_claims, harness_id, container_id) =
+        match verify_harness_ownership(&state, &headers, &id).await {
+            Ok(v) => v,
+            Err(r) => return r,
+        };
+
+    // Look up the latest available release.
+    let release = sqlx::query_as::<_, (String, String, Option<String>)>(
+        "SELECT version, harness_image, agent_image FROM releases WHERE status = 'available' ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten();
+
+    let (new_version, harness_image, agent_image) = match release {
+        Some(r) => r,
+        None => {
+            warn!("No available release found for update");
+            return Redirect::to("/dashboard").into_response();
+        }
+    };
+
+    // Save current image_tag as previous_image_tag for rollback.
+    let _ = sqlx::query(
+        "UPDATE harness_instances SET previous_image_tag = image_tag WHERE id = $1",
+    )
+    .bind(harness_id)
+    .execute(&state.db)
+    .await;
+
+    // Stop old task if it exists.
+    if let Some(cid) = &container_id {
+        if let Some(ref ecs) = state.ecs_provisioner {
+            let _ = ecs.stop(cid).await;
+        } else if let Some(ref manager) = state.harness_manager {
+            let _ = manager.deprovision(cid).await;
+        }
+    }
+
+    // Tear down ALB routing — poller will set up new routing.
+    teardown_alb_routing(&state, harness_id).await;
+
+    let _ = sqlx::query(
+        "UPDATE harness_instances SET status = 'provisioning', healthy = FALSE WHERE id = $1",
+    )
+    .bind(harness_id)
+    .execute(&state.db)
+    .await;
+
+    // Get tenant info for provisioning.
+    let tenant_row = sqlx::query_as::<_, (Uuid, String)>(
+        "SELECT t.id, t.slug FROM tenants t JOIN harness_instances h ON h.tenant_id = t.id WHERE h.id = $1",
+    )
+    .bind(harness_id)
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten();
+
+    let (tenant_id, tenant_slug) = match tenant_row {
+        Some(r) => r,
+        None => return Redirect::to("/dashboard").into_response(),
+    };
+
+    if let Some(ref ecs) = state.ecs_provisioner {
+        let ecs_config = HarnessConfig {
+            customer_id: tenant_id,
+            region: "us-east-1".to_string(),
+            instance_size: InstanceSize::Small,
+            environment: "production".to_string(),
+            platform_grpc_url: String::new(),
+            env_vars: HashMap::new(),
+        };
+
+        match ecs
+            .provision_with_images(&ecs_config, &tenant_slug, &harness_image, agent_image.as_deref())
+            .await
+        {
+            Ok(task_arn) => {
+                let _ = sqlx::query(
+                    "UPDATE harness_instances SET container_id = $1, image_tag = $2, provisioned_at = NOW() WHERE id = $3",
+                )
+                .bind(&task_arn)
+                .bind(&new_version)
+                .bind(harness_id)
+                .execute(&state.db)
+                .await;
+
+                info!(task_arn = %task_arn, version = %new_version, "Harness updated to new release");
+
+                let subdomain: Option<String> =
+                    sqlx::query_scalar("SELECT subdomain FROM harness_instances WHERE id = $1")
+                        .bind(harness_id)
+                        .fetch_optional(&state.db)
+                        .await
+                        .ok()
+                        .flatten();
+
+                spawn_ecs_status_poller(
+                    ecs.clone(),
+                    state.db.clone(),
+                    task_arn,
+                    harness_id,
+                    state.alb_router.clone(),
+                    subdomain,
+                );
+            }
+            Err(e) => {
+                error!("Failed to update harness {}: {}", harness_id, e);
+                let _ = sqlx::query("UPDATE harness_instances SET status = 'error' WHERE id = $1")
+                    .bind(harness_id)
+                    .execute(&state.db)
+                    .await;
+            }
+        }
+    }
+
+    Redirect::to("/dashboard").into_response()
+}
+
+/// Roll back a harness to the previous version.
+async fn harness_rollback(
+    State(state): State<PlatformState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let (_claims, harness_id, container_id) =
+        match verify_harness_ownership(&state, &headers, &id).await {
+            Ok(v) => v,
+            Err(r) => return r,
+        };
+
+    // Read the previous_image_tag.
+    let prev_tag: Option<String> = sqlx::query_scalar(
+        "SELECT previous_image_tag FROM harness_instances WHERE id = $1",
+    )
+    .bind(harness_id)
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten();
+
+    let prev_tag = match prev_tag {
+        Some(t) => t,
+        None => {
+            warn!("No previous image tag for rollback on harness {}", harness_id);
+            return Redirect::to("/dashboard").into_response();
+        }
+    };
+
+    // Look up the release for that version.
+    let release = sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT harness_image, agent_image FROM releases WHERE version = $1",
+    )
+    .bind(&prev_tag)
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten();
+
+    let (harness_image, agent_image) = match release {
+        Some(r) => r,
+        None => {
+            warn!("Release not found for version {} during rollback", prev_tag);
+            return Redirect::to("/dashboard").into_response();
+        }
+    };
+
+    // Stop old task.
+    if let Some(cid) = &container_id {
+        if let Some(ref ecs) = state.ecs_provisioner {
+            let _ = ecs.stop(cid).await;
+        } else if let Some(ref manager) = state.harness_manager {
+            let _ = manager.deprovision(cid).await;
+        }
+    }
+
+    teardown_alb_routing(&state, harness_id).await;
+
+    let _ = sqlx::query(
+        "UPDATE harness_instances SET status = 'provisioning', healthy = FALSE WHERE id = $1",
+    )
+    .bind(harness_id)
+    .execute(&state.db)
+    .await;
+
+    let tenant_row = sqlx::query_as::<_, (Uuid, String)>(
+        "SELECT t.id, t.slug FROM tenants t JOIN harness_instances h ON h.tenant_id = t.id WHERE h.id = $1",
+    )
+    .bind(harness_id)
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten();
+
+    let (tenant_id, tenant_slug) = match tenant_row {
+        Some(r) => r,
+        None => return Redirect::to("/dashboard").into_response(),
+    };
+
+    if let Some(ref ecs) = state.ecs_provisioner {
+        let ecs_config = HarnessConfig {
+            customer_id: tenant_id,
+            region: "us-east-1".to_string(),
+            instance_size: InstanceSize::Small,
+            environment: "production".to_string(),
+            platform_grpc_url: String::new(),
+            env_vars: HashMap::new(),
+        };
+
+        match ecs
+            .provision_with_images(&ecs_config, &tenant_slug, &harness_image, agent_image.as_deref())
+            .await
+        {
+            Ok(task_arn) => {
+                // Swap tags: current becomes previous, previous becomes current.
+                let _ = sqlx::query(
+                    "UPDATE harness_instances SET container_id = $1, previous_image_tag = image_tag, image_tag = $2, provisioned_at = NOW() WHERE id = $3",
+                )
+                .bind(&task_arn)
+                .bind(&prev_tag)
+                .bind(harness_id)
+                .execute(&state.db)
+                .await;
+
+                info!(task_arn = %task_arn, version = %prev_tag, "Harness rolled back");
+
+                let subdomain: Option<String> =
+                    sqlx::query_scalar("SELECT subdomain FROM harness_instances WHERE id = $1")
+                        .bind(harness_id)
+                        .fetch_optional(&state.db)
+                        .await
+                        .ok()
+                        .flatten();
+
+                spawn_ecs_status_poller(
+                    ecs.clone(),
+                    state.db.clone(),
+                    task_arn,
+                    harness_id,
+                    state.alb_router.clone(),
+                    subdomain,
+                );
+            }
+            Err(e) => {
+                error!("Failed to rollback harness {}: {}", harness_id, e);
                 let _ = sqlx::query("UPDATE harness_instances SET status = 'error' WHERE id = $1")
                     .bind(harness_id)
                     .execute(&state.db)

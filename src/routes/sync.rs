@@ -189,8 +189,17 @@ async fn get_config(
         }
     }
 
+    // Look up the latest available release from the database; fall back to compile-time version.
+    let latest_version: Option<String> =
+        sqlx::query_scalar("SELECT version FROM releases WHERE status = 'available' ORDER BY created_at DESC LIMIT 1")
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten()
+            .or_else(|| Some(env!("CARGO_PKG_VERSION").to_string()));
+
     Json(RemoteConfig {
-        latest_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        latest_version,
         enabled,
         model_overrides: vec![],
         feature_flags,
@@ -334,9 +343,17 @@ struct VersionInfo {
     update_required: bool,
 }
 
-async fn get_latest_version() -> impl IntoResponse {
+async fn get_latest_version(State(state): State<PlatformState>) -> impl IntoResponse {
+    let latest_version: String =
+        sqlx::query_scalar("SELECT version FROM releases WHERE status = 'available' ORDER BY created_at DESC LIMIT 1")
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+
     Json(VersionInfo {
-        latest_version: env!("CARGO_PKG_VERSION").to_string(),
+        latest_version,
         minimum_version: "0.1.0".to_string(),
         release_notes_url: None,
         update_required: false,
