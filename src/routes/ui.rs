@@ -1483,12 +1483,11 @@ async fn harness_update(
     };
 
     // Save current image_tag as previous_image_tag for rollback.
-    let _ = sqlx::query(
-        "UPDATE harness_instances SET previous_image_tag = image_tag WHERE id = $1",
-    )
-    .bind(harness_id)
-    .execute(&state.db)
-    .await;
+    let _ =
+        sqlx::query("UPDATE harness_instances SET previous_image_tag = image_tag WHERE id = $1")
+            .bind(harness_id)
+            .execute(&state.db)
+            .await;
 
     // Stop old task if it exists.
     if let Some(cid) = &container_id {
@@ -1535,7 +1534,12 @@ async fn harness_update(
         };
 
         match ecs
-            .provision_with_images(&ecs_config, &tenant_slug, &harness_image, agent_image.as_deref())
+            .provision_with_images(
+                &ecs_config,
+                &tenant_slug,
+                &harness_image,
+                agent_image.as_deref(),
+            )
             .await
         {
             Ok(task_arn) => {
@@ -1593,19 +1597,21 @@ async fn harness_rollback(
         };
 
     // Read the previous_image_tag.
-    let prev_tag: Option<String> = sqlx::query_scalar(
-        "SELECT previous_image_tag FROM harness_instances WHERE id = $1",
-    )
-    .bind(harness_id)
-    .fetch_optional(&state.db)
-    .await
-    .ok()
-    .flatten();
+    let prev_tag: Option<String> =
+        sqlx::query_scalar("SELECT previous_image_tag FROM harness_instances WHERE id = $1")
+            .bind(harness_id)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten();
 
     let prev_tag = match prev_tag {
         Some(t) => t,
         None => {
-            warn!("No previous image tag for rollback on harness {}", harness_id);
+            warn!(
+                "No previous image tag for rollback on harness {}",
+                harness_id
+            );
             return Redirect::to("/dashboard").into_response();
         }
     };
@@ -1671,7 +1677,12 @@ async fn harness_rollback(
         };
 
         match ecs
-            .provision_with_images(&ecs_config, &tenant_slug, &harness_image, agent_image.as_deref())
+            .provision_with_images(
+                &ecs_config,
+                &tenant_slug,
+                &harness_image,
+                agent_image.as_deref(),
+            )
             .await
         {
             Ok(task_arn) => {

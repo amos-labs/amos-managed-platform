@@ -190,13 +190,14 @@ async fn get_config(
     }
 
     // Look up the latest available release from the database; fall back to compile-time version.
-    let latest_version: Option<String> =
-        sqlx::query_scalar("SELECT version FROM releases WHERE status = 'available' ORDER BY created_at DESC LIMIT 1")
-            .fetch_optional(&state.db)
-            .await
-            .ok()
-            .flatten()
-            .or_else(|| Some(env!("CARGO_PKG_VERSION").to_string()));
+    let latest_version: Option<String> = sqlx::query_scalar(
+        "SELECT version FROM releases WHERE status = 'available' ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten()
+    .or_else(|| Some(env!("CARGO_PKG_VERSION").to_string()));
 
     Json(RemoteConfig {
         latest_version,
@@ -344,13 +345,14 @@ struct VersionInfo {
 }
 
 async fn get_latest_version(State(state): State<PlatformState>) -> impl IntoResponse {
-    let latest_version: String =
-        sqlx::query_scalar("SELECT version FROM releases WHERE status = 'available' ORDER BY created_at DESC LIMIT 1")
-            .fetch_optional(&state.db)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+    let latest_version: String = sqlx::query_scalar(
+        "SELECT version FROM releases WHERE status = 'available' ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
 
     Json(VersionInfo {
         latest_version,

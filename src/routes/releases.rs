@@ -32,7 +32,6 @@ struct RegisterReleaseRequest {
     release_notes: Option<String>,
 }
 
-
 /// `POST /releases` — Register a new release. Authenticated via `RELEASE_API_KEY` bearer token.
 async fn register_release(
     State(state): State<PlatformState>,
@@ -138,14 +137,16 @@ async fn list_releases(State(state): State<PlatformState>) -> impl IntoResponse 
 
     let releases: Vec<ReleaseInfo> = rows
         .into_iter()
-        .map(|(id, version, commit_sha, status, release_notes, created_at)| ReleaseInfo {
-            id: id.to_string(),
-            version,
-            commit_sha,
-            status,
-            release_notes,
-            created_at,
-        })
+        .map(
+            |(id, version, commit_sha, status, release_notes, created_at)| ReleaseInfo {
+                id: id.to_string(),
+                version,
+                commit_sha,
+                status,
+                release_notes,
+                created_at,
+            },
+        )
         .collect();
 
     Json(serde_json::json!({ "releases": releases }))
