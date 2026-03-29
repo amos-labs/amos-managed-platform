@@ -688,17 +688,27 @@ async fn register_submit(
             env_vars: HashMap::new(),         // ECS provisioner sets its own env
         };
 
+        // Look up the current release version so we can track what we deployed.
+        let current_version: Option<String> = sqlx::query_scalar(
+            "SELECT version FROM releases WHERE status = 'available' ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten();
+
         match ecs.provision(&ecs_config, &slug).await {
             Ok(task_arn) => {
                 info!(task_arn = %task_arn, "ECS task launched for tenant");
 
-                // Store the task ARN as container_id
+                // Store the task ARN as container_id and the image_tag for version tracking.
                 let _ = sqlx::query(
                     "UPDATE harness_instances
-                     SET container_id = $1, provisioned_at = NOW()
-                     WHERE id = $2",
+                     SET container_id = $1, provisioned_at = NOW(), image_tag = $2
+                     WHERE id = $3",
                 )
                 .bind(&task_arn)
+                .bind(&current_version)
                 .bind(harness_id)
                 .execute(&state.db)
                 .await;
@@ -756,8 +766,17 @@ async fn register_submit(
 
 // ── Dashboard ───────────────────────────────────────────────────────────
 
+#[derive(Deserialize, Default)]
+struct DashboardQuery {
+    #[serde(default)]
+    msg: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
 async fn dashboard_page(
     State(state): State<PlatformState>,
+    axum::extract::Query(query): axum::extract::Query<DashboardQuery>,
     headers: axum::http::HeaderMap,
 ) -> Response {
     let claims = match extract_session_claims(&state, &headers) {
@@ -882,8 +901,8 @@ async fn dashboard_page(
         instances,
         user_count,
         api_key_count,
-        flash_message: None,
-        flash_error: None,
+        flash_message: query.msg,
+        flash_error: query.error,
     })
     .into_response()
 }
@@ -1481,7 +1500,10 @@ async fn harness_update(
         Some(r) => r,
         None => {
             warn!("No available release found for update");
-            return Redirect::to("/dashboard").into_response();
+            return Redirect::to(
+                "/dashboard?error=No+release+available+for+update.+Push+a+new+build+first.",
+            )
+            .into_response();
         }
     };
 
@@ -1580,11 +1602,15 @@ async fn harness_update(
                     .bind(harness_id)
                     .execute(&state.db)
                     .await;
+                return Redirect::to(
+                    "/dashboard?error=Failed+to+update+harness.+Check+logs+for+details.",
+                )
+                .into_response();
             }
         }
     }
 
-    Redirect::to("/dashboard").into_response()
+    Redirect::to("/dashboard?msg=Harness+update+started.").into_response()
 }
 
 /// Roll back a harness to the previous version.
@@ -1615,7 +1641,8 @@ async fn harness_rollback(
                 "No previous image tag for rollback on harness {}",
                 harness_id
             );
-            return Redirect::to("/dashboard").into_response();
+            return Redirect::to("/dashboard?error=No+previous+version+available+for+rollback.")
+                .into_response();
         }
     };
 
@@ -1633,7 +1660,8 @@ async fn harness_rollback(
         Some(r) => r,
         None => {
             warn!("Release not found for version {} during rollback", prev_tag);
-            return Redirect::to("/dashboard").into_response();
+            return Redirect::to("/dashboard?error=Release+record+not+found+for+previous+version.")
+                .into_response();
         }
     };
 
@@ -1724,11 +1752,15 @@ async fn harness_rollback(
                     .bind(harness_id)
                     .execute(&state.db)
                     .await;
+                return Redirect::to(
+                    "/dashboard?error=Failed+to+roll+back+harness.+Check+logs+for+details.",
+                )
+                .into_response();
             }
         }
     }
 
-    Redirect::to("/dashboard").into_response()
+    Redirect::to("/dashboard?msg=Harness+rollback+started.").into_response()
 }
 
 async fn harness_delete(
@@ -1912,10 +1944,20 @@ async fn deploy_new_harness(
             env_vars: HashMap::new(),
         };
 
+        // Look up the current release version so we can track what we deployed.
+        let current_version: Option<String> = sqlx::query_scalar(
+            "SELECT version FROM releases WHERE status = 'available' ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten();
+
         match ecs.provision(&ecs_config, &tenant_slug).await {
             Ok(task_arn) => {
-                let _ = sqlx::query("UPDATE harness_instances SET container_id = $1, provisioned_at = NOW() WHERE id = $2")
+                let _ = sqlx::query("UPDATE harness_instances SET container_id = $1, provisioned_at = NOW(), image_tag = $2 WHERE id = $3")
                     .bind(&task_arn)
+                    .bind(&current_version)
                     .bind(harness_id)
                     .execute(&state.db)
                     .await;
