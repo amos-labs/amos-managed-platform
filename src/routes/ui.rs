@@ -13,6 +13,8 @@ use axum::{
 };
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::Instant;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -23,6 +25,33 @@ use crate::{
 };
 
 const SESSION_COOKIE: &str = "amos_session";
+
+/// Simple in-memory IP rate limiter for auth endpoints.
+static AUTH_RATE_LIMITER: std::sync::LazyLock<Mutex<HashMap<String, Vec<Instant>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Returns true if the IP has exceeded the rate limit (max requests per window).
+fn is_rate_limited(ip: &str, max_requests: usize, window_secs: u64) -> bool {
+    let now = Instant::now();
+    let mut map = AUTH_RATE_LIMITER.lock().unwrap_or_else(|e| e.into_inner());
+    let entries = map.entry(ip.to_string()).or_default();
+    entries.retain(|t| now.duration_since(*t).as_secs() < window_secs);
+    if entries.len() >= max_requests {
+        return true;
+    }
+    entries.push(now);
+    false
+}
+
+fn extract_client_ip(headers: &axum::http::HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .unwrap_or("unknown")
+        .trim()
+        .to_string()
+}
 
 /// Truncate a version/image tag for display (e.g., "sha-f73ede4..." → "sha-f73ed...").
 fn truncate_version(v: &str) -> String {
@@ -301,7 +330,21 @@ async fn login_page() -> impl IntoResponse {
     HtmlTemplate(LoginTemplate { error: None })
 }
 
-async fn login_submit(State(state): State<PlatformState>, Form(form): Form<LoginForm>) -> Response {
+async fn login_submit(
+    State(state): State<PlatformState>,
+    headers: axum::http::HeaderMap,
+    Form(form): Form<LoginForm>,
+) -> Response {
+    // Rate limit: 10 login attempts per IP per 60 seconds
+    let ip = extract_client_ip(&headers);
+    if is_rate_limited(&ip, 10, 60) {
+        warn!(ip = %ip, "Login rate limited");
+        return HtmlTemplate(LoginTemplate {
+            error: Some("Too many login attempts. Please wait a minute and try again.".into()),
+        })
+        .into_response();
+    }
+
     // Look up user by email
     let row = sqlx::query_as::<_, (Uuid, Uuid, String, String, String, bool)>(
         "SELECT u.id, u.tenant_id, u.password_hash, u.role, t.slug, u.is_active
@@ -403,8 +446,19 @@ async fn register_page() -> impl IntoResponse {
 
 async fn register_submit(
     State(state): State<PlatformState>,
+    headers: axum::http::HeaderMap,
     Form(form): Form<RegisterForm>,
 ) -> Response {
+    // Rate limit: 5 signups per IP per 5 minutes
+    let ip = extract_client_ip(&headers);
+    if is_rate_limited(&ip, 5, 300) {
+        warn!(ip = %ip, "Registration rate limited");
+        return HtmlTemplate(RegisterTemplate {
+            error: Some("Too many signup attempts. Please wait a few minutes.".into()),
+        })
+        .into_response();
+    }
+
     // Validation
     if form.organization_name.trim().is_empty() {
         return HtmlTemplate(RegisterTemplate {
@@ -421,6 +475,14 @@ async fn register_submit(
     if form.password.len() < 8 {
         return HtmlTemplate(RegisterTemplate {
             error: Some("Password must be at least 8 characters.".into()),
+        })
+        .into_response();
+    }
+
+    let valid_plans = ["free", "starter", "growth", "enterprise"];
+    if !valid_plans.contains(&form.plan.as_str()) {
+        return HtmlTemplate(RegisterTemplate {
+            error: Some("Invalid plan selected.".into()),
         })
         .into_response();
     }
@@ -445,34 +507,51 @@ async fn register_submit(
         }
     };
 
-    let subdomain = Some(slug.clone());
     let tenant_id = Uuid::new_v4();
 
-    // Create tenant
-    let result = sqlx::query(
-        "INSERT INTO tenants (id, name, slug, plan, subdomain) VALUES ($1, $2, $3, $4, $5)",
-    )
-    .bind(tenant_id)
-    .bind(&form.organization_name)
-    .bind(&slug)
-    .bind(&form.plan)
-    .bind(&subdomain)
-    .execute(&state.db)
-    .await;
+    // Try to create tenant, auto-suffix slug on collision
+    let mut final_slug = slug.clone();
+    let mut attempts = 0;
+    loop {
+        let subdomain = Some(final_slug.clone());
+        let result = sqlx::query(
+            "INSERT INTO tenants (id, name, slug, plan, subdomain) VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(tenant_id)
+        .bind(&form.organization_name)
+        .bind(&final_slug)
+        .bind(&form.plan)
+        .bind(&subdomain)
+        .execute(&state.db)
+        .await;
 
-    if let Err(e) = result {
-        let err_str = e.to_string();
-        if err_str.contains("tenants_slug_key") || err_str.contains("tenants_subdomain_key") {
-            return HtmlTemplate(RegisterTemplate {
-                error: Some(format!("Organization '{}' is already taken.", slug)),
-            })
-            .into_response();
+        match result {
+            Ok(_) => break,
+            Err(e) => {
+                let err_str = e.to_string();
+                if (err_str.contains("tenants_slug_key")
+                    || err_str.contains("tenants_subdomain_key"))
+                    && attempts < 5
+                {
+                    attempts += 1;
+                    let suffix: u16 = rand::random::<u16>() % 9000 + 1000;
+                    final_slug = format!("{}-{}", slug, suffix);
+                    continue;
+                }
+                if attempts >= 5 {
+                    error!("Slug collision after 5 attempts for: {}", slug);
+                    return HtmlTemplate(RegisterTemplate {
+                        error: Some("Organization name is unavailable. Try a different name.".into()),
+                    })
+                    .into_response();
+                }
+                error!("Failed to create tenant: {}", e);
+                return HtmlTemplate(RegisterTemplate {
+                    error: Some("Failed to create organization.".into()),
+                })
+                .into_response();
+            }
         }
-        error!("Failed to create tenant: {}", e);
-        return HtmlTemplate(RegisterTemplate {
-            error: Some("Failed to create organization.".into()),
-        })
-        .into_response();
     }
 
     // Create user (owner)
@@ -517,7 +596,7 @@ async fn register_submit(
     )
     .bind(harness_id)
     .bind(tenant_id)
-    .bind(&subdomain)
+    .bind(&final_slug)
     .execute(&state.db)
     .await;
 
@@ -697,7 +776,7 @@ async fn register_submit(
         .ok()
         .flatten();
 
-        match ecs.provision(&ecs_config, &slug).await {
+        match ecs.provision(&ecs_config, &final_slug).await {
             Ok(task_arn) => {
                 info!(task_arn = %task_arn, "ECS task launched for tenant");
 
@@ -720,7 +799,7 @@ async fn register_submit(
                     task_arn,
                     harness_id,
                     state.alb_router.clone(),
-                    subdomain.clone(),
+                    Some(final_slug.clone()),
                 );
             }
             Err(e) => {
@@ -745,7 +824,7 @@ async fn register_submit(
         user_id,
         tenant_id,
         "owner",
-        &slug,
+        &final_slug,
         &jwt_secret,
         access_expiry,
     ) {
