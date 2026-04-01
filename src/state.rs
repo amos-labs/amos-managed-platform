@@ -12,6 +12,46 @@ use crate::provisioning::ecs::{EcsProvisioner, EcsProvisionerConfig};
 use crate::provisioning::HarnessManager;
 use crate::solana::SolanaClient;
 
+/// Re-export the Stripe client type for handlers.
+pub type StripeClient = stripe::Client;
+
+/// Stripe billing configuration, loaded from environment variables.
+#[derive(Debug, Clone)]
+pub struct StripeConfig {
+    /// Stripe secret API key.
+    pub secret_key: String,
+    /// Stripe webhook signing secret.
+    pub webhook_secret: Option<String>,
+    /// Price IDs for each paid plan.
+    pub price_starter: Option<String>,
+    pub price_growth: Option<String>,
+    pub price_enterprise: Option<String>,
+}
+
+impl StripeConfig {
+    /// Load from env vars. Returns None if AMOS__STRIPE__SECRET_KEY is not set.
+    pub fn from_env() -> Option<Self> {
+        let secret_key = std::env::var("AMOS__STRIPE__SECRET_KEY").ok()?;
+        Some(Self {
+            secret_key,
+            webhook_secret: std::env::var("AMOS__STRIPE__WEBHOOK_SECRET").ok(),
+            price_starter: std::env::var("AMOS__STRIPE__PRICE_STARTER").ok(),
+            price_growth: std::env::var("AMOS__STRIPE__PRICE_GROWTH").ok(),
+            price_enterprise: std::env::var("AMOS__STRIPE__PRICE_ENTERPRISE").ok(),
+        })
+    }
+
+    /// Get the Price ID for a plan name.
+    pub fn price_id_for_plan(&self, plan: &str) -> Option<&str> {
+        match plan {
+            "starter" => self.price_starter.as_deref(),
+            "growth" => self.price_growth.as_deref(),
+            "enterprise" => self.price_enterprise.as_deref(),
+            _ => None,
+        }
+    }
+}
+
 /// Shared application state for the AMOS platform.
 ///
 /// This struct is cloned cheaply (via Arc internally) and passed
@@ -32,6 +72,10 @@ pub struct PlatformState {
     pub ecs_provisioner: Option<Arc<EcsProvisioner>>,
     /// ALB router for subdomain-based harness routing (production).
     pub alb_router: Option<Arc<AlbRouter>>,
+    /// Stripe API client (None if Stripe not configured).
+    pub stripe_client: Option<StripeClient>,
+    /// Stripe configuration (price IDs, webhook secret).
+    pub stripe_config: Option<StripeConfig>,
 }
 
 impl PlatformState {
@@ -131,6 +175,17 @@ impl PlatformState {
             None
         };
 
+        // Initialize Stripe client (optional, requires AMOS__STRIPE__SECRET_KEY).
+        let stripe_config = StripeConfig::from_env();
+        let stripe_client = stripe_config.as_ref().map(|cfg| {
+            info!("Stripe client initialized");
+            stripe::Client::new(&cfg.secret_key)
+        });
+
+        if stripe_client.is_none() {
+            info!("Stripe not configured (AMOS__STRIPE__SECRET_KEY not set)");
+        }
+
         Ok(Self {
             db,
             redis,
@@ -139,6 +194,8 @@ impl PlatformState {
             harness_manager,
             ecs_provisioner,
             alb_router,
+            stripe_client,
+            stripe_config,
         })
     }
 

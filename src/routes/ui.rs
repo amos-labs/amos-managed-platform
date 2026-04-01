@@ -73,6 +73,18 @@ fn truncate_version(v: &str) -> String {
 /// `https://{subdomain}.custom.amoslabs.com`.
 ///
 /// Called from: `register_submit`, `harness_redeploy`, `deploy_new_harness`.
+/// Spawn a background poller for ECS task status. Public so the webhook handler can use it.
+pub fn spawn_ecs_status_poller_public(
+    ecs: std::sync::Arc<crate::provisioning::ecs::EcsProvisioner>,
+    db: sqlx::PgPool,
+    task_arn: String,
+    harness_id: Uuid,
+    alb_router: Option<std::sync::Arc<AlbRouter>>,
+    subdomain: Option<String>,
+) {
+    spawn_ecs_status_poller(ecs, db, task_arn, harness_id, alb_router, subdomain);
+}
+
 fn spawn_ecs_status_poller(
     ecs: std::sync::Arc<crate::provisioning::ecs::EcsProvisioner>,
     db: sqlx::PgPool,
@@ -228,6 +240,8 @@ struct DashboardTemplate {
     tenant_name: String,
     tenant_slug: String,
     plan: String,
+    plan_price: String,
+    stripe_subscription_status: String,
     instances: Vec<HarnessInfo>,
     user_count: i64,
     api_key_count: i64,
@@ -240,10 +254,21 @@ struct DashboardTemplate {
 struct SettingsTemplate {
     tenant_name: String,
     role: String,
+    plan: String,
+    plan_price: String,
+    stripe_subscription_status: String,
+    has_stripe_customer: bool,
     api_keys: Vec<ApiKeyInfo>,
     users: Vec<UserInfo>,
     new_api_key: Option<String>,
     flash_message: Option<String>,
+}
+
+#[derive(Template)]
+#[template(path = "billing_upgrade.html")]
+struct BillingUpgradeTemplate {
+    tenant_name: String,
+    current_plan: String,
 }
 
 // ── View model types ────────────────────────────────────────────────────
@@ -313,6 +338,10 @@ pub fn routes() -> Router<PlatformState> {
         .route("/dashboard", get(dashboard_page))
         .route("/settings", get(settings_page))
         .route("/settings/api-keys", post(create_api_key_submit))
+        .route("/billing/success", get(billing_success))
+        .route("/billing/upgrade", get(billing_upgrade_page))
+        .route("/billing/checkout", post(billing_checkout))
+        .route("/billing/portal", post(billing_portal))
         .route("/dashboard/harness/new", post(deploy_new_harness))
         .route("/dashboard/harness/{id}/start", post(harness_start))
         .route("/dashboard/harness/{id}/stop", post(harness_stop))
@@ -541,7 +570,9 @@ async fn register_submit(
                 if attempts >= 5 {
                     error!("Slug collision after 5 attempts for: {}", slug);
                     return HtmlTemplate(RegisterTemplate {
-                        error: Some("Organization name is unavailable. Try a different name.".into()),
+                        error: Some(
+                            "Organization name is unavailable. Try a different name.".into(),
+                        ),
                     })
                     .into_response();
                 }
@@ -588,7 +619,8 @@ async fn register_submit(
         .into_response();
     }
 
-    // Create harness instance record
+    // Create harness instance record (pending for all plans — paid plans get
+    // provisioned after Stripe checkout completes via webhook).
     let harness_id = Uuid::new_v4();
     let _ = sqlx::query(
         "INSERT INTO harness_instances (id, tenant_id, subdomain, status)
@@ -600,223 +632,7 @@ async fn register_submit(
     .execute(&state.db)
     .await;
 
-    // Provision Docker container for the harness
-    if let Some(ref manager) = state.harness_manager {
-        let platform_url = format!(
-            "http://{}:{}",
-            state.config.server.host, state.config.server.port
-        );
-
-        // Build env vars the harness container needs.
-        // Inside Docker on macOS, host.docker.internal resolves to the host machine.
-        let mut harness_env = HashMap::new();
-        harness_env.insert(
-            "AMOS__DATABASE__URL".to_string(),
-            "postgres://rickbarkley@host.docker.internal:5432/amos_dev".to_string(),
-        );
-        harness_env.insert(
-            "AMOS__REDIS__URL".to_string(),
-            "redis://host.docker.internal:6379".to_string(),
-        );
-        harness_env.insert(
-            "AMOS__PLATFORM__URL".to_string(),
-            format!("http://host.docker.internal:{}", state.config.server.port),
-        );
-
-        let config = HarnessConfig {
-            customer_id: tenant_id,
-            region: "us-west-2".to_string(),
-            instance_size: InstanceSize::Small,
-            environment: "development".to_string(),
-            platform_grpc_url: platform_url,
-            env_vars: harness_env,
-        };
-
-        info!(tenant_id = %tenant_id, harness_id = %harness_id, "Provisioning harness container for new tenant");
-
-        // Update status to provisioning
-        let _ = sqlx::query("UPDATE harness_instances SET status = 'provisioning' WHERE id = $1")
-            .bind(harness_id)
-            .execute(&state.db)
-            .await;
-
-        match manager.provision(&config).await {
-            Ok(container_id) => {
-                info!(container_id = %container_id, "Harness container provisioned, starting...");
-
-                // Record container_id immediately, keep status as 'provisioning'
-                let _ = sqlx::query(
-                    "UPDATE harness_instances
-                     SET container_id = $1, provisioned_at = NOW()
-                     WHERE id = $2",
-                )
-                .bind(&container_id)
-                .bind(harness_id)
-                .execute(&state.db)
-                .await;
-
-                // Start the container
-                if let Err(e) = manager.start(&container_id).await {
-                    warn!(
-                        "Failed to auto-start harness container {}: {}",
-                        container_id, e
-                    );
-                    let _ =
-                        sqlx::query("UPDATE harness_instances SET status = 'error' WHERE id = $1")
-                            .bind(harness_id)
-                            .execute(&state.db)
-                            .await;
-                } else {
-                    info!(container_id = %container_id, "Harness container start issued");
-
-                    // Wait for the container to become healthy with a retry loop.
-                    // The container needs time to boot and bind its port.
-                    let mut external_port: Option<i32> = None;
-                    let mut final_status = "provisioning";
-
-                    for attempt in 1..=10 {
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
-                        // Check if container is still running
-                        match manager.get_status(&container_id).await {
-                            Ok(crate::provisioning::HarnessStatus::Running) => {
-                                // Container is alive, try to get the port
-                                match manager.inspect_host_port(&container_id).await {
-                                    Ok(Some(port)) => {
-                                        info!(
-                                            port = port,
-                                            attempt = attempt,
-                                            "Harness port detected"
-                                        );
-                                        external_port = Some(port as i32);
-                                        final_status = "running";
-                                        break;
-                                    }
-                                    Ok(None) => {
-                                        info!(attempt = attempt, "Waiting for port binding...");
-                                    }
-                                    Err(e) => {
-                                        warn!(attempt = attempt, "Port inspect error: {}", e);
-                                    }
-                                }
-                            }
-                            Ok(crate::provisioning::HarnessStatus::Error) => {
-                                warn!("Harness container exited with error");
-                                final_status = "error";
-                                break;
-                            }
-                            Ok(crate::provisioning::HarnessStatus::Stopped) => {
-                                warn!("Harness container stopped unexpectedly");
-                                final_status = "error";
-                                break;
-                            }
-                            Ok(other) => {
-                                info!(attempt = attempt, status = ?other, "Container not yet running");
-                            }
-                            Err(e) => {
-                                warn!(attempt = attempt, "Failed to check container status: {}", e);
-                                final_status = "error";
-                                break;
-                            }
-                        }
-                    }
-
-                    let internal_url = external_port.map(|p| format!("http://localhost:{}", p));
-                    let healthy = final_status == "running" && external_port.is_some();
-
-                    let _ = sqlx::query(
-                        "UPDATE harness_instances
-                         SET status = $2,
-                             started_at = CASE WHEN $2 = 'running' THEN NOW() ELSE NULL END,
-                             external_port = $4, internal_url = $5, healthy = $6
-                         WHERE id = $3",
-                    )
-                    .bind(&container_id)
-                    .bind(final_status)
-                    .bind(harness_id)
-                    .bind(external_port)
-                    .bind(&internal_url)
-                    .bind(healthy)
-                    .execute(&state.db)
-                    .await;
-                }
-            }
-            Err(e) => {
-                error!("Failed to provision harness container: {}", e);
-                let _ = sqlx::query("UPDATE harness_instances SET status = 'error' WHERE id = $1")
-                    .bind(harness_id)
-                    .execute(&state.db)
-                    .await;
-            }
-        }
-    } else if let Some(ref ecs) = state.ecs_provisioner {
-        // Production path: provision harness as an ECS Fargate task.
-        info!(tenant_id = %tenant_id, harness_id = %harness_id, "Provisioning harness via ECS Fargate");
-
-        let _ = sqlx::query("UPDATE harness_instances SET status = 'provisioning' WHERE id = $1")
-            .bind(harness_id)
-            .execute(&state.db)
-            .await;
-
-        let ecs_config = HarnessConfig {
-            customer_id: tenant_id,
-            region: "us-east-1".to_string(),
-            instance_size: InstanceSize::Small,
-            environment: "production".to_string(),
-            platform_grpc_url: String::new(), // Not used by ECS provisioner
-            env_vars: HashMap::new(),         // ECS provisioner sets its own env
-        };
-
-        // Look up the current release version so we can track what we deployed.
-        let current_version: Option<String> = sqlx::query_scalar(
-            "SELECT version FROM releases WHERE status = 'available' ORDER BY created_at DESC LIMIT 1",
-        )
-        .fetch_optional(&state.db)
-        .await
-        .ok()
-        .flatten();
-
-        match ecs.provision(&ecs_config, &final_slug).await {
-            Ok(task_arn) => {
-                info!(task_arn = %task_arn, "ECS task launched for tenant");
-
-                // Store the task ARN as container_id and the image_tag for version tracking.
-                let _ = sqlx::query(
-                    "UPDATE harness_instances
-                     SET container_id = $1, provisioned_at = NOW(), image_tag = $2
-                     WHERE id = $3",
-                )
-                .bind(&task_arn)
-                .bind(&current_version)
-                .bind(harness_id)
-                .execute(&state.db)
-                .await;
-
-                // Poll ECS in the background until task reaches RUNNING.
-                spawn_ecs_status_poller(
-                    state.ecs_provisioner.clone().unwrap(),
-                    state.db.clone(),
-                    task_arn,
-                    harness_id,
-                    state.alb_router.clone(),
-                    Some(final_slug.clone()),
-                );
-            }
-            Err(e) => {
-                error!("Failed to provision ECS harness task: {}", e);
-                let _ = sqlx::query("UPDATE harness_instances SET status = 'error' WHERE id = $1")
-                    .bind(harness_id)
-                    .execute(&state.db)
-                    .await;
-            }
-        }
-    } else {
-        warn!(
-            "No provisioner available (Docker or ECS) — harness instance created as pending only"
-        );
-    }
-
-    // Issue JWT and set cookie
+    // Issue JWT and set session cookie (needed for both flows)
     let jwt_secret = get_jwt_secret(&state);
     let access_expiry = state.config.auth.access_token_expiry_secs as i64;
 
@@ -840,6 +656,95 @@ async fn register_submit(
         SESSION_COOKIE, token, access_expiry
     );
 
+    // ── Paid plans: redirect to Stripe Checkout ────────────────────────
+    let is_paid = form.plan != "free";
+    if is_paid {
+        if let (Some(ref client), Some(ref stripe_cfg)) =
+            (&state.stripe_client, &state.stripe_config)
+        {
+            // Look up the Stripe Price ID for this plan
+            let price_id = match stripe_cfg.price_id_for_plan(&form.plan) {
+                Some(p) => p,
+                None => {
+                    error!(plan = %form.plan, "No Stripe price ID configured for plan");
+                    // Fall through to dashboard with a pending harness
+                    return ([(header::SET_COOKIE, cookie)], Redirect::to("/dashboard"))
+                        .into_response();
+                }
+            };
+
+            // Create Stripe customer
+            let customer_id = match crate::billing::stripe_service::create_customer(
+                client,
+                &form.email,
+                &form.name,
+                tenant_id,
+            )
+            .await
+            {
+                Ok(id) => {
+                    // Store the Stripe customer ID
+                    let _ = sqlx::query("UPDATE tenants SET stripe_customer_id = $1 WHERE id = $2")
+                        .bind(id.as_str())
+                        .bind(tenant_id)
+                        .execute(&state.db)
+                        .await;
+                    id.to_string()
+                }
+                Err(e) => {
+                    error!("Failed to create Stripe customer: {}", e);
+                    return ([(header::SET_COOKIE, cookie)], Redirect::to("/dashboard"))
+                        .into_response();
+                }
+            };
+
+            // Create Checkout Session
+            let base_url = format!(
+                "{}://{}:{}",
+                if state.config.server.port == 443 {
+                    "https"
+                } else {
+                    "http"
+                },
+                state.config.server.host,
+                state.config.server.port
+            );
+            let success_url = format!(
+                "{}/billing/success?session_id={{CHECKOUT_SESSION_ID}}",
+                base_url
+            );
+            let cancel_url = format!("{}/dashboard?error=checkout_canceled", base_url);
+
+            match crate::billing::stripe_service::create_checkout_session(
+                client,
+                &customer_id,
+                price_id,
+                &success_url,
+                &cancel_url,
+                tenant_id,
+            )
+            .await
+            {
+                Ok(checkout_url) if !checkout_url.is_empty() => {
+                    info!(tenant_id = %tenant_id, "Redirecting to Stripe Checkout");
+                    return ([(header::SET_COOKIE, cookie)], Redirect::to(&checkout_url))
+                        .into_response();
+                }
+                Ok(_) => {
+                    error!("Stripe returned empty checkout URL");
+                }
+                Err(e) => {
+                    error!("Failed to create Stripe checkout session: {}", e);
+                }
+            }
+        } else {
+            warn!("Paid plan selected but Stripe not configured — provisioning directly");
+            // Fallback: provision harness directly (dev mode without Stripe)
+            crate::routes::webhooks::provision_harness_for_tenant(&state, tenant_id).await;
+        }
+    }
+
+    // Free plan (or Stripe not configured): go to dashboard
     ([(header::SET_COOKIE, cookie)], Redirect::to("/dashboard")).into_response()
 }
 
@@ -868,9 +773,9 @@ async fn dashboard_page(
         Err(_) => return Redirect::to("/login").into_response(),
     };
 
-    // Fetch tenant info
-    let tenant_row = sqlx::query_as::<_, (String, String, String)>(
-        "SELECT name, slug, plan FROM tenants WHERE id = $1",
+    // Fetch tenant info (including billing status)
+    let tenant_row = sqlx::query_as::<_, (String, String, String, Option<String>)>(
+        "SELECT name, slug, plan, stripe_subscription_status FROM tenants WHERE id = $1",
     )
     .bind(tenant_id)
     .fetch_optional(&state.db)
@@ -878,8 +783,22 @@ async fn dashboard_page(
     .ok()
     .flatten();
 
-    let (tenant_name, tenant_slug, plan) =
-        tenant_row.unwrap_or_else(|| ("Unknown".into(), claims.tenant_slug.clone(), "free".into()));
+    let (tenant_name, tenant_slug, plan, stripe_sub_status) = tenant_row.unwrap_or_else(|| {
+        (
+            "Unknown".into(),
+            claims.tenant_slug.clone(),
+            "free".into(),
+            None,
+        )
+    });
+
+    let plan_enum = match plan.as_str() {
+        "starter" => crate::billing::Plan::Starter,
+        "growth" => crate::billing::Plan::Growth,
+        "enterprise" => crate::billing::Plan::Enterprise,
+        _ => crate::billing::Plan::Free,
+    };
+    let stripe_subscription_status = stripe_sub_status.unwrap_or_else(|| "none".into());
 
     // Fetch the latest available release version for update-available badge.
     let latest_release_version: Option<String> = sqlx::query_scalar(
@@ -977,6 +896,8 @@ async fn dashboard_page(
         tenant_name,
         tenant_slug,
         plan,
+        plan_price: plan_enum.price_display().to_string(),
+        stripe_subscription_status,
         instances,
         user_count,
         api_key_count,
@@ -1011,14 +932,25 @@ async fn settings_page_inner(
         Err(_) => return Redirect::to("/login").into_response(),
     };
 
-    // Tenant name
-    let tenant_name: String = sqlx::query_scalar("SELECT name FROM tenants WHERE id = $1")
-        .bind(tenant_id)
-        .fetch_optional(&state.db)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "Unknown".into());
+    // Tenant name + billing info
+    let tenant_row = sqlx::query_as::<_, (String, String, Option<String>, Option<String>)>(
+        "SELECT name, plan, stripe_customer_id, stripe_subscription_status FROM tenants WHERE id = $1",
+    )
+    .bind(tenant_id)
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten();
+
+    let (tenant_name, plan, stripe_customer_id, stripe_sub_status) =
+        tenant_row.unwrap_or_else(|| ("Unknown".into(), "free".into(), None, None));
+
+    let plan_enum = match plan.as_str() {
+        "starter" => crate::billing::Plan::Starter,
+        "growth" => crate::billing::Plan::Growth,
+        "enterprise" => crate::billing::Plan::Enterprise,
+        _ => crate::billing::Plan::Free,
+    };
 
     // API keys
     let key_rows = sqlx::query_as::<_, (String, String, bool, String)>(
@@ -1063,6 +995,10 @@ async fn settings_page_inner(
     HtmlTemplate(SettingsTemplate {
         tenant_name,
         role: claims.role.clone(),
+        plan: plan.clone(),
+        plan_price: plan_enum.price_display().to_string(),
+        stripe_subscription_status: stripe_sub_status.unwrap_or_else(|| "none".into()),
+        has_stripe_customer: stripe_customer_id.is_some(),
         api_keys,
         users,
         new_api_key,
@@ -1241,6 +1177,9 @@ async fn harness_start(
             environment: "production".to_string(),
             platform_grpc_url: String::new(),
             env_vars: HashMap::new(),
+            harness_role: "primary".to_string(),
+            packages: vec![],
+            harness_id: None,
         };
 
         match ecs.provision(&ecs_config, &tenant_slug).await {
@@ -1370,6 +1309,9 @@ async fn harness_restart(
             environment: "production".to_string(),
             platform_grpc_url: String::new(),
             env_vars: HashMap::new(),
+            harness_role: "primary".to_string(),
+            packages: vec![],
+            harness_id: None,
         };
 
         match ecs.provision(&ecs_config, &tenant_slug).await {
@@ -1457,6 +1399,9 @@ async fn harness_redeploy(
                 state.config.server.host, state.config.server.port
             ),
             env_vars: harness_env,
+            harness_role: "primary".to_string(),
+            packages: vec![],
+            harness_id: None,
         };
 
         match manager.provision(&config).await {
@@ -1511,6 +1456,9 @@ async fn harness_redeploy(
             environment: "production".to_string(),
             platform_grpc_url: String::new(),
             env_vars: HashMap::new(),
+            harness_role: "primary".to_string(),
+            packages: vec![],
+            harness_id: None,
         };
 
         match ecs.provision(&ecs_config, &tenant_slug).await {
@@ -1635,6 +1583,9 @@ async fn harness_update(
             environment: "production".to_string(),
             platform_grpc_url: String::new(),
             env_vars: HashMap::new(),
+            harness_role: "primary".to_string(),
+            packages: vec![],
+            harness_id: None,
         };
 
         match ecs
@@ -1784,6 +1735,9 @@ async fn harness_rollback(
             environment: "production".to_string(),
             platform_grpc_url: String::new(),
             env_vars: HashMap::new(),
+            harness_role: "primary".to_string(),
+            packages: vec![],
+            harness_id: None,
         };
 
         match ecs
@@ -1966,6 +1920,9 @@ async fn deploy_new_harness(
                 state.config.server.host, state.config.server.port
             ),
             env_vars: harness_env,
+            harness_role: "primary".to_string(),
+            packages: vec![],
+            harness_id: None,
         };
 
         match manager.provision(&config).await {
@@ -2021,6 +1978,9 @@ async fn deploy_new_harness(
             environment: "production".to_string(),
             platform_grpc_url: String::new(),
             env_vars: HashMap::new(),
+            harness_role: "primary".to_string(),
+            packages: vec![],
+            harness_id: None,
         };
 
         // Look up the current release version so we can track what we deployed.
@@ -2065,6 +2025,223 @@ async fn deploy_new_harness(
     }
 
     Redirect::to("/dashboard").into_response()
+}
+
+// ── Billing Routes ───────────────────────────────────────────────────────
+
+/// `GET /billing/success` — post-Stripe-checkout redirect.
+async fn billing_success(
+    axum::extract::Query(_query): axum::extract::Query<DashboardQuery>,
+) -> Response {
+    // Simply redirect to dashboard with a success message
+    Redirect::to("/dashboard?msg=Payment+successful!+Your+harness+is+being+provisioned.")
+        .into_response()
+}
+
+/// `GET /billing/upgrade` — pricing comparison page for free/current users.
+async fn billing_upgrade_page(
+    State(state): State<PlatformState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let claims = match extract_session_claims(&state, &headers) {
+        Some(c) => c,
+        None => return Redirect::to("/login").into_response(),
+    };
+
+    let tenant_id: Uuid = match claims.tenant_id.parse() {
+        Ok(id) => id,
+        Err(_) => return Redirect::to("/login").into_response(),
+    };
+
+    let tenant_row =
+        sqlx::query_as::<_, (String, String)>("SELECT name, plan FROM tenants WHERE id = $1")
+            .bind(tenant_id)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten();
+
+    let (tenant_name, current_plan) =
+        tenant_row.unwrap_or_else(|| ("Unknown".into(), "free".into()));
+
+    HtmlTemplate(BillingUpgradeTemplate {
+        tenant_name,
+        current_plan,
+    })
+    .into_response()
+}
+
+/// Form for the checkout button on the upgrade page.
+#[derive(Deserialize)]
+struct CheckoutForm {
+    plan: String,
+}
+
+/// `POST /billing/checkout` — create Stripe Checkout session for plan upgrade.
+async fn billing_checkout(
+    State(state): State<PlatformState>,
+    headers: axum::http::HeaderMap,
+    Form(form): Form<CheckoutForm>,
+) -> Response {
+    let claims = match extract_session_claims(&state, &headers) {
+        Some(c) => c,
+        None => return Redirect::to("/login").into_response(),
+    };
+
+    let tenant_id: Uuid = match claims.tenant_id.parse() {
+        Ok(id) => id,
+        Err(_) => return Redirect::to("/login").into_response(),
+    };
+
+    let (client, stripe_cfg) = match (&state.stripe_client, &state.stripe_config) {
+        (Some(c), Some(cfg)) => (c, cfg),
+        _ => {
+            return Redirect::to("/dashboard?error=Stripe+not+configured").into_response();
+        }
+    };
+
+    let price_id = match stripe_cfg.price_id_for_plan(&form.plan) {
+        Some(p) => p,
+        None => {
+            return Redirect::to("/billing/upgrade?error=Invalid+plan").into_response();
+        }
+    };
+
+    // Get or create Stripe customer
+    let customer_row = sqlx::query_as::<_, (Option<String>, String, String)>(
+        "SELECT stripe_customer_id, u.email, u.name FROM tenants t
+         JOIN users u ON u.tenant_id = t.id AND u.role = 'owner'
+         WHERE t.id = $1",
+    )
+    .bind(tenant_id)
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten();
+
+    let (stripe_customer_id, email, name) = match customer_row {
+        Some(row) => row,
+        None => {
+            return Redirect::to("/dashboard?error=Tenant+not+found").into_response();
+        }
+    };
+
+    let customer_id = match stripe_customer_id {
+        Some(id) => id,
+        None => {
+            // Create a new Stripe customer
+            match crate::billing::stripe_service::create_customer(client, &email, &name, tenant_id)
+                .await
+            {
+                Ok(id) => {
+                    let id_str = id.to_string();
+                    let _ = sqlx::query("UPDATE tenants SET stripe_customer_id = $1 WHERE id = $2")
+                        .bind(&id_str)
+                        .bind(tenant_id)
+                        .execute(&state.db)
+                        .await;
+                    id_str
+                }
+                Err(e) => {
+                    error!("Failed to create Stripe customer: {}", e);
+                    return Redirect::to("/dashboard?error=Payment+setup+failed").into_response();
+                }
+            }
+        }
+    };
+
+    let base_url = format!(
+        "{}://{}:{}",
+        if state.config.server.port == 443 {
+            "https"
+        } else {
+            "http"
+        },
+        state.config.server.host,
+        state.config.server.port
+    );
+    let success_url = format!(
+        "{}/billing/success?session_id={{CHECKOUT_SESSION_ID}}",
+        base_url
+    );
+    let cancel_url = format!("{}/billing/upgrade", base_url);
+
+    match crate::billing::stripe_service::create_checkout_session(
+        client,
+        &customer_id,
+        price_id,
+        &success_url,
+        &cancel_url,
+        tenant_id,
+    )
+    .await
+    {
+        Ok(url) if !url.is_empty() => Redirect::to(&url).into_response(),
+        Ok(_) => Redirect::to("/billing/upgrade?error=Checkout+failed").into_response(),
+        Err(e) => {
+            error!("Failed to create checkout session: {}", e);
+            Redirect::to("/billing/upgrade?error=Checkout+failed").into_response()
+        }
+    }
+}
+
+/// `POST /billing/portal` — redirect to Stripe Customer Portal.
+async fn billing_portal(
+    State(state): State<PlatformState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let claims = match extract_session_claims(&state, &headers) {
+        Some(c) => c,
+        None => return Redirect::to("/login").into_response(),
+    };
+
+    let tenant_id: Uuid = match claims.tenant_id.parse() {
+        Ok(id) => id,
+        Err(_) => return Redirect::to("/login").into_response(),
+    };
+
+    let client = match &state.stripe_client {
+        Some(c) => c,
+        None => {
+            return Redirect::to("/settings?msg=Stripe+not+configured").into_response();
+        }
+    };
+
+    let customer_id: Option<String> =
+        sqlx::query_scalar("SELECT stripe_customer_id FROM tenants WHERE id = $1")
+            .bind(tenant_id)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten();
+
+    let customer_id = match customer_id {
+        Some(id) => id,
+        None => {
+            return Redirect::to("/settings?msg=No+billing+account+found").into_response();
+        }
+    };
+
+    let return_url = format!(
+        "{}://{}:{}/settings",
+        if state.config.server.port == 443 {
+            "https"
+        } else {
+            "http"
+        },
+        state.config.server.host,
+        state.config.server.port
+    );
+
+    match crate::billing::stripe_service::create_portal_session(client, &customer_id, &return_url)
+        .await
+    {
+        Ok(url) => Redirect::to(&url).into_response(),
+        Err(e) => {
+            error!("Failed to create portal session: {}", e);
+            Redirect::to("/settings?msg=Could+not+open+billing+portal").into_response()
+        }
+    }
 }
 
 // ── Logout ──────────────────────────────────────────────────────────────

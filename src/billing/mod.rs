@@ -1,6 +1,7 @@
 //! Customer billing and subscription management.
 
-use amos_core::token::economics::AMOS_DISCOUNT_BPS;
+pub mod stripe_service;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -23,11 +24,11 @@ pub struct Customer {
 pub enum Plan {
     /// Free tier: limited features for evaluation.
     Free,
-    /// Starter: $99/month, suitable for small teams.
+    /// Starter: $45/month (0.5 vCPU, 1 GB).
     Starter,
-    /// Growth: $499/month, suitable for growing companies.
+    /// Growth: $85/month (1 vCPU, 2 GB).
     Growth,
-    /// Enterprise: custom pricing, full features + support.
+    /// Enterprise: $155/month (2 vCPU, 4 GB).
     Enterprise,
 }
 
@@ -74,9 +75,34 @@ impl Plan {
     pub fn monthly_price_cents(&self) -> u64 {
         match self {
             Plan::Free => 0,
-            Plan::Starter => 99_00,
-            Plan::Growth => 49_900,
-            Plan::Enterprise => 0, // Custom pricing
+            Plan::Starter => 4_500,
+            Plan::Growth => 8_500,
+            Plan::Enterprise => 15_500,
+        }
+    }
+
+    /// Whether this is a paid plan that requires Stripe checkout.
+    pub fn is_paid(&self) -> bool {
+        !matches!(self, Plan::Free)
+    }
+
+    /// Display name for the plan.
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            Plan::Free => "Free",
+            Plan::Starter => "Starter",
+            Plan::Growth => "Growth",
+            Plan::Enterprise => "Enterprise",
+        }
+    }
+
+    /// Monthly price as a formatted string.
+    pub fn price_display(&self) -> &'static str {
+        match self {
+            Plan::Free => "$0/mo",
+            Plan::Starter => "$45/mo",
+            Plan::Growth => "$85/mo",
+            Plan::Enterprise => "$155/mo",
         }
     }
 }
@@ -158,138 +184,6 @@ impl UsageMetrics {
     }
 }
 
-//    Compute Cost Tracking
-
-/// AI model pricing per 1M tokens.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelPricing {
-    pub model_name: String,
-    pub input_rate_per_million: f64,  // USD
-    pub output_rate_per_million: f64, // USD
-}
-
-/// A single compute usage record.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ComputeUsageRecord {
-    pub id: Uuid,
-    pub customer_id: Uuid,
-    pub model_name: String,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cost_usd_cents: u64,        // Raw AWS cost
-    pub charge_usd_cents: u64,      // Customer charge (cost * 1.20)
-    pub customer_owned_model: bool, // Sovereign AI: true if customer-owned infrastructure
-    pub timestamp: DateTime<Utc>,
-}
-
-/// Monthly billing summary.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BillingSummary {
-    pub customer_id: Uuid,
-    pub period_start: DateTime<Utc>,
-    pub period_end: DateTime<Utc>,
-    pub subscription_charge_cents: u64,
-    pub compute_charges_cents: u64,
-    pub total_charges_cents: u64,
-    pub amos_discount_applied: bool,
-    pub discount_amount_cents: u64,
-    pub final_amount_cents: u64,
-}
-
-//    Cost Calculation Functions
-
-/// Calculate AI cost from token usage.
-/// Returns cost in USD cents.
-pub fn calculate_ai_cost(input_tokens: u64, output_tokens: u64, pricing: &ModelPricing) -> u64 {
-    let input_cost = (input_tokens as f64 / 1_000_000.0) * pricing.input_rate_per_million;
-    let output_cost = (output_tokens as f64 / 1_000_000.0) * pricing.output_rate_per_million;
-    let total_usd = input_cost + output_cost;
-
-    // Convert to cents and round
-    (total_usd * 100.0).round() as u64
-}
-
-/// Apply markup to raw cost. Customer-owned models get no markup.
-pub fn calculate_customer_charge(cost_cents: u64, customer_owned: bool) -> u64 {
-    if customer_owned {
-        // No markup for customer-owned models — they pay their own infrastructure
-        cost_cents
-    } else {
-        // Standard 20% markup for AMOS-managed compute
-        (cost_cents as f64 * 1.20).round() as u64
-    }
-}
-
-/// Calculate full billing summary for a customer.
-pub fn calculate_billing_summary(
-    customer: &Customer,
-    subscription: &Subscription,
-    compute_records: &[ComputeUsageRecord],
-    pay_with_amos: bool,
-) -> BillingSummary {
-    // Calculate subscription charge
-    let subscription_charge_cents = subscription.plan.monthly_price_cents();
-
-    // Calculate total compute charges
-    let compute_charges_cents: u64 = compute_records.iter().map(|r| r.charge_usd_cents).sum();
-
-    // Total before discount
-    let total_charges_cents = subscription_charge_cents + compute_charges_cents;
-
-    // Apply AMOS discount if paying with tokens
-    let (discount_amount_cents, final_amount_cents) = if pay_with_amos {
-        // AMOS_DISCOUNT_BPS is 2000 (20%) - apply to total
-        let discount =
-            (total_charges_cents as f64 * (AMOS_DISCOUNT_BPS as f64 / 10_000.0)).round() as u64;
-        let final_amount = total_charges_cents.saturating_sub(discount);
-        (discount, final_amount)
-    } else {
-        (0, total_charges_cents)
-    };
-
-    BillingSummary {
-        customer_id: customer.id,
-        period_start: subscription.current_period_start,
-        period_end: subscription.current_period_end,
-        subscription_charge_cents,
-        compute_charges_cents,
-        total_charges_cents,
-        amos_discount_applied: pay_with_amos,
-        discount_amount_cents,
-        final_amount_cents,
-    }
-}
-
-//    Default Model Pricing
-
-/// Get default AI model pricing.
-pub fn default_model_pricing() -> Vec<ModelPricing> {
-    vec![
-        ModelPricing {
-            model_name: "qwen3-next-80b".into(),
-            input_rate_per_million: 0.20,
-            output_rate_per_million: 0.80,
-        },
-        ModelPricing {
-            model_name: "claude-3.5-haiku".into(),
-            input_rate_per_million: 0.25,
-            output_rate_per_million: 1.25,
-        },
-        ModelPricing {
-            model_name: "claude-3.5-sonnet".into(),
-            input_rate_per_million: 3.00,
-            output_rate_per_million: 15.00,
-        },
-    ]
-}
-
-/// Get pricing for a specific model by name.
-pub fn get_model_pricing(model_name: &str) -> Option<ModelPricing> {
-    default_model_pricing()
-        .into_iter()
-        .find(|p| p.model_name == model_name)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,6 +199,22 @@ mod tests {
     }
 
     #[test]
+    fn plan_prices_correct() {
+        assert_eq!(Plan::Free.monthly_price_cents(), 0);
+        assert_eq!(Plan::Starter.monthly_price_cents(), 4_500);
+        assert_eq!(Plan::Growth.monthly_price_cents(), 8_500);
+        assert_eq!(Plan::Enterprise.monthly_price_cents(), 15_500);
+    }
+
+    #[test]
+    fn plan_is_paid() {
+        assert!(!Plan::Free.is_paid());
+        assert!(Plan::Starter.is_paid());
+        assert!(Plan::Growth.is_paid());
+        assert!(Plan::Enterprise.is_paid());
+    }
+
+    #[test]
     fn usage_violations_detected() {
         let limits = Plan::Starter.limits();
         let usage = UsageMetrics {
@@ -317,328 +227,5 @@ mod tests {
         let violations = usage.exceeds_limits(&limits);
         assert_eq!(violations.len(), 1);
         assert!(violations[0].contains("Conversations"));
-    }
-
-    //    Cost Calculation Tests
-
-    #[test]
-    fn calculate_ai_cost_small_usage() {
-        let pricing = ModelPricing {
-            model_name: "test-model".into(),
-            input_rate_per_million: 1.00,
-            output_rate_per_million: 2.00,
-        };
-
-        // 100K input, 50K output
-        let cost = calculate_ai_cost(100_000, 50_000, &pricing);
-
-        // Expected: (100K / 1M) * $1.00 + (50K / 1M) * $2.00
-        //         = 0.1 * 1.00 + 0.05 * 2.00
-        //         = 0.10 + 0.10 = $0.20 = 20 cents
-        assert_eq!(cost, 20);
-    }
-
-    #[test]
-    fn calculate_ai_cost_large_usage() {
-        let pricing = ModelPricing {
-            model_name: "claude-3.5-sonnet".into(),
-            input_rate_per_million: 3.00,
-            output_rate_per_million: 15.00,
-        };
-
-        // 1M input, 500K output
-        let cost = calculate_ai_cost(1_000_000, 500_000, &pricing);
-
-        // Expected: (1M / 1M) * $3.00 + (500K / 1M) * $15.00
-        //         = 1.0 * 3.00 + 0.5 * 15.00
-        //         = 3.00 + 7.50 = $10.50 = 1050 cents
-        assert_eq!(cost, 1050);
-    }
-
-    #[test]
-    fn calculate_ai_cost_zero_usage() {
-        let pricing = ModelPricing {
-            model_name: "test-model".into(),
-            input_rate_per_million: 1.00,
-            output_rate_per_million: 2.00,
-        };
-
-        let cost = calculate_ai_cost(0, 0, &pricing);
-        assert_eq!(cost, 0);
-    }
-
-    #[test]
-    fn calculate_customer_charge_applies_markup() {
-        // 20% markup on $1.00 = $1.20
-        assert_eq!(calculate_customer_charge(100, false), 120);
-
-        // 20% markup on $10.00 = $12.00
-        assert_eq!(calculate_customer_charge(1000, false), 1200);
-
-        // 20% markup on $0.50 = $0.60
-        assert_eq!(calculate_customer_charge(50, false), 60);
-    }
-
-    #[test]
-    fn calculate_customer_charge_zero() {
-        assert_eq!(calculate_customer_charge(0, false), 0);
-    }
-
-    #[test]
-    fn calculate_customer_charge_sovereign_ai_no_markup() {
-        // Customer-owned model: no markup
-        assert_eq!(calculate_customer_charge(100, true), 100);
-        assert_eq!(calculate_customer_charge(1000, true), 1000);
-        assert_eq!(calculate_customer_charge(0, true), 0);
-
-        // AMOS-managed: 20% markup still applies
-        assert_eq!(calculate_customer_charge(100, false), 120);
-    }
-
-    #[test]
-    fn billing_summary_without_amos_discount() {
-        let customer = Customer {
-            id: Uuid::new_v4(),
-            name: "Test Customer".into(),
-            email: "test@example.com".into(),
-            organization: None,
-            plan: Plan::Starter,
-            created_at: Utc::now(),
-            harness_id: None,
-        };
-
-        let subscription = Subscription {
-            id: Uuid::new_v4(),
-            customer_id: customer.id,
-            plan: Plan::Starter,
-            status: SubscriptionStatus::Active,
-            started_at: Utc::now(),
-            current_period_start: Utc::now(),
-            current_period_end: Utc::now(),
-            cancel_at: None,
-        };
-
-        let compute_records = vec![
-            ComputeUsageRecord {
-                id: Uuid::new_v4(),
-                customer_id: customer.id,
-                model_name: "claude-3.5-haiku".into(),
-                input_tokens: 1_000_000,
-                output_tokens: 500_000,
-                cost_usd_cents: 100,
-                charge_usd_cents: 120, // 20% markup
-                customer_owned_model: false,
-                timestamp: Utc::now(),
-            },
-            ComputeUsageRecord {
-                id: Uuid::new_v4(),
-                customer_id: customer.id,
-                model_name: "claude-3.5-haiku".into(),
-                input_tokens: 500_000,
-                output_tokens: 250_000,
-                cost_usd_cents: 50,
-                charge_usd_cents: 60,
-                customer_owned_model: false,
-                timestamp: Utc::now(),
-            },
-        ];
-
-        let summary = calculate_billing_summary(&customer, &subscription, &compute_records, false);
-
-        assert_eq!(summary.customer_id, customer.id);
-        assert_eq!(summary.subscription_charge_cents, 99_00); // Starter plan
-        assert_eq!(summary.compute_charges_cents, 180); // 120 + 60
-        assert_eq!(summary.total_charges_cents, 99_00 + 180);
-        assert!(!summary.amos_discount_applied);
-        assert_eq!(summary.discount_amount_cents, 0);
-        assert_eq!(summary.final_amount_cents, 99_00 + 180);
-    }
-
-    #[test]
-    fn billing_summary_with_amos_discount() {
-        let customer = Customer {
-            id: Uuid::new_v4(),
-            name: "Test Customer".into(),
-            email: "test@example.com".into(),
-            organization: None,
-            plan: Plan::Growth,
-            created_at: Utc::now(),
-            harness_id: None,
-        };
-
-        let subscription = Subscription {
-            id: Uuid::new_v4(),
-            customer_id: customer.id,
-            plan: Plan::Growth,
-            status: SubscriptionStatus::Active,
-            started_at: Utc::now(),
-            current_period_start: Utc::now(),
-            current_period_end: Utc::now(),
-            cancel_at: None,
-        };
-
-        let compute_records = vec![ComputeUsageRecord {
-            id: Uuid::new_v4(),
-            customer_id: customer.id,
-            model_name: "claude-3.5-sonnet".into(),
-            input_tokens: 10_000_000,
-            output_tokens: 5_000_000,
-            cost_usd_cents: 10_000,
-            charge_usd_cents: 12_000,
-            customer_owned_model: false,
-            timestamp: Utc::now(),
-        }];
-
-        let summary = calculate_billing_summary(&customer, &subscription, &compute_records, true);
-
-        assert_eq!(summary.subscription_charge_cents, 49_900); // Growth plan
-        assert_eq!(summary.compute_charges_cents, 12_000);
-        assert_eq!(summary.total_charges_cents, 49_900 + 12_000);
-        assert!(summary.amos_discount_applied);
-
-        // 20% discount on total (AMOS_DISCOUNT_BPS = 2000 = 20%)
-        let expected_discount = ((49_900 + 12_000) as f64 * 0.20).round() as u64;
-        assert_eq!(summary.discount_amount_cents, expected_discount);
-        assert_eq!(
-            summary.final_amount_cents,
-            (49_900 + 12_000) - expected_discount
-        );
-    }
-
-    #[test]
-    fn billing_summary_free_plan() {
-        let customer = Customer {
-            id: Uuid::new_v4(),
-            name: "Free User".into(),
-            email: "free@example.com".into(),
-            organization: None,
-            plan: Plan::Free,
-            created_at: Utc::now(),
-            harness_id: None,
-        };
-
-        let subscription = Subscription {
-            id: Uuid::new_v4(),
-            customer_id: customer.id,
-            plan: Plan::Free,
-            status: SubscriptionStatus::Active,
-            started_at: Utc::now(),
-            current_period_start: Utc::now(),
-            current_period_end: Utc::now(),
-            cancel_at: None,
-        };
-
-        let compute_records = vec![];
-
-        let summary = calculate_billing_summary(&customer, &subscription, &compute_records, false);
-
-        assert_eq!(summary.subscription_charge_cents, 0);
-        assert_eq!(summary.compute_charges_cents, 0);
-        assert_eq!(summary.total_charges_cents, 0);
-        assert_eq!(summary.final_amount_cents, 0);
-    }
-
-    #[test]
-    fn default_model_pricing_has_expected_models() {
-        let pricing = default_model_pricing();
-
-        assert_eq!(pricing.len(), 3);
-
-        let qwen = pricing.iter().find(|p| p.model_name == "qwen3-next-80b");
-        assert!(qwen.is_some());
-        let qwen = qwen.unwrap();
-        assert_eq!(qwen.input_rate_per_million, 0.20);
-        assert_eq!(qwen.output_rate_per_million, 0.80);
-
-        let haiku = pricing.iter().find(|p| p.model_name == "claude-3.5-haiku");
-        assert!(haiku.is_some());
-        let haiku = haiku.unwrap();
-        assert_eq!(haiku.input_rate_per_million, 0.25);
-        assert_eq!(haiku.output_rate_per_million, 1.25);
-
-        let sonnet = pricing.iter().find(|p| p.model_name == "claude-3.5-sonnet");
-        assert!(sonnet.is_some());
-        let sonnet = sonnet.unwrap();
-        assert_eq!(sonnet.input_rate_per_million, 3.00);
-        assert_eq!(sonnet.output_rate_per_million, 15.00);
-    }
-
-    #[test]
-    fn get_model_pricing_finds_existing_model() {
-        let pricing = get_model_pricing("claude-3.5-sonnet");
-        assert!(pricing.is_some());
-
-        let pricing = pricing.unwrap();
-        assert_eq!(pricing.model_name, "claude-3.5-sonnet");
-        assert_eq!(pricing.input_rate_per_million, 3.00);
-        assert_eq!(pricing.output_rate_per_million, 15.00);
-    }
-
-    #[test]
-    fn get_model_pricing_returns_none_for_unknown_model() {
-        let pricing = get_model_pricing("unknown-model");
-        assert!(pricing.is_none());
-    }
-
-    #[test]
-    fn end_to_end_billing_calculation() {
-        // Create a customer using Qwen model
-        let customer = Customer {
-            id: Uuid::new_v4(),
-            name: "E2E Test".into(),
-            email: "e2e@example.com".into(),
-            organization: Some("Test Org".into()),
-            plan: Plan::Starter,
-            created_at: Utc::now(),
-            harness_id: Some("harness-123".into()),
-        };
-
-        let subscription = Subscription {
-            id: Uuid::new_v4(),
-            customer_id: customer.id,
-            plan: Plan::Starter,
-            status: SubscriptionStatus::Active,
-            started_at: Utc::now(),
-            current_period_start: Utc::now(),
-            current_period_end: Utc::now(),
-            cancel_at: None,
-        };
-
-        // Get pricing and calculate costs
-        let qwen_pricing = get_model_pricing("qwen3-next-80b").unwrap();
-
-        // Simulate 10M input tokens, 5M output tokens
-        let raw_cost = calculate_ai_cost(10_000_000, 5_000_000, &qwen_pricing);
-        // Expected: (10M / 1M) * 0.20 + (5M / 1M) * 0.80 = 2.00 + 4.00 = $6.00 = 600 cents
-        assert_eq!(raw_cost, 600);
-
-        let customer_charge = calculate_customer_charge(raw_cost, false);
-        // Expected: 600 * 1.20 = 720 cents
-        assert_eq!(customer_charge, 720);
-
-        // Create usage record
-        let compute_records = vec![ComputeUsageRecord {
-            id: Uuid::new_v4(),
-            customer_id: customer.id,
-            model_name: "qwen3-next-80b".into(),
-            input_tokens: 10_000_000,
-            output_tokens: 5_000_000,
-            cost_usd_cents: raw_cost,
-            charge_usd_cents: customer_charge,
-            customer_owned_model: false,
-            timestamp: Utc::now(),
-        }];
-
-        // Calculate billing summary with AMOS discount
-        let summary = calculate_billing_summary(&customer, &subscription, &compute_records, true);
-
-        assert_eq!(summary.subscription_charge_cents, 99_00);
-        assert_eq!(summary.compute_charges_cents, 720);
-        assert_eq!(summary.total_charges_cents, 99_00 + 720);
-        assert!(summary.amos_discount_applied);
-
-        // 20% discount on 10620 cents = 2124 cents
-        assert_eq!(summary.discount_amount_cents, 2124);
-        assert_eq!(summary.final_amount_cents, 10620 - 2124);
     }
 }

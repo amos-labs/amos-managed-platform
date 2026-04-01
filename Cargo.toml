@@ -68,6 +68,9 @@ aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-ecs = "1"
 aws-sdk-elasticloadbalancingv2 = "1"
 
+# Stripe billing
+async-stripe = { version = "0.41", features = ["runtime-tokio-hyper-rustls", "checkout", "billing", "webhook-events"] }
+
 # Misc
 secrecy = { version = "0.10", features = ["serde"] }
 dotenvy = "0.15"

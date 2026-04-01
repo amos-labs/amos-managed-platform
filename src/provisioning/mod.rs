@@ -94,6 +94,15 @@ impl HarnessManager {
             std::env::var("AMOS__SERVER__PORT").unwrap_or_else(|_| "4000".to_string())
         ));
 
+        // Multi-harness: pass role, packages, and harness ID
+        env_vars.push(format!("AMOS_HARNESS_ROLE={}", config.harness_role));
+        if !config.packages.is_empty() {
+            env_vars.push(format!("AMOS_PACKAGES={}", config.packages.join(",")));
+        }
+        if let Some(harness_id) = &config.harness_id {
+            env_vars.push(format!("AMOS_HARNESS_ID={}", harness_id));
+        }
+
         // Explicit config from HarnessConfig.env_vars takes highest precedence.
         for (key, value) in &config.env_vars {
             env_vars.push(format!("{}={}", key, value));
@@ -269,6 +278,18 @@ pub struct HarnessConfig {
     pub environment: String, // "production", "staging", "development"
     pub platform_grpc_url: String,
     pub env_vars: HashMap<String, String>,
+    /// Harness role: "primary", "specialist", or "worker"
+    #[serde(default = "default_harness_role")]
+    pub harness_role: String,
+    /// Packages to enable on this harness (e.g., ["autoresearch"])
+    #[serde(default)]
+    pub packages: Vec<String>,
+    /// Harness instance ID (from harness_instances table)
+    pub harness_id: Option<Uuid>,
+}
+
+fn default_harness_role() -> String {
+    "primary".to_string()
 }
 
 /// Harness instance size.

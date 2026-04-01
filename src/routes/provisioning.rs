@@ -30,6 +30,23 @@ pub fn routes() -> Router<PlatformState> {
         .route("/provision/harness/{id}/stop", post(stop_harness))
         .route("/provision/harness/{id}", delete(deprovision_harness))
         .route("/provision/harness/{id}/logs", get(get_harness_logs))
+        // Multi-harness management: provision specialized harnesses per tenant
+        .route(
+            "/tenants/{tenant_id}/harnesses",
+            post(provision_specialist_harness).get(list_tenant_harnesses),
+        )
+        .route(
+            "/tenants/{tenant_id}/harnesses/{harness_id}",
+            delete(deprovision_tenant_harness),
+        )
+        .route(
+            "/tenants/{tenant_id}/harnesses/{harness_id}/restart",
+            post(restart_tenant_harness),
+        )
+        .route(
+            "/tenants/{tenant_id}/harnesses/{harness_id}/packages",
+            axum::routing::put(update_harness_packages),
+        )
 }
 
 //    Provision Harness
@@ -83,6 +100,9 @@ async fn provision_harness(
         environment: req.environment.unwrap_or_else(|| "development".into()),
         platform_grpc_url: platform_url,
         env_vars: req.env_vars.unwrap_or_default(),
+        harness_role: "primary".to_string(),
+        packages: vec![],
+        harness_id: None,
     };
 
     info!(
@@ -416,4 +436,415 @@ async fn get_harness_logs(
             }),
         ))
     }
+}
+
+// ── Multi-Harness Management ────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ProvisionSpecialistRequest {
+    name: String,
+    harness_role: Option<String>, // defaults to "specialist"
+    packages: Vec<String>,
+    instance_size: Option<String>,
+    parent_harness_id: Option<Uuid>,
+}
+
+#[derive(Serialize)]
+struct SpecialistHarnessResponse {
+    harness_id: Uuid,
+    name: String,
+    harness_role: String,
+    packages: Vec<String>,
+    status: String,
+    container_id: Option<String>,
+    provisioned_at: DateTime<Utc>,
+    provider: String,
+}
+
+/// Provision a new specialized harness for a tenant.
+async fn provision_specialist_harness(
+    State(state): State<PlatformState>,
+    Path(tenant_id): Path<Uuid>,
+    Json(req): Json<ProvisionSpecialistRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let harness_role = req.harness_role.unwrap_or_else(|| "specialist".to_string());
+    let harness_id = Uuid::new_v4();
+
+    // Insert into harness_instances
+    let _result = sqlx::query(
+        r#"
+        INSERT INTO harness_instances
+            (id, tenant_id, name, harness_role, packages, parent_harness_id,
+             status, instance_size, environment)
+        VALUES ($1, $2, $3, $4, $5, $6, 'provisioning', 'small', 'development')
+        "#,
+    )
+    .bind(harness_id)
+    .bind(tenant_id)
+    .bind(&req.name)
+    .bind(&harness_role)
+    .bind(serde_json::to_value(&req.packages).unwrap_or_default())
+    .bind(req.parent_harness_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| {
+        error!("Failed to insert harness instance: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Database error: {}", e),
+            }),
+        )
+    })?;
+
+    info!(
+        harness_id = %harness_id,
+        tenant_id = %tenant_id,
+        role = %harness_role,
+        packages = ?req.packages,
+        "Provisioning specialist harness"
+    );
+
+    let instance_size = match req.instance_size.as_deref() {
+        Some("medium") => InstanceSize::Medium,
+        Some("large") => InstanceSize::Large,
+        _ => InstanceSize::Small,
+    };
+
+    let platform_url = format!(
+        "http://{}:{}",
+        state.config.server.host, state.config.server.port
+    );
+
+    let config = HarnessConfig {
+        customer_id: tenant_id,
+        region: "us-west-2".into(),
+        instance_size,
+        environment: "development".into(),
+        platform_grpc_url: platform_url,
+        env_vars: HashMap::new(),
+        harness_role: harness_role.clone(),
+        packages: req.packages.clone(),
+        harness_id: Some(harness_id),
+    };
+
+    let mut container_id: Option<String> = None;
+    let mut provider = "none".to_string();
+    // Suppress "value never read" — both are always overwritten in the branches below,
+    // but Rust's control-flow analysis doesn't see through early returns.
+    let _ = (&container_id, &provider);
+
+    // Try Docker first, then ECS
+    if let Some(manager) = state.harness_manager.as_ref() {
+        match manager.provision(&config).await {
+            Ok(cid) => {
+                if let Err(e) = manager.start(&cid).await {
+                    error!("Failed to auto-start specialist harness: {}", e);
+                }
+                container_id = Some(cid.clone());
+                provider = "docker".to_string();
+
+                // Update DB with container info
+                let _ = sqlx::query(
+                    "UPDATE harness_instances SET container_id = $1, status = 'running' WHERE id = $2",
+                )
+                .bind(&cid)
+                .bind(harness_id)
+                .execute(&state.db)
+                .await;
+            }
+            Err(e) => {
+                error!("Failed to provision specialist harness via Docker: {}", e);
+                let _ = sqlx::query("UPDATE harness_instances SET status = 'error' WHERE id = $1")
+                    .bind(harness_id)
+                    .execute(&state.db)
+                    .await;
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("Provisioning failed: {}", e),
+                    }),
+                ));
+            }
+        }
+    } else if let Some(ecs) = state.ecs_provisioner.as_ref() {
+        let slug = format!(
+            "{}-{}",
+            tenant_id,
+            req.name.to_lowercase().replace(' ', "-")
+        );
+        match ecs.provision(&config, &slug).await {
+            Ok(task_arn) => {
+                container_id = Some(task_arn.clone());
+                provider = "ecs".to_string();
+                let _ = sqlx::query(
+                    "UPDATE harness_instances SET container_id = $1, status = 'provisioning' WHERE id = $2",
+                )
+                .bind(&task_arn)
+                .bind(harness_id)
+                .execute(&state.db)
+                .await;
+            }
+            Err(e) => {
+                error!("Failed to provision specialist harness via ECS: {}", e);
+                let _ = sqlx::query("UPDATE harness_instances SET status = 'error' WHERE id = $1")
+                    .bind(harness_id)
+                    .execute(&state.db)
+                    .await;
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("ECS provisioning failed: {}", e),
+                    }),
+                ));
+            }
+        }
+    } else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "No provisioner available".into(),
+            }),
+        ));
+    }
+
+    Ok((
+        StatusCode::CREATED,
+        Json(SpecialistHarnessResponse {
+            harness_id,
+            name: req.name,
+            harness_role,
+            packages: req.packages,
+            status: "provisioning".to_string(),
+            container_id,
+            provisioned_at: Utc::now(),
+            provider,
+        }),
+    ))
+}
+
+/// List all harnesses for a tenant.
+async fn list_tenant_harnesses(
+    State(state): State<PlatformState>,
+    Path(tenant_id): Path<Uuid>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let rows = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            Option<String>,
+            String,
+            serde_json::Value,
+            String,
+            Option<bool>,
+        ),
+    >(
+        r#"
+        SELECT id, name, harness_role, packages, status, healthy
+        FROM harness_instances
+        WHERE tenant_id = $1 AND status != 'deprovisioned'
+        ORDER BY harness_role, name
+        "#,
+    )
+    .bind(tenant_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Database error: {}", e),
+            }),
+        )
+    })?;
+
+    let harnesses: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(id, name, role, packages, status, healthy)| {
+            serde_json::json!({
+                "harness_id": id,
+                "name": name,
+                "harness_role": role,
+                "packages": packages,
+                "status": status,
+                "healthy": healthy,
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "tenant_id": tenant_id,
+        "harnesses": harnesses,
+        "count": harnesses.len(),
+    })))
+}
+
+/// Deprovision a specialist harness.
+async fn deprovision_tenant_harness(
+    State(state): State<PlatformState>,
+    Path((tenant_id, harness_id)): Path<(Uuid, Uuid)>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    // Get container_id from DB
+    let row = sqlx::query_as::<_, (Option<String>,)>(
+        "SELECT container_id FROM harness_instances WHERE id = $1 AND tenant_id = $2",
+    )
+    .bind(harness_id)
+    .bind(tenant_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Database error: {}", e),
+            }),
+        )
+    })?;
+
+    let container_id = row.and_then(|(cid,)| cid).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "Harness not found".into(),
+            }),
+        )
+    })?;
+
+    // Stop/remove the container
+    if let Some(manager) = state.harness_manager.as_ref() {
+        let _ = manager.deprovision(&container_id).await;
+    } else if let Some(ecs) = state.ecs_provisioner.as_ref() {
+        let _ = ecs.stop(&container_id).await;
+    }
+
+    // Mark as deprovisioned
+    let _ = sqlx::query(
+        "UPDATE harness_instances SET status = 'deprovisioned', stopped_at = NOW() WHERE id = $1",
+    )
+    .bind(harness_id)
+    .execute(&state.db)
+    .await;
+
+    info!(harness_id = %harness_id, "Specialist harness deprovisioned");
+
+    Ok(Json(serde_json::json!({
+        "harness_id": harness_id,
+        "status": "deprovisioned",
+    })))
+}
+
+/// Restart a harness.
+async fn restart_tenant_harness(
+    State(state): State<PlatformState>,
+    Path((tenant_id, harness_id)): Path<(Uuid, Uuid)>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let row = sqlx::query_as::<_, (Option<String>,)>(
+        "SELECT container_id FROM harness_instances WHERE id = $1 AND tenant_id = $2",
+    )
+    .bind(harness_id)
+    .bind(tenant_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Database error: {}", e),
+            }),
+        )
+    })?;
+
+    let container_id = row.and_then(|(cid,)| cid).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "Harness not found".into(),
+            }),
+        )
+    })?;
+
+    if let Some(manager) = state.harness_manager.as_ref() {
+        let _ = manager.stop(&container_id).await;
+        manager.start(&container_id).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to restart: {}", e),
+                }),
+            )
+        })?;
+    } else {
+        return Err((
+            StatusCode::NOT_IMPLEMENTED,
+            Json(ErrorResponse {
+                error: "Restart is only supported for Docker containers".into(),
+            }),
+        ));
+    }
+
+    let _ = sqlx::query(
+        "UPDATE harness_instances SET status = 'running', started_at = NOW() WHERE id = $1",
+    )
+    .bind(harness_id)
+    .execute(&state.db)
+    .await;
+
+    info!(harness_id = %harness_id, "Harness restarted");
+
+    Ok(Json(serde_json::json!({
+        "harness_id": harness_id,
+        "status": "running",
+    })))
+}
+
+/// Update packages on a harness.
+#[derive(Deserialize)]
+struct UpdatePackagesRequest {
+    packages: Vec<String>,
+}
+
+async fn update_harness_packages(
+    State(state): State<PlatformState>,
+    Path((tenant_id, harness_id)): Path<(Uuid, Uuid)>,
+    Json(req): Json<UpdatePackagesRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let packages_json = serde_json::to_value(&req.packages).unwrap_or_default();
+
+    let result = sqlx::query(
+        "UPDATE harness_instances SET packages = $1, updated_at = NOW() WHERE id = $2 AND tenant_id = $3",
+    )
+    .bind(&packages_json)
+    .bind(harness_id)
+    .bind(tenant_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Database error: {}", e),
+            }),
+        )
+    })?;
+
+    if result.rows_affected() == 0 {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "Harness not found".into(),
+            }),
+        ));
+    }
+
+    info!(
+        harness_id = %harness_id,
+        packages = ?req.packages,
+        "Harness packages updated (restart required for changes to take effect)"
+    );
+
+    Ok(Json(serde_json::json!({
+        "harness_id": harness_id,
+        "packages": req.packages,
+        "message": "Packages updated. Restart the harness for changes to take effect.",
+    })))
 }

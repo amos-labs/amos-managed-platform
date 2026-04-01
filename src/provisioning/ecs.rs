@@ -274,6 +274,15 @@ impl EcsProvisioner {
             env_vars.push(kv("BRAVE_API_KEY", &self.brave_api_key));
         }
 
+        // Multi-harness: pass role, packages, and harness ID
+        env_vars.push(kv("AMOS_HARNESS_ROLE", &config.harness_role));
+        if !config.packages.is_empty() {
+            env_vars.push(kv("AMOS_PACKAGES", &config.packages.join(",")));
+        }
+        if let Some(harness_id) = &config.harness_id {
+            env_vars.push(kv("AMOS_HARNESS_ID", &harness_id.to_string()));
+        }
+
         // Forward any extra env vars from HarnessConfig.
         for (key, value) in &config.env_vars {
             env_vars.push(kv(key, value));

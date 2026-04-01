@@ -40,6 +40,17 @@
       </form>
     </div>
 
+    {% if stripe_subscription_status == "past_due" %}
+    <div class="mb-6 rounded-md bg-red-50 border border-red-200 p-4">
+      <div class="flex items-center justify-between">
+        <div class="text-sm font-medium text-red-800">Your payment is past due. Update your payment method to avoid service interruption.</div>
+        <form action="/billing/portal" method="POST">
+          <button type="submit" class="rounded-md bg-red-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-red-500">Update Payment</button>
+        </form>
+      </div>
+    </div>
+    {% endif %}
+
     {% if let Some(msg) = flash_message %}
     <div class="mb-6 rounded-md bg-blue-50 p-4">
       <div class="flex">
@@ -59,10 +70,22 @@
     <!-- Harness Instances -->
     <div class="mb-8">
       <h2 class="text-lg font-semibold text-gray-900 mb-4">Harness Instances</h2>
+      {% if plan == "free" %}
+      <div class="mb-4 rounded-lg border border-indigo-200 bg-indigo-50 p-4">
+        <div class="flex items-center justify-between">
+          <div>
+            <p class="text-sm font-medium text-indigo-800">Upgrade to activate your harness</p>
+            <p class="mt-0.5 text-xs text-indigo-600">Free plan does not include a running harness. Upgrade starting at $45/mo.</p>
+          </div>
+          <a href="/billing/upgrade" class="rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500">Upgrade</a>
+        </div>
+      </div>
+      {% endif %}
+
       {% if instances.is_empty() %}
       <div class="rounded-lg border-2 border-dashed border-gray-300 p-8 text-center">
         <p class="text-sm text-gray-500">No harness instances yet.</p>
-        <p class="mt-1 text-xs text-gray-400">Click "Deploy New Harness" above to provision one.</p>
+        <p class="mt-1 text-xs text-gray-400">{% if plan == "free" %}Upgrade your plan to get a harness.{% else %}Click "Deploy New Harness" above to provision one.{% endif %}</p>
       </div>
       {% else %}
       <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
@@ -193,6 +216,10 @@
       <div class="rounded-lg border bg-white p-5 shadow-sm">
         <h3 class="text-sm font-medium text-gray-500">Plan</h3>
         <p class="mt-1 text-xl font-semibold text-gray-900 capitalize">{{ plan }}</p>
+        <p class="text-xs text-gray-500">{{ plan_price }}</p>
+        {% if plan == "free" %}
+        <a href="/billing/upgrade" class="mt-2 inline-block text-xs font-medium text-indigo-600 hover:text-indigo-500">Upgrade &rarr;</a>
+        {% endif %}
       </div>
       <div class="rounded-lg border bg-white p-5 shadow-sm">
         <h3 class="text-sm font-medium text-gray-500">Team Members</h3>

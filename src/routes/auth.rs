@@ -277,6 +277,9 @@ async fn register(
                 state.config.server.host, state.config.server.port
             ),
             env_vars: std::collections::HashMap::new(),
+            harness_role: "primary".to_string(),
+            packages: vec![],
+            harness_id: None,
         };
 
         match manager.provision(&config).await {

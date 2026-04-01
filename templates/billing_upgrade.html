@@ -1,0 +1,126 @@
+{% extends "base.html" %}
+
+{% block title %}Upgrade Plan - AMOS Platform{% endblock %}
+
+{% block body %}
+<div class="min-h-full">
+  <!-- Navigation -->
+  <nav class="border-b border-gray-200 bg-white">
+    <div class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
+      <div class="flex h-14 justify-between">
+        <div class="flex items-center space-x-8">
+          <span class="text-lg font-bold text-gray-900">AMOS</span>
+          <a href="/dashboard" class="border-b-2 border-transparent px-1 pt-1 text-sm font-medium text-gray-500 hover:border-gray-300 hover:text-gray-700">Dashboard</a>
+          <a href="/settings" class="border-b-2 border-transparent px-1 pt-1 text-sm font-medium text-gray-500 hover:border-gray-300 hover:text-gray-700">Settings</a>
+        </div>
+        <div class="flex items-center space-x-4">
+          <span class="text-sm text-gray-500">{{ tenant_name }}</span>
+          <form action="/logout" method="POST" class="inline">
+            <button type="submit" class="text-sm text-gray-500 hover:text-gray-700">Sign out</button>
+          </form>
+        </div>
+      </div>
+    </div>
+  </nav>
+
+  <main class="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
+    <div class="text-center mb-10">
+      <h1 class="text-3xl font-bold text-gray-900">Choose Your Plan</h1>
+      <p class="mt-2 text-sm text-gray-500">
+        Your current plan: <span class="font-semibold capitalize">{{ current_plan }}</span>.
+        AI compute is BYOK (Bring Your Own Key) — you pay Anthropic directly.
+      </p>
+    </div>
+
+    <div class="grid gap-6 sm:grid-cols-2 lg:grid-cols-4 max-w-5xl mx-auto">
+      <!-- Free -->
+      <div class="rounded-lg border bg-white p-6 shadow-sm {% if current_plan == "free" %}ring-2 ring-indigo-500{% endif %}">
+        <h3 class="text-lg font-semibold text-gray-900">Free</h3>
+        <p class="mt-2 text-3xl font-bold text-gray-900">$0<span class="text-sm font-normal text-gray-500">/mo</span></p>
+        <ul class="mt-4 space-y-2 text-sm text-gray-600">
+          <li>100 conversations/mo</li>
+          <li>1 bot</li>
+          <li>1 GB storage</li>
+          <li>Community support</li>
+        </ul>
+        {% if current_plan == "free" %}
+        <div class="mt-6 text-center text-sm font-medium text-indigo-600">Current plan</div>
+        {% endif %}
+      </div>
+
+      <!-- Starter -->
+      <div class="rounded-lg border bg-white p-6 shadow-sm {% if current_plan == "starter" %}ring-2 ring-indigo-500{% endif %}">
+        <h3 class="text-lg font-semibold text-gray-900">Starter</h3>
+        <p class="mt-2 text-3xl font-bold text-gray-900">$45<span class="text-sm font-normal text-gray-500">/mo</span></p>
+        <ul class="mt-4 space-y-2 text-sm text-gray-600">
+          <li>5,000 conversations/mo</li>
+          <li>5 bots</li>
+          <li>10 GB storage</li>
+          <li>Email support</li>
+          <li>0.5 vCPU, 1 GB RAM</li>
+        </ul>
+        {% if current_plan != "starter" %}
+        <form action="/billing/checkout" method="POST" class="mt-6">
+          <input type="hidden" name="plan" value="starter" />
+          <button type="submit" class="w-full rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500">
+            {% if current_plan == "free" %}Upgrade{% else %}Switch{% endif %} to Starter
+          </button>
+        </form>
+        {% else %}
+        <div class="mt-6 text-center text-sm font-medium text-indigo-600">Current plan</div>
+        {% endif %}
+      </div>
+
+      <!-- Growth -->
+      <div class="rounded-lg border bg-white p-6 shadow-sm {% if current_plan == "growth" %}ring-2 ring-indigo-500{% endif %}">
+        <h3 class="text-lg font-semibold text-gray-900">Growth</h3>
+        <p class="mt-2 text-3xl font-bold text-gray-900">$85<span class="text-sm font-normal text-gray-500">/mo</span></p>
+        <ul class="mt-4 space-y-2 text-sm text-gray-600">
+          <li>50,000 conversations/mo</li>
+          <li>20 bots</li>
+          <li>100 GB storage</li>
+          <li>Priority support</li>
+          <li>1 vCPU, 2 GB RAM</li>
+        </ul>
+        {% if current_plan != "growth" %}
+        <form action="/billing/checkout" method="POST" class="mt-6">
+          <input type="hidden" name="plan" value="growth" />
+          <button type="submit" class="w-full rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500">
+            {% if current_plan == "free" %}Upgrade{% else %}Switch{% endif %} to Growth
+          </button>
+        </form>
+        {% else %}
+        <div class="mt-6 text-center text-sm font-medium text-indigo-600">Current plan</div>
+        {% endif %}
+      </div>
+
+      <!-- Enterprise -->
+      <div class="rounded-lg border bg-white p-6 shadow-sm {% if current_plan == "enterprise" %}ring-2 ring-indigo-500{% endif %}">
+        <h3 class="text-lg font-semibold text-gray-900">Enterprise</h3>
+        <p class="mt-2 text-3xl font-bold text-gray-900">$155<span class="text-sm font-normal text-gray-500">/mo</span></p>
+        <ul class="mt-4 space-y-2 text-sm text-gray-600">
+          <li>Unlimited conversations</li>
+          <li>Unlimited bots</li>
+          <li>Unlimited storage</li>
+          <li>Dedicated support</li>
+          <li>2 vCPU, 4 GB RAM</li>
+        </ul>
+        {% if current_plan != "enterprise" %}
+        <form action="/billing/checkout" method="POST" class="mt-6">
+          <input type="hidden" name="plan" value="enterprise" />
+          <button type="submit" class="w-full rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500">
+            {% if current_plan == "free" %}Upgrade{% else %}Switch{% endif %} to Enterprise
+          </button>
+        </form>
+        {% else %}
+        <div class="mt-6 text-center text-sm font-medium text-indigo-600">Current plan</div>
+        {% endif %}
+      </div>
+    </div>
+
+    <div class="mt-8 text-center">
+      <a href="/dashboard" class="text-sm text-gray-500 hover:text-gray-700">Back to dashboard</a>
+    </div>
+  </main>
+</div>
+{% endblock %}

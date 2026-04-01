@@ -47,6 +47,11 @@ pub fn build_http_router(state: PlatformState) -> Router {
     Router::new()
         // UI routes (SSR pages: /login, /register, /dashboard, /settings)
         .merge(ui_routes)
+        // Stripe webhook (no auth — signature verification handles authentication)
+        .route(
+            "/webhooks/stripe",
+            axum::routing::post(routes::webhooks::stripe_webhook),
+        )
         // Root path: redirect browsers to login, serve API catalog for agents
         .route("/", axum::routing::get(routes::discovery::root_handler))
         .nest("/api/v1", api_routes)

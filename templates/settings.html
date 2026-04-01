@@ -32,6 +32,57 @@
     </div>
     {% endif %}
 
+    <!-- Billing Section -->
+    <section class="mb-10">
+      <h2 class="text-lg font-semibold text-gray-900 mb-4">Billing</h2>
+
+      {% if stripe_subscription_status == "past_due" %}
+      <div class="mb-4 rounded-md bg-red-50 border border-red-200 p-4">
+        <p class="text-sm font-medium text-red-800">Your payment is past due. Please update your payment method to avoid service interruption.</p>
+      </div>
+      {% endif %}
+
+      <div class="rounded-lg border bg-white p-5 shadow-sm">
+        <dl class="grid grid-cols-2 gap-4">
+          <div>
+            <dt class="text-sm font-medium text-gray-500">Current Plan</dt>
+            <dd class="mt-1 text-lg font-semibold text-gray-900 capitalize">{{ plan }}</dd>
+          </div>
+          <div>
+            <dt class="text-sm font-medium text-gray-500">Monthly Price</dt>
+            <dd class="mt-1 text-lg font-semibold text-gray-900">{{ plan_price }}</dd>
+          </div>
+          {% if stripe_subscription_status != "none" %}
+          <div>
+            <dt class="text-sm font-medium text-gray-500">Subscription Status</dt>
+            <dd class="mt-1 text-sm capitalize
+              {% if stripe_subscription_status == "active" %}text-green-700
+              {% elif stripe_subscription_status == "past_due" %}text-red-700
+              {% elif stripe_subscription_status == "canceled" %}text-gray-500
+              {% else %}text-yellow-700{% endif %}">
+              {{ stripe_subscription_status }}
+            </dd>
+          </div>
+          {% endif %}
+        </dl>
+
+        <div class="mt-4 flex gap-3">
+          {% if has_stripe_customer %}
+          <form action="/billing/portal" method="POST">
+            <button type="submit" class="rounded-md bg-gray-100 px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-200">
+              Manage Billing
+            </button>
+          </form>
+          {% endif %}
+          {% if plan == "free" %}
+          <a href="/billing/upgrade" class="rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500">
+            Upgrade Plan
+          </a>
+          {% endif %}
+        </div>
+      </div>
+    </section>
+
     <!-- API Keys Section -->
     <section class="mb-10">
       <div class="flex items-center justify-between mb-4">

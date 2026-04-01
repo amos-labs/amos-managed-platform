@@ -15,6 +15,7 @@ pub mod sync;
 pub mod tenants;
 pub mod token;
 pub mod ui;
+pub mod webhooks;
 
 /// Build all API routes (nested under /api/v1 by server.rs).
 pub fn api_routes() -> Router<PlatformState> {

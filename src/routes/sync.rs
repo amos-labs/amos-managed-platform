@@ -21,6 +21,7 @@ pub fn routes() -> Router<PlatformState> {
         .route("/sync/config", get(get_config))
         .route("/sync/activity", post(receive_activity))
         .route("/sync/version", get(get_latest_version))
+        .route("/sync/siblings", get(get_siblings))
 }
 
 // ── Heartbeat ───────────────────────────────────────────────────────────
@@ -35,6 +36,12 @@ struct HeartbeatPayload {
     timestamp: String,
     /// Optional tenant_id for identifying which harness is sending
     tenant_id: Option<String>,
+    /// Optional harness_id for per-harness heartbeat (multi-harness mode)
+    harness_id: Option<String>,
+    /// Harness role: primary, specialist, or worker
+    harness_role: Option<String>,
+    /// Enabled packages on this harness
+    packages: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -56,8 +63,45 @@ async fn receive_heartbeat(
         payload.tenant_id,
     );
 
-    // Update harness status in database if tenant_id is provided
-    if let Some(tenant_id_str) = &payload.tenant_id {
+    // Per-harness heartbeat: if harness_id is provided, update only that instance.
+    // Fallback: update by tenant_id for backward compatibility.
+    if let Some(harness_id_str) = &payload.harness_id {
+        if let Ok(harness_id) = uuid::Uuid::parse_str(harness_id_str) {
+            let result = sqlx::query(
+                r#"
+                UPDATE harness_instances
+                SET last_heartbeat = NOW(),
+                    harness_version = $1,
+                    healthy = $2
+                WHERE id = $3 AND status != 'deprovisioned'
+                "#,
+            )
+            .bind(&payload.harness_version)
+            .bind(payload.healthy)
+            .bind(harness_id)
+            .execute(&state.db)
+            .await;
+
+            match result {
+                Ok(result) => {
+                    if result.rows_affected() > 0 {
+                        debug!("Updated harness status for harness {}", harness_id);
+                    } else {
+                        debug!(
+                            "No harness instance found for id {} (may not be provisioned yet)",
+                            harness_id
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to update harness status in database: {}", e);
+                }
+            }
+        } else {
+            debug!("Invalid harness_id format: {}", harness_id_str);
+        }
+    } else if let Some(tenant_id_str) = &payload.tenant_id {
+        // Backward compatible: update all harnesses for this tenant
         if let Ok(tenant_id) = uuid::Uuid::parse_str(tenant_id_str) {
             let result = sqlx::query(
                 r#"
@@ -93,7 +137,7 @@ async fn receive_heartbeat(
             debug!("Invalid tenant_id format: {}", tenant_id_str);
         }
     } else {
-        debug!("No tenant_id provided in heartbeat (backwards compatibility mode)");
+        debug!("No tenant_id or harness_id provided in heartbeat (backwards compatibility mode)");
     }
 
     Json(HeartbeatResponse {
@@ -360,6 +404,130 @@ async fn get_latest_version(State(state): State<PlatformState>) -> impl IntoResp
         release_notes_url: None,
         update_required: false,
     })
+}
+
+// ── Siblings Discovery ──────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct SiblingsQuery {
+    tenant_id: String,
+    /// The calling harness's ID (excluded from results)
+    exclude_harness_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SiblingHarness {
+    harness_id: String,
+    name: Option<String>,
+    harness_role: String,
+    packages: serde_json::Value,
+    internal_url: Option<String>,
+    status: String,
+    healthy: Option<bool>,
+    last_heartbeat: Option<DateTime<Utc>>,
+}
+
+#[derive(Serialize)]
+struct SiblingsResponse {
+    siblings: Vec<SiblingHarness>,
+}
+
+/// Returns all harness instances for a tenant, excluding the caller.
+///
+/// Used by the orchestrator module on the primary harness to discover
+/// specialist and worker harnesses.
+async fn get_siblings(
+    State(state): State<PlatformState>,
+    axum::extract::Query(params): axum::extract::Query<SiblingsQuery>,
+) -> impl IntoResponse {
+    let tenant_id = match uuid::Uuid::parse_str(&params.tenant_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return Json(SiblingsResponse { siblings: vec![] });
+        }
+    };
+
+    let exclude_id = params
+        .exclude_harness_id
+        .as_deref()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok());
+
+    let query = if let Some(exclude) = exclude_id {
+        sqlx::query_as::<
+            _,
+            (
+                uuid::Uuid,
+                Option<String>,
+                String,
+                serde_json::Value,
+                Option<String>,
+                String,
+                Option<bool>,
+                Option<DateTime<Utc>>,
+            ),
+        >(
+            r#"
+            SELECT id, name, harness_role, packages, internal_url, status, healthy, last_heartbeat
+            FROM harness_instances
+            WHERE tenant_id = $1 AND id != $2
+              AND status NOT IN ('deprovisioned', 'error')
+            ORDER BY harness_role, name
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(exclude)
+        .fetch_all(&state.db)
+        .await
+    } else {
+        sqlx::query_as::<
+            _,
+            (
+                uuid::Uuid,
+                Option<String>,
+                String,
+                serde_json::Value,
+                Option<String>,
+                String,
+                Option<bool>,
+                Option<DateTime<Utc>>,
+            ),
+        >(
+            r#"
+            SELECT id, name, harness_role, packages, internal_url, status, healthy, last_heartbeat
+            FROM harness_instances
+            WHERE tenant_id = $1
+              AND status NOT IN ('deprovisioned', 'error')
+            ORDER BY harness_role, name
+            "#,
+        )
+        .bind(tenant_id)
+        .fetch_all(&state.db)
+        .await
+    };
+
+    let siblings = match query {
+        Ok(rows) => rows
+            .into_iter()
+            .map(
+                |(id, name, role, packages, url, status, healthy, heartbeat)| SiblingHarness {
+                    harness_id: id.to_string(),
+                    name,
+                    harness_role: role,
+                    packages,
+                    internal_url: url,
+                    status,
+                    healthy,
+                    last_heartbeat: heartbeat,
+                },
+            )
+            .collect(),
+        Err(e) => {
+            tracing::warn!("Failed to query siblings: {}", e);
+            vec![]
+        }
+    };
+
+    Json(SiblingsResponse { siblings })
 }
 
 #[cfg(test)]
