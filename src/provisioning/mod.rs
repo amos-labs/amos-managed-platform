@@ -80,13 +80,16 @@ impl HarnessManager {
 
         // The harness needs its own database, NOT the platform database.
         // In production this would be a per-customer database; for development
-        // we use amos_dev. The platform DB URL (amos_platform_dev) was forwarded
-        // above and must be overridden here.
+        // we use amos_harness_dev. The platform DB URL (amos_platform_dev) was
+        // forwarded above and must be overridden here.
         // TODO: In production, create per-customer databases dynamically.
-        env_vars.push(
-            "AMOS__DATABASE__URL=postgres://rickbarkley@host.docker.internal:5432/amos_dev"
-                .to_string(),
-        );
+        let db_user = std::env::var("POSTGRES_USER").unwrap_or_else(|_| "amos".to_string());
+        let db_pass =
+            std::env::var("POSTGRES_PASSWORD").unwrap_or_else(|_| "amos_dev_password".to_string());
+        env_vars.push(format!(
+            "AMOS__DATABASE__URL=postgresql://{}:{}@host.docker.internal:5432/amos_harness_dev",
+            db_user, db_pass
+        ));
 
         // Point the harness's platform URL back at the host-running platform.
         env_vars.push(format!(

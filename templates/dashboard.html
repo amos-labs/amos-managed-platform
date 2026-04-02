@@ -70,7 +70,7 @@
     <!-- Harness Instances -->
     <div class="mb-8">
       <h2 class="text-lg font-semibold text-gray-900 mb-4">Harness Instances</h2>
-      {% if plan == "free" %}
+      {% if plan == "free" %}{% if billing_enabled %}
       <div class="mb-4 rounded-lg border border-indigo-200 bg-indigo-50 p-4">
         <div class="flex items-center justify-between">
           <div>
@@ -80,12 +80,12 @@
           <a href="/billing/upgrade" class="rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500">Upgrade</a>
         </div>
       </div>
-      {% endif %}
+      {% endif %}{% endif %}
 
       {% if instances.is_empty() %}
       <div class="rounded-lg border-2 border-dashed border-gray-300 p-8 text-center">
         <p class="text-sm text-gray-500">No harness instances yet.</p>
-        <p class="mt-1 text-xs text-gray-400">{% if plan == "free" %}Upgrade your plan to get a harness.{% else %}Click "Deploy New Harness" above to provision one.{% endif %}</p>
+        <p class="mt-1 text-xs text-gray-400">{% if plan == "free" %}{% if billing_enabled %}Upgrade your plan to get a harness.{% endif %}{% else %}Click "Deploy New Harness" above to provision one.{% endif %}</p>
       </div>
       {% else %}
       <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">

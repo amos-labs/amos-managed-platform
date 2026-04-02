@@ -10,7 +10,12 @@ WORKDIR /app
 COPY . .
 
 # Build the platform binary (SQLX_OFFLINE since no live DB in Docker build)
-RUN SQLX_OFFLINE=true cargo build --release --bin amos-platform
+# Override LTO and codegen-units to reduce peak memory usage in container builds.
+# The Cargo.toml uses lto="fat" + codegen-units=1 which needs ~8GB+ RAM.
+RUN CARGO_PROFILE_RELEASE_LTO=thin \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+    SQLX_OFFLINE=true \
+    cargo build --release --bin amos-platform
 
 # Stage 2: Runtime
 FROM debian:bookworm-slim

@@ -247,6 +247,7 @@ struct DashboardTemplate {
     api_key_count: i64,
     flash_message: Option<String>,
     flash_error: Option<String>,
+    billing_enabled: bool,
 }
 
 #[derive(Template)]
@@ -744,7 +745,13 @@ async fn register_submit(
         }
     }
 
-    // Free plan (or Stripe not configured): go to dashboard
+    // Self-hosted / Stripe not configured: provision free-tier harnesses immediately.
+    // When billing is enabled (managed hosting), free-tier users must upgrade first.
+    if !is_paid && state.stripe_client.is_none() {
+        info!(tenant_id = %tenant_id, "Stripe not configured — provisioning free-tier harness immediately");
+        crate::routes::webhooks::provision_harness_for_tenant(&state, tenant_id).await;
+    }
+
     ([(header::SET_COOKIE, cookie)], Redirect::to("/dashboard")).into_response()
 }
 
@@ -903,6 +910,7 @@ async fn dashboard_page(
         api_key_count,
         flash_message: query.msg,
         flash_error: query.error,
+        billing_enabled: state.stripe_client.is_some(),
     })
     .into_response()
 }
