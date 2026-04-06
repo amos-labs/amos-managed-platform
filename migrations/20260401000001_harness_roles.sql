@@ -6,6 +6,21 @@ ALTER TABLE harness_instances
   ADD COLUMN packages JSONB NOT NULL DEFAULT '[]'::jsonb,
   ADD COLUMN parent_harness_id UUID REFERENCES harness_instances(id);
 
+-- Demote duplicate primaries: for each tenant with multiple non-deprovisioned
+-- harnesses, keep only the newest as 'primary' and set the rest to 'worker'.
+WITH ranked AS (
+  SELECT id, ROW_NUMBER() OVER (
+    PARTITION BY tenant_id
+    ORDER BY created_at DESC
+  ) AS rn
+  FROM harness_instances
+  WHERE status != 'deprovisioned'
+)
+UPDATE harness_instances
+  SET harness_role = 'worker'
+FROM ranked
+WHERE harness_instances.id = ranked.id AND ranked.rn > 1;
+
 -- Only one primary harness per tenant (non-deprovisioned)
 CREATE UNIQUE INDEX idx_one_primary_per_tenant
   ON harness_instances (tenant_id)
