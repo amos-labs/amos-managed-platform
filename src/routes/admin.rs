@@ -78,6 +78,7 @@ struct TenantSummary {
     email: String,
     organization: Option<String>,
     plan: String,
+    max_harnesses: i32,
     stripe_subscription_status: Option<String>,
     created_at: DateTime<Utc>,
     harnesses: Vec<HarnessInfo>,
@@ -90,6 +91,7 @@ struct HarnessInfo {
     status: String,
     instance_size: Option<String>,
     internal_url: Option<String>,
+    endpoint_url: Option<String>,
     region: Option<String>,
 }
 
@@ -171,7 +173,7 @@ async fn list_tenants(
     State(state): State<PlatformState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     // First, fetch all tenants with owner email.
-    let tenant_rows = sqlx::query_as::<_, (Uuid, String, String, Option<String>, String, Option<String>, DateTime<Utc>)>(
+    let tenant_rows = sqlx::query_as::<_, (Uuid, String, String, Option<String>, String, i32, Option<String>, DateTime<Utc>)>(
         r#"
         SELECT
             t.id,
@@ -179,6 +181,7 @@ async fn list_tenants(
             COALESCE(u.email, ''),
             t.slug,
             t.plan,
+            t.max_harnesses,
             t.stripe_subscription_status,
             t.created_at
         FROM tenants t
@@ -199,7 +202,7 @@ async fn list_tenants(
     })?;
 
     // Fetch all harness instances in one query.
-    let harness_rows = sqlx::query_as::<_, (Uuid, Uuid, Option<String>, String, Option<String>, Option<String>, Option<String>)>(
+    let harness_rows = sqlx::query_as::<_, (Uuid, Uuid, Option<String>, String, Option<String>, Option<String>, Option<String>, Option<String>)>(
         r#"
         SELECT
             h.id,
@@ -208,6 +211,7 @@ async fn list_tenants(
             h.status,
             h.instance_size,
             h.internal_url,
+            h.endpoint_url,
             h.region
         FROM harness_instances h
         WHERE h.status != 'deprovisioned'
@@ -229,7 +233,7 @@ async fn list_tenants(
     // Group harnesses by tenant_id.
     let mut harness_map: std::collections::HashMap<Uuid, Vec<HarnessInfo>> =
         std::collections::HashMap::new();
-    for (id, tenant_id, name, status, instance_size, internal_url, region) in harness_rows {
+    for (id, tenant_id, name, status, instance_size, internal_url, endpoint_url, region) in harness_rows {
         harness_map
             .entry(tenant_id)
             .or_default()
@@ -239,6 +243,7 @@ async fn list_tenants(
                 status,
                 instance_size,
                 internal_url,
+                endpoint_url,
                 region,
             });
     }
@@ -246,12 +251,13 @@ async fn list_tenants(
     let tenants: Vec<TenantSummary> = tenant_rows
         .into_iter()
         .map(
-            |(id, name, email, slug, plan, stripe_status, created_at)| TenantSummary {
+            |(id, name, email, slug, plan, max_harnesses, stripe_status, created_at)| TenantSummary {
                 id,
                 name,
                 email,
                 organization: slug,
                 plan,
+                max_harnesses,
                 stripe_subscription_status: stripe_status,
                 created_at,
                 harnesses: harness_map.remove(&id).unwrap_or_default(),
@@ -272,7 +278,7 @@ async fn get_tenant(
     State(state): State<PlatformState>,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let tenant_row = sqlx::query_as::<_, (Uuid, String, String, Option<String>, String, Option<String>, DateTime<Utc>)>(
+    let tenant_row = sqlx::query_as::<_, (Uuid, String, String, Option<String>, String, i32, Option<String>, DateTime<Utc>)>(
         r#"
         SELECT
             t.id,
@@ -280,6 +286,7 @@ async fn get_tenant(
             COALESCE(u.email, ''),
             t.slug,
             t.plan,
+            t.max_harnesses,
             t.stripe_subscription_status,
             t.created_at
         FROM tenants t
@@ -299,7 +306,7 @@ async fn get_tenant(
         )
     })?;
 
-    let (tenant_id, name, email, slug, plan, stripe_status, created_at) =
+    let (tenant_id, name, email, slug, plan, max_harnesses, stripe_status, created_at) =
         tenant_row.ok_or_else(|| {
             (
                 StatusCode::NOT_FOUND,
@@ -309,9 +316,9 @@ async fn get_tenant(
             )
         })?;
 
-    let harness_rows = sqlx::query_as::<_, (Uuid, Option<String>, String, Option<String>, Option<String>, Option<String>)>(
+    let harness_rows = sqlx::query_as::<_, (Uuid, Option<String>, String, Option<String>, Option<String>, Option<String>, Option<String>)>(
         r#"
-        SELECT h.id, h.name, h.status, h.instance_size, h.internal_url, h.region
+        SELECT h.id, h.name, h.status, h.instance_size, h.internal_url, h.endpoint_url, h.region
         FROM harness_instances h
         WHERE h.tenant_id = $1 AND h.status != 'deprovisioned'
         ORDER BY h.name
@@ -331,12 +338,13 @@ async fn get_tenant(
 
     let harnesses: Vec<HarnessInfo> = harness_rows
         .into_iter()
-        .map(|(id, name, status, instance_size, internal_url, region)| HarnessInfo {
+        .map(|(id, name, status, instance_size, internal_url, endpoint_url, region)| HarnessInfo {
             id,
             name,
             status,
             instance_size,
             internal_url,
+            endpoint_url,
             region,
         })
         .collect();
@@ -347,6 +355,7 @@ async fn get_tenant(
         email,
         organization: slug,
         plan,
+        max_harnesses,
         stripe_subscription_status: stripe_status,
         created_at,
         harnesses,
