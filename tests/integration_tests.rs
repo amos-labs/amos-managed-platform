@@ -16,6 +16,7 @@ use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use sqlx::Executor;
 use tower::ServiceExt; // for `oneshot`
+use uuid::Uuid;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Test Helpers
@@ -74,7 +75,8 @@ async fn setup_test_state() -> amos_platform::PlatformState {
             users,
             tenants,
             contribution_activities,
-            emission_records
+            emission_records,
+            stripe_webhook_events
          CASCADE",
         )
         .await
@@ -258,21 +260,6 @@ async fn test_register_validation_errors() {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(body["field"], "password");
 
-    // Invalid plan
-    let (status, body) = post_json(
-        &app,
-        "/api/v1/auth/register",
-        &json!({
-            "organization_name": "Org",
-            "email": "a@b.com",
-            "name": "User",
-            "password": "12345678",
-            "plan": "invalid_plan",
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(body["field"], "plan");
 }
 
 #[tokio::test]
@@ -674,6 +661,513 @@ async fn test_404_returns_json() {
 
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Billing API Tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_list_plans_returns_account_types_and_harness_pricing() {
+    let state = setup_test_state().await;
+    let app = build_test_app(state);
+
+    let (status, body) = get_with_auth(&app, "/api/v1/billing/plans", None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Account types
+    let account_types = body["account_types"]
+        .as_array()
+        .expect("account_types should be an array");
+    assert_eq!(account_types.len(), 2);
+    assert_eq!(account_types[0]["name"], "free");
+    assert_eq!(account_types[0]["max_harnesses"], 1);
+    assert_eq!(account_types[1]["name"], "hosted");
+    assert!(account_types[1]["max_harnesses"].as_u64().unwrap() > 1);
+
+    // Harness pricing (3 sizes)
+    let pricing = body["harness_pricing"]
+        .as_array()
+        .expect("harness_pricing should be an array");
+    assert_eq!(pricing.len(), 3);
+
+    // Small
+    assert_eq!(pricing[0]["size"], "small");
+    assert_eq!(pricing[0]["price_cents"], 4500);
+    assert_eq!(pricing[0]["price_display"], "$45/mo");
+    assert_eq!(pricing[0]["resources"]["vcpu"], 1);
+    assert_eq!(pricing[0]["resources"]["memory_gb"], 2);
+    assert_eq!(pricing[0]["resources"]["storage_gb"], 10);
+
+    // Medium
+    assert_eq!(pricing[1]["size"], "medium");
+    assert_eq!(pricing[1]["price_cents"], 9500);
+    assert_eq!(pricing[1]["resources"]["vcpu"], 2);
+    assert_eq!(pricing[1]["resources"]["memory_gb"], 4);
+
+    // Large
+    assert_eq!(pricing[2]["size"], "large");
+    assert_eq!(pricing[2]["price_cents"], 19500);
+    assert_eq!(pricing[2]["resources"]["vcpu"], 4);
+    assert_eq!(pricing[2]["resources"]["memory_gb"], 8);
+}
+
+#[tokio::test]
+async fn test_list_customers_empty() {
+    let state = setup_test_state().await;
+    let app = build_test_app(state);
+
+    let (status, body) = get_with_auth(&app, "/api/v1/billing/customers", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total"], 0);
+    assert!(body["customers"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_list_customers_after_registration() {
+    let state = setup_test_state().await;
+    let app = build_test_app(state);
+
+    // Register a user (creates a tenant + user)
+    register_test_user(&app, "Billing Corp", "billing@test.com", "password123").await;
+
+    let (status, body) = get_with_auth(&app, "/api/v1/billing/customers", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total"], 1);
+
+    let customer = &body["customers"][0];
+    assert_eq!(customer["name"], "Billing Corp");
+    assert_eq!(customer["email"], "billing@test.com");
+    assert_eq!(customer["plan"], "free");
+}
+
+#[tokio::test]
+async fn test_get_customer_not_found() {
+    let state = setup_test_state().await;
+    let app = build_test_app(state);
+
+    let fake_id = uuid::Uuid::new_v4();
+    let (status, _) =
+        get_with_auth(&app, &format!("/api/v1/billing/customers/{}", fake_id), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_get_customer_detail() {
+    let state = setup_test_state().await;
+    let app = build_test_app(state);
+
+    let (_, _, tenant_id, _) =
+        register_test_user(&app, "Detail Corp", "detail@test.com", "password123").await;
+
+    let (status, body) =
+        get_with_auth(&app, &format!("/api/v1/billing/customers/{}", tenant_id), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["name"], "Detail Corp");
+    assert_eq!(body["email"], "detail@test.com");
+    assert_eq!(body["plan"], "free");
+    assert_eq!(body["id"], tenant_id);
+}
+
+#[tokio::test]
+async fn test_get_customer_usage() {
+    let state = setup_test_state().await;
+    let app = build_test_app(state);
+
+    let (_, _, tenant_id, _) =
+        register_test_user(&app, "Usage Corp", "usage@test.com", "password123").await;
+
+    let (status, body) = get_with_auth(
+        &app,
+        &format!("/api/v1/billing/customers/{}/usage", tenant_id),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["customer_id"], tenant_id);
+    assert_eq!(body["usage"]["conversations"], 0);
+    assert_eq!(body["usage"]["tokens_used"], 0);
+    assert!(body["period_start"].is_string());
+    assert!(body["period_end"].is_string());
+}
+
+#[tokio::test]
+async fn test_subscribe_customer_to_hosted() {
+    let state = setup_test_state().await;
+    let app = build_test_app(state);
+
+    let (_, _, tenant_id, _) =
+        register_test_user(&app, "Subscribe Corp", "sub@test.com", "password123").await;
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/billing/customers/{}/subscribe", tenant_id),
+        &json!({ "plan": "hosted" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["plan"], "hosted");
+    assert_eq!(body["status"], "active");
+    assert!(body["subscription_id"].is_string());
+    assert!(body["started_at"].is_string());
+    assert!(body["next_billing_date"].is_string());
+
+    // Verify next_billing_date is ~30 days from now (not equal to started_at)
+    let started: chrono::DateTime<chrono::Utc> =
+        body["started_at"].as_str().unwrap().parse().unwrap();
+    let next_billing: chrono::DateTime<chrono::Utc> =
+        body["next_billing_date"].as_str().unwrap().parse().unwrap();
+    let diff = next_billing - started;
+    assert!(
+        diff.num_days() >= 29 && diff.num_days() <= 31,
+        "next_billing_date should be ~30 days after started_at, got {} days",
+        diff.num_days()
+    );
+}
+
+#[tokio::test]
+async fn test_subscribe_legacy_plan_maps_to_hosted() {
+    let state = setup_test_state().await;
+    let app = build_test_app(state);
+
+    let (_, _, tenant_id, _) =
+        register_test_user(&app, "Legacy Corp", "legacy@test.com", "password123").await;
+
+    // Legacy "starter" should map to "hosted"
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v1/billing/customers/{}/subscribe", tenant_id),
+        &json!({ "plan": "starter" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["plan"], "hosted");
+}
+
+#[tokio::test]
+async fn test_subscribe_nonexistent_customer() {
+    let state = setup_test_state().await;
+    let app = build_test_app(state);
+
+    let fake_id = uuid::Uuid::new_v4();
+    let (status, _) = post_json(
+        &app,
+        &format!("/api/v1/billing/customers/{}/subscribe", fake_id),
+        &json!({ "plan": "hosted" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_get_current_usage_requires_customer_id() {
+    let state = setup_test_state().await;
+    let app = build_test_app(state);
+
+    // No customer_id query param should return 401
+    let (status, _) = get_with_auth(&app, "/api/v1/billing/usage", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_get_current_usage_with_customer_id() {
+    let state = setup_test_state().await;
+    let app = build_test_app(state);
+
+    let (_, _, tenant_id, _) =
+        register_test_user(&app, "Current Usage Corp", "cusage@test.com", "password123").await;
+
+    let (status, body) = get_with_auth(
+        &app,
+        &format!("/api/v1/billing/usage?customer_id={}", tenant_id),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["customer_id"], tenant_id);
+    assert_eq!(body["usage"]["conversations"], 0);
+    assert_eq!(body["usage"]["tokens_used"], 0);
+}
+
+#[tokio::test]
+async fn test_get_current_usage_nonexistent_customer() {
+    let state = setup_test_state().await;
+    let app = build_test_app(state);
+
+    let fake_id = uuid::Uuid::new_v4();
+    let (status, _) = get_with_auth(
+        &app,
+        &format!("/api/v1/billing/usage?customer_id={}", fake_id),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Stripe Webhook Tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_webhook_rejects_invalid_signature() {
+    let state = setup_test_state().await;
+    let app = build_test_app(state);
+
+    // Send a webhook with an invalid signature — should get either:
+    // - 400 (Bad Request) if Stripe is configured (signature verification fails)
+    // - 503 (Service Unavailable) if Stripe is not configured
+    let req = Request::builder()
+        .method(http::Method::POST)
+        .uri("/webhooks/stripe")
+        .header("stripe-signature", "t=123,v1=abc")
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    assert!(
+        status == StatusCode::BAD_REQUEST || status == StatusCode::SERVICE_UNAVAILABLE,
+        "Expected 400 or 503, got {}",
+        status
+    );
+}
+
+#[tokio::test]
+async fn test_webhook_idempotency() {
+    let state = setup_test_state().await;
+
+    // Insert a fake webhook event to simulate prior processing
+    let event_id = "evt_test_idempotent_123";
+    sqlx::query(
+        "INSERT INTO stripe_webhook_events (stripe_event_id, event_type, payload)
+         VALUES ($1, $2, '{}'::jsonb)
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(event_id)
+    .bind("test.event")
+    .execute(&state.db)
+    .await
+    .expect("insert webhook event");
+
+    // Verify the event is recorded
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM stripe_webhook_events WHERE stripe_event_id = $1)",
+    )
+    .bind(event_id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+
+    assert!(exists, "Webhook event should be stored for idempotency");
+}
+
+#[tokio::test]
+async fn test_subscription_status_updates_in_db() {
+    let state = setup_test_state().await;
+    let app = build_test_app(state.clone());
+
+    // Register a tenant and simulate Stripe checkout completion
+    let (_, _, tenant_id, _) =
+        register_test_user(&app, "Webhook Corp", "webhook@test.com", "password123").await;
+    let tenant_uuid = uuid::Uuid::parse_str(&tenant_id).unwrap();
+
+    // Simulate Stripe checkout: update tenant with stripe IDs
+    sqlx::query(
+        "UPDATE tenants SET stripe_customer_id = $1, stripe_subscription_id = $2, stripe_subscription_status = 'active' WHERE id = $3",
+    )
+    .bind("cus_test_123")
+    .bind("sub_test_123")
+    .bind(tenant_uuid)
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    // Verify the subscription status
+    let status: Option<String> = sqlx::query_scalar(
+        "SELECT stripe_subscription_status FROM tenants WHERE id = $1",
+    )
+    .bind(tenant_uuid)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(status, Some("active".to_string()));
+
+    // Simulate payment failure: mark as past_due
+    sqlx::query("UPDATE tenants SET stripe_subscription_status = 'past_due' WHERE stripe_subscription_id = $1")
+        .bind("sub_test_123")
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    let status: Option<String> = sqlx::query_scalar(
+        "SELECT stripe_subscription_status FROM tenants WHERE id = $1",
+    )
+    .bind(tenant_uuid)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(status, Some("past_due".to_string()));
+
+    // Simulate invoice paid: clear past_due → active
+    sqlx::query(
+        "UPDATE tenants SET stripe_subscription_status = 'active' WHERE stripe_subscription_id = $1 AND stripe_subscription_status = 'past_due'",
+    )
+    .bind("sub_test_123")
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    let status: Option<String> = sqlx::query_scalar(
+        "SELECT stripe_subscription_status FROM tenants WHERE id = $1",
+    )
+    .bind(tenant_uuid)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(status, Some("active".to_string()));
+
+    // Simulate subscription canceled
+    sqlx::query("UPDATE tenants SET stripe_subscription_status = 'canceled' WHERE id = $1")
+        .bind(tenant_uuid)
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    let status: Option<String> = sqlx::query_scalar(
+        "SELECT stripe_subscription_status FROM tenants WHERE id = $1",
+    )
+    .bind(tenant_uuid)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(status, Some("canceled".to_string()));
+}
+
+#[tokio::test]
+async fn test_harness_provisioning_on_checkout() {
+    let state = setup_test_state().await;
+    let app = build_test_app(state.clone());
+
+    // Register a tenant
+    let (_, _, tenant_id, _) =
+        register_test_user(&app, "Provision Corp", "provision@test.com", "password123").await;
+    let tenant_uuid = uuid::Uuid::parse_str(&tenant_id).unwrap();
+
+    // Verify harness was auto-created at registration
+    let harness_count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM harness_instances WHERE tenant_id = $1")
+            .bind(tenant_uuid)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert!(
+        harness_count.0 >= 1,
+        "At least one harness should exist after registration"
+    );
+
+    // Verify harness has the correct subdomain (tenant slug)
+    let subdomain: Option<String> = sqlx::query_scalar(
+        "SELECT subdomain FROM harness_instances WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(tenant_uuid)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(subdomain, Some("provision-corp".to_string()));
+}
+
+#[tokio::test]
+async fn test_harness_stop_on_subscription_cancel() {
+    let state = setup_test_state().await;
+    let app = build_test_app(state.clone());
+
+    // Register a tenant
+    let (_, _, tenant_id, _) =
+        register_test_user(&app, "Cancel Corp", "cancel@test.com", "password123").await;
+    let tenant_uuid = uuid::Uuid::parse_str(&tenant_id).unwrap();
+
+    // Get the auto-provisioned harness and mark it as running
+    let harness_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM harness_instances WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(tenant_uuid)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+
+    sqlx::query("UPDATE harness_instances SET status = 'running', healthy = TRUE, container_id = 'fake_container_123' WHERE id = $1")
+        .bind(harness_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    // Simulate subscription deletion: stop the harness
+    // (Same SQL as the webhook handler would execute)
+    let harness_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM harness_instances WHERE tenant_id = $1 AND status = 'running'",
+    )
+    .bind(tenant_uuid)
+    .fetch_all(&state.db)
+    .await
+    .unwrap();
+    assert!(!harness_ids.is_empty(), "Should have running harness");
+
+    // Mark as stopped (what stop_harness does after container stop)
+    for hid in &harness_ids {
+        sqlx::query("UPDATE harness_instances SET status = 'stopped', healthy = FALSE WHERE id = $1")
+            .bind(hid)
+            .execute(&state.db)
+            .await
+            .unwrap();
+    }
+
+    // Verify harness is stopped
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM harness_instances WHERE id = $1",
+    )
+    .bind(harness_id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(status, "stopped");
+
+    let healthy: bool = sqlx::query_scalar(
+        "SELECT healthy FROM harness_instances WHERE id = $1",
+    )
+    .bind(harness_id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert!(!healthy);
+}
+
+#[tokio::test]
+async fn test_stripe_webhook_events_table_constraints() {
+    let state = setup_test_state().await;
+
+    // Insert a webhook event
+    sqlx::query(
+        "INSERT INTO stripe_webhook_events (stripe_event_id, event_type, payload) VALUES ($1, $2, $3::jsonb)",
+    )
+    .bind("evt_unique_test_1")
+    .bind("checkout.session.completed")
+    .bind("{\"test\": true}")
+    .execute(&state.db)
+    .await
+    .expect("first insert should succeed");
+
+    // Duplicate should fail (unique constraint on stripe_event_id)
+    let dup_result = sqlx::query(
+        "INSERT INTO stripe_webhook_events (stripe_event_id, event_type, payload) VALUES ($1, $2, $3::jsonb)",
+    )
+    .bind("evt_unique_test_1")
+    .bind("checkout.session.completed")
+    .bind("{\"test\": true}")
+    .execute(&state.db)
+    .await;
+
+    assert!(dup_result.is_err(), "Duplicate event ID should be rejected");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

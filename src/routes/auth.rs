@@ -45,8 +45,10 @@ struct RegisterRequest {
     name: String,
     /// Password (min 8 characters).
     password: String,
-    /// Desired plan: free, starter, growth, enterprise.
+    /// Plan is always "free" at registration. Hosting upgrades happen from the dashboard.
+    /// Kept as optional field for backward compatibility with API callers.
     #[serde(default = "default_plan")]
+    #[allow(dead_code)]
     plan: String,
 }
 
@@ -108,22 +110,6 @@ async fn register(
         ));
     }
 
-    let valid_plans = ["free", "starter", "growth", "enterprise"];
-    if !valid_plans.contains(&req.plan.as_str()) {
-        return Err((
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(AuthError {
-                error: format!(
-                    "Invalid plan '{}'. Valid plans: {:?}.",
-                    req.plan, valid_plans
-                ),
-                code: "validation_error",
-                field: Some("plan"),
-                hint: Some("Use one of: free, starter, growth, enterprise.".into()),
-            }),
-        ));
-    }
-
     // ── Generate slug and subdomain ─────────────────────────────────
     let slug = auth::slugify(&req.organization_name);
     if slug.is_empty() {
@@ -163,7 +149,7 @@ async fn register(
     .bind(tenant_id)
     .bind(&req.organization_name)
     .bind(&slug)
-    .bind(&req.plan)
+    .bind("free")
     .bind(&subdomain)
     .execute(&state.db)
     .await;
@@ -363,7 +349,7 @@ async fn register(
         tenant_id = %tenant_id,
         user_id = %user_id,
         slug = %slug,
-        plan = %req.plan,
+        plan = "free",
         "New tenant registered"
     );
 

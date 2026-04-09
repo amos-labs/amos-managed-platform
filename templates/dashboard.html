@@ -30,14 +30,18 @@
         <h1 class="text-2xl font-bold text-gray-900">Dashboard</h1>
         <p class="mt-1 text-sm text-gray-500">Organization: {{ tenant_name }} ({{ tenant_slug }})</p>
       </div>
-      <form action="/dashboard/harness/new" method="POST" class="flex items-center gap-2">
-        <input type="text" name="name" placeholder="Harness name (optional)"
-               class="rounded-md border border-gray-300 px-3 py-2 text-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500" />
-        <button type="submit"
-                class="inline-flex items-center rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600">
-          + Deploy New Harness
-        </button>
-      </form>
+      <div class="flex items-center gap-2">
+        {% if billing_enabled %}
+        <a href="/billing/upgrade"
+           class="inline-flex items-center rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500">
+          + Deploy Hosted Harness
+        </a>
+        {% endif %}
+        <a href="https://docs.amoslabs.com/self-host" target="_blank"
+           class="inline-flex items-center rounded-md border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 shadow-sm hover:bg-gray-50">
+          Self-Host (Free)
+        </a>
+      </div>
     </div>
 
     {% if stripe_subscription_status == "past_due" %}
@@ -74,10 +78,10 @@
       <div class="mb-4 rounded-lg border border-indigo-200 bg-indigo-50 p-4">
         <div class="flex items-center justify-between">
           <div>
-            <p class="text-sm font-medium text-indigo-800">Upgrade to activate your harness</p>
-            <p class="mt-0.5 text-xs text-indigo-600">Free plan does not include a running harness. Upgrade starting at $45/mo.</p>
+            <p class="text-sm font-medium text-indigo-800">Deploy a hosted harness</p>
+            <p class="mt-0.5 text-xs text-indigo-600">Choose a harness size starting at $45/mo, or self-host for free with Docker.</p>
           </div>
-          <a href="/billing/upgrade" class="rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500">Upgrade</a>
+          <a href="/billing/upgrade" class="rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500">Choose Size</a>
         </div>
       </div>
       {% endif %}{% endif %}

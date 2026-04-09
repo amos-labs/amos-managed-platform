@@ -267,6 +267,7 @@ struct SettingsTemplate {
 
 #[derive(Template)]
 #[template(path = "billing_upgrade.html")]
+#[allow(dead_code)]
 struct BillingUpgradeTemplate {
     tenant_name: String,
     current_plan: String,
@@ -322,7 +323,6 @@ struct RegisterForm {
     name: String,
     email: String,
     password: String,
-    plan: String,
 }
 
 #[derive(Deserialize)]
@@ -509,14 +509,6 @@ async fn register_submit(
         .into_response();
     }
 
-    let valid_plans = ["free", "starter", "growth", "enterprise"];
-    if !valid_plans.contains(&form.plan.as_str()) {
-        return HtmlTemplate(RegisterTemplate {
-            error: Some("Invalid plan selected.".into()),
-        })
-        .into_response();
-    }
-
     let slug = auth::slugify(&form.organization_name);
     if slug.is_empty() {
         return HtmlTemplate(RegisterTemplate {
@@ -550,7 +542,7 @@ async fn register_submit(
         .bind(tenant_id)
         .bind(&form.organization_name)
         .bind(&final_slug)
-        .bind(&form.plan)
+        .bind("free")
         .bind(&subdomain)
         .execute(&state.db)
         .await;
@@ -657,97 +649,9 @@ async fn register_submit(
         SESSION_COOKIE, token, access_expiry
     );
 
-    // ── Paid plans: redirect to Stripe Checkout ────────────────────────
-    let is_paid = form.plan != "free";
-    if is_paid {
-        if let (Some(ref client), Some(ref stripe_cfg)) =
-            (&state.stripe_client, &state.stripe_config)
-        {
-            // Look up the Stripe Price ID for this plan
-            let price_id = match stripe_cfg.price_id_for_plan(&form.plan) {
-                Some(p) => p,
-                None => {
-                    error!(plan = %form.plan, "No Stripe price ID configured for plan");
-                    // Fall through to dashboard with a pending harness
-                    return ([(header::SET_COOKIE, cookie)], Redirect::to("/dashboard"))
-                        .into_response();
-                }
-            };
-
-            // Create Stripe customer
-            let customer_id = match crate::billing::stripe_service::create_customer(
-                client,
-                &form.email,
-                &form.name,
-                tenant_id,
-            )
-            .await
-            {
-                Ok(id) => {
-                    // Store the Stripe customer ID
-                    let _ = sqlx::query("UPDATE tenants SET stripe_customer_id = $1 WHERE id = $2")
-                        .bind(id.as_str())
-                        .bind(tenant_id)
-                        .execute(&state.db)
-                        .await;
-                    id.to_string()
-                }
-                Err(e) => {
-                    error!("Failed to create Stripe customer: {}", e);
-                    return ([(header::SET_COOKIE, cookie)], Redirect::to("/dashboard"))
-                        .into_response();
-                }
-            };
-
-            // Create Checkout Session
-            let base_url = format!(
-                "{}://{}:{}",
-                if state.config.server.port == 443 {
-                    "https"
-                } else {
-                    "http"
-                },
-                state.config.server.host,
-                state.config.server.port
-            );
-            let success_url = format!(
-                "{}/billing/success?session_id={{CHECKOUT_SESSION_ID}}",
-                base_url
-            );
-            let cancel_url = format!("{}/dashboard?error=checkout_canceled", base_url);
-
-            match crate::billing::stripe_service::create_checkout_session(
-                client,
-                &customer_id,
-                price_id,
-                &success_url,
-                &cancel_url,
-                tenant_id,
-            )
-            .await
-            {
-                Ok(checkout_url) if !checkout_url.is_empty() => {
-                    info!(tenant_id = %tenant_id, "Redirecting to Stripe Checkout");
-                    return ([(header::SET_COOKIE, cookie)], Redirect::to(&checkout_url))
-                        .into_response();
-                }
-                Ok(_) => {
-                    error!("Stripe returned empty checkout URL");
-                }
-                Err(e) => {
-                    error!("Failed to create Stripe checkout session: {}", e);
-                }
-            }
-        } else {
-            warn!("Paid plan selected but Stripe not configured — provisioning directly");
-            // Fallback: provision harness directly (dev mode without Stripe)
-            crate::routes::webhooks::provision_harness_for_tenant(&state, tenant_id).await;
-        }
-    }
-
-    // Self-hosted / Stripe not configured: provision free-tier harnesses immediately.
-    // When billing is enabled (managed hosting), free-tier users must upgrade first.
-    if !is_paid && state.stripe_client.is_none() {
+    // Self-hosted / Stripe not configured: provision free-tier harness immediately.
+    // When billing is enabled (managed hosting), users upgrade from the dashboard.
+    if state.stripe_client.is_none() {
         info!(tenant_id = %tenant_id, "Stripe not configured — provisioning free-tier harness immediately");
         crate::routes::webhooks::provision_harness_for_tenant(&state, tenant_id).await;
     }
@@ -799,12 +703,7 @@ async fn dashboard_page(
         )
     });
 
-    let plan_enum = match plan.as_str() {
-        "starter" => crate::billing::Plan::Starter,
-        "growth" => crate::billing::Plan::Growth,
-        "enterprise" => crate::billing::Plan::Enterprise,
-        _ => crate::billing::Plan::Free,
-    };
+    let plan_enum = crate::billing::Plan::from_str(&plan);
     let stripe_subscription_status = stripe_sub_status.unwrap_or_else(|| "none".into());
 
     // Fetch the latest available release version for update-available badge.
@@ -903,7 +802,7 @@ async fn dashboard_page(
         tenant_name,
         tenant_slug,
         plan,
-        plan_price: plan_enum.price_display().to_string(),
+        plan_price: if plan_enum.is_paid() { "Per harness".to_string() } else { "Free".to_string() },
         stripe_subscription_status,
         instances,
         user_count,
@@ -953,12 +852,7 @@ async fn settings_page_inner(
     let (tenant_name, plan, stripe_customer_id, stripe_sub_status) =
         tenant_row.unwrap_or_else(|| ("Unknown".into(), "free".into(), None, None));
 
-    let plan_enum = match plan.as_str() {
-        "starter" => crate::billing::Plan::Starter,
-        "growth" => crate::billing::Plan::Growth,
-        "enterprise" => crate::billing::Plan::Enterprise,
-        _ => crate::billing::Plan::Free,
-    };
+    let plan_enum = crate::billing::Plan::from_str(&plan);
 
     // API keys
     let key_rows = sqlx::query_as::<_, (String, String, bool, String)>(
@@ -1004,7 +898,7 @@ async fn settings_page_inner(
         tenant_name,
         role: claims.role.clone(),
         plan: plan.clone(),
-        plan_price: plan_enum.price_display().to_string(),
+        plan_price: if plan_enum.is_paid() { "Per harness".to_string() } else { "Free".to_string() },
         stripe_subscription_status: stripe_sub_status.unwrap_or_else(|| "none".into()),
         has_stripe_customer: stripe_customer_id.is_some(),
         api_keys,
@@ -2082,7 +1976,8 @@ async fn billing_upgrade_page(
 /// Form for the checkout button on the upgrade page.
 #[derive(Deserialize)]
 struct CheckoutForm {
-    plan: String,
+    /// Harness size: "small", "medium", or "large"
+    size: String,
 }
 
 /// `POST /billing/checkout` — create Stripe Checkout session for plan upgrade.
@@ -2108,7 +2003,12 @@ async fn billing_checkout(
         }
     };
 
-    let price_id = match stripe_cfg.price_id_for_plan(&form.plan) {
+    // Resolve price by harness size
+    let size = match form.size.as_str() {
+        "small" | "medium" | "large" => form.size.as_str(),
+        _ => "small",
+    };
+    let price_id = match stripe_cfg.price_id_for_size(size) {
         Some(p) => p,
         None => {
             return Redirect::to("/billing/upgrade?error=Invalid+plan").into_response();

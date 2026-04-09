@@ -20,12 +20,14 @@ pub type StripeClient = stripe::Client;
 pub struct StripeConfig {
     /// Stripe secret API key.
     pub secret_key: String,
+    /// Stripe publishable key (for client-side if needed).
+    pub publishable_key: Option<String>,
     /// Stripe webhook signing secret.
     pub webhook_secret: Option<String>,
-    /// Price IDs for each paid plan.
-    pub price_starter: Option<String>,
-    pub price_growth: Option<String>,
-    pub price_enterprise: Option<String>,
+    /// Price ID per harness size.
+    pub price_small: Option<String>,
+    pub price_medium: Option<String>,
+    pub price_large: Option<String>,
 }
 
 impl StripeConfig {
@@ -34,19 +36,24 @@ impl StripeConfig {
         let secret_key = std::env::var("AMOS__STRIPE__SECRET_KEY").ok()?;
         Some(Self {
             secret_key,
+            publishable_key: std::env::var("AMOS__STRIPE__PUBLISHABLE_KEY").ok(),
             webhook_secret: std::env::var("AMOS__STRIPE__WEBHOOK_SECRET").ok(),
-            price_starter: std::env::var("AMOS__STRIPE__PRICE_STARTER").ok(),
-            price_growth: std::env::var("AMOS__STRIPE__PRICE_GROWTH").ok(),
-            price_enterprise: std::env::var("AMOS__STRIPE__PRICE_ENTERPRISE").ok(),
+            price_small: std::env::var("AMOS__STRIPE__PRICE_SMALL").ok()
+                // Backwards compat: PRICE_HOSTED maps to small
+                .or_else(|| std::env::var("AMOS__STRIPE__PRICE_HOSTED").ok()),
+            price_medium: std::env::var("AMOS__STRIPE__PRICE_MEDIUM").ok(),
+            price_large: std::env::var("AMOS__STRIPE__PRICE_LARGE").ok(),
         })
     }
 
-    /// Get the Price ID for a plan name.
-    pub fn price_id_for_plan(&self, plan: &str) -> Option<&str> {
-        match plan {
-            "starter" => self.price_starter.as_deref(),
-            "growth" => self.price_growth.as_deref(),
-            "enterprise" => self.price_enterprise.as_deref(),
+    /// Get the Stripe Price ID for a harness size.
+    pub fn price_id_for_size(&self, size: &str) -> Option<&str> {
+        match size {
+            "small" => self.price_small.as_deref(),
+            "medium" => self.price_medium.as_deref(),
+            "large" => self.price_large.as_deref(),
+            // Legacy: plan names map to small
+            "hosted" | "starter" | "growth" | "enterprise" => self.price_small.as_deref(),
             _ => None,
         }
     }

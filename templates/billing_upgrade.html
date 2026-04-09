@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 
-{% block title %}Upgrade Plan - AMOS Platform{% endblock %}
+{% block title %}Deploy Hosted Harness - AMOS Platform{% endblock %}
 
 {% block body %}
 <div class="min-h-full">
@@ -25,101 +25,79 @@
 
   <main class="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
     <div class="text-center mb-10">
-      <h1 class="text-3xl font-bold text-gray-900">Choose Your Plan</h1>
+      <h1 class="text-3xl font-bold text-gray-900">Deploy a Hosted Harness</h1>
       <p class="mt-2 text-sm text-gray-500">
-        Your current plan: <span class="font-semibold capitalize">{{ current_plan }}</span>.
-        AI compute is BYOK (Bring Your Own Key) — you pay Anthropic directly.
+        Choose the right size for your workload. Each harness is billed separately.
+        <br />AI compute is BYOK (Bring Your Own Key) &mdash; you pay your AI provider directly.
       </p>
     </div>
 
-    <div class="grid gap-6 sm:grid-cols-2 lg:grid-cols-4 max-w-5xl mx-auto">
-      <!-- Free -->
-      <div class="rounded-lg border bg-white p-6 shadow-sm {% if current_plan == "free" %}ring-2 ring-indigo-500{% endif %}">
-        <h3 class="text-lg font-semibold text-gray-900">Free</h3>
-        <p class="mt-2 text-3xl font-bold text-gray-900">$0<span class="text-sm font-normal text-gray-500">/mo</span></p>
-        <ul class="mt-4 space-y-2 text-sm text-gray-600">
-          <li>100 conversations/mo</li>
-          <li>1 bot</li>
-          <li>1 GB storage</li>
-          <li>Community support</li>
-        </ul>
-        {% if current_plan == "free" %}
-        <div class="mt-6 text-center text-sm font-medium text-indigo-600">Current plan</div>
-        {% endif %}
-      </div>
-
-      <!-- Starter -->
-      <div class="rounded-lg border bg-white p-6 shadow-sm {% if current_plan == "starter" %}ring-2 ring-indigo-500{% endif %}">
-        <h3 class="text-lg font-semibold text-gray-900">Starter</h3>
+    <div class="grid gap-6 sm:grid-cols-3 max-w-4xl mx-auto">
+      <!-- Small -->
+      <div class="rounded-lg border bg-white p-6 shadow-sm hover:ring-2 hover:ring-indigo-200 transition-all">
+        <h3 class="text-lg font-semibold text-gray-900">Small</h3>
         <p class="mt-2 text-3xl font-bold text-gray-900">$45<span class="text-sm font-normal text-gray-500">/mo</span></p>
         <ul class="mt-4 space-y-2 text-sm text-gray-600">
-          <li>5,000 conversations/mo</li>
-          <li>5 bots</li>
+          <li>1 vCPU</li>
+          <li>2 GB RAM</li>
           <li>10 GB storage</li>
           <li>Email support</li>
-          <li>0.5 vCPU, 1 GB RAM</li>
         </ul>
-        {% if current_plan != "starter" %}
+        <p class="mt-3 text-xs text-gray-400">Good for personal use, small teams, and getting started.</p>
         <form action="/billing/checkout" method="POST" class="mt-6">
-          <input type="hidden" name="plan" value="starter" />
+          <input type="hidden" name="size" value="small" />
           <button type="submit" class="w-full rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500">
-            {% if current_plan == "free" %}Upgrade{% else %}Switch{% endif %} to Starter
+            Deploy Small Harness
           </button>
         </form>
-        {% else %}
-        <div class="mt-6 text-center text-sm font-medium text-indigo-600">Current plan</div>
-        {% endif %}
       </div>
 
-      <!-- Growth -->
-      <div class="rounded-lg border bg-white p-6 shadow-sm {% if current_plan == "growth" %}ring-2 ring-indigo-500{% endif %}">
-        <h3 class="text-lg font-semibold text-gray-900">Growth</h3>
-        <p class="mt-2 text-3xl font-bold text-gray-900">$85<span class="text-sm font-normal text-gray-500">/mo</span></p>
+      <!-- Medium -->
+      <div class="rounded-lg border-2 border-indigo-500 bg-white p-6 shadow-md relative">
+        <span class="absolute -top-3 left-1/2 -translate-x-1/2 inline-flex items-center rounded-full bg-indigo-600 px-3 py-0.5 text-xs font-semibold text-white">Most Popular</span>
+        <h3 class="text-lg font-semibold text-gray-900">Medium</h3>
+        <p class="mt-2 text-3xl font-bold text-gray-900">$95<span class="text-sm font-normal text-gray-500">/mo</span></p>
         <ul class="mt-4 space-y-2 text-sm text-gray-600">
-          <li>50,000 conversations/mo</li>
-          <li>20 bots</li>
-          <li>100 GB storage</li>
+          <li>2 vCPU</li>
+          <li>4 GB RAM</li>
+          <li>50 GB storage</li>
           <li>Priority support</li>
-          <li>1 vCPU, 2 GB RAM</li>
         </ul>
-        {% if current_plan != "growth" %}
+        <p class="mt-3 text-xs text-gray-400">Best for growing businesses and multi-user workloads.</p>
         <form action="/billing/checkout" method="POST" class="mt-6">
-          <input type="hidden" name="plan" value="growth" />
+          <input type="hidden" name="size" value="medium" />
           <button type="submit" class="w-full rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500">
-            {% if current_plan == "free" %}Upgrade{% else %}Switch{% endif %} to Growth
+            Deploy Medium Harness
           </button>
         </form>
-        {% else %}
-        <div class="mt-6 text-center text-sm font-medium text-indigo-600">Current plan</div>
-        {% endif %}
       </div>
 
-      <!-- Enterprise -->
-      <div class="rounded-lg border bg-white p-6 shadow-sm {% if current_plan == "enterprise" %}ring-2 ring-indigo-500{% endif %}">
-        <h3 class="text-lg font-semibold text-gray-900">Enterprise</h3>
-        <p class="mt-2 text-3xl font-bold text-gray-900">$155<span class="text-sm font-normal text-gray-500">/mo</span></p>
+      <!-- Large -->
+      <div class="rounded-lg border bg-white p-6 shadow-sm hover:ring-2 hover:ring-indigo-200 transition-all">
+        <h3 class="text-lg font-semibold text-gray-900">Large</h3>
+        <p class="mt-2 text-3xl font-bold text-gray-900">$195<span class="text-sm font-normal text-gray-500">/mo</span></p>
         <ul class="mt-4 space-y-2 text-sm text-gray-600">
-          <li>Unlimited conversations</li>
-          <li>Unlimited bots</li>
-          <li>Unlimited storage</li>
+          <li>4 vCPU</li>
+          <li>8 GB RAM</li>
+          <li>200 GB storage</li>
           <li>Dedicated support</li>
-          <li>2 vCPU, 4 GB RAM</li>
         </ul>
-        {% if current_plan != "enterprise" %}
+        <p class="mt-3 text-xs text-gray-400">For demanding workloads, large teams, and enterprise use.</p>
         <form action="/billing/checkout" method="POST" class="mt-6">
-          <input type="hidden" name="plan" value="enterprise" />
+          <input type="hidden" name="size" value="large" />
           <button type="submit" class="w-full rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500">
-            {% if current_plan == "free" %}Upgrade{% else %}Switch{% endif %} to Enterprise
+            Deploy Large Harness
           </button>
         </form>
-        {% else %}
-        <div class="mt-6 text-center text-sm font-medium text-indigo-600">Current plan</div>
-        {% endif %}
       </div>
     </div>
 
-    <div class="mt-8 text-center">
-      <a href="/dashboard" class="text-sm text-gray-500 hover:text-gray-700">Back to dashboard</a>
+    <div class="mt-10 text-center space-y-3">
+      <p class="text-sm text-gray-500">
+        Already have infrastructure? <strong>Self-host for free</strong> &mdash;
+        download the Docker image from your <a href="/dashboard" class="text-indigo-600 hover:text-indigo-500 underline">dashboard</a>.
+      </p>
+      <a href="/dashboard" class="text-sm text-gray-500 hover:text-gray-700">&larr; Back to dashboard</a>
     </div>
   </main>
 </div>

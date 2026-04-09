@@ -307,7 +307,7 @@ fn build_catalog() -> ApiCatalog {
                     Endpoint {
                         method: "POST",
                         path: "/api/v1/billing/customers",
-                        description: "Create a customer. Body: {name, email, organization?, plan?: 'free'|'starter'|'growth'|'enterprise'}. Returns API key.",
+                        description: "Create a customer. Body: {name, email, organization?, plan?: 'free'|'hosted'}. Returns API key.",
                         auth: Some("Bearer token"),
                     },
                     Endpoint {
@@ -325,7 +325,7 @@ fn build_catalog() -> ApiCatalog {
                     Endpoint {
                         method: "POST",
                         path: "/api/v1/billing/customers/{id}/subscribe",
-                        description: "Subscribe a customer to a plan. Body: {plan: 'free'|'starter'|'growth'|'enterprise', payment_method_id?}.",
+                        description: "Subscribe a customer to a plan. Body: {plan: 'free'|'hosted', payment_method_id?}.",
                         auth: Some("Bearer token"),
                     },
                     Endpoint {
