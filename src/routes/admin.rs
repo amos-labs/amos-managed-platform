@@ -446,18 +446,31 @@ async fn provision_harness(
         InstanceSize::Large => "large",
     };
 
+    // Check if tenant already has a primary harness.
+    let has_primary = sqlx::query_as::<_, (i64,)>(
+        "SELECT COUNT(*) FROM harness_instances WHERE tenant_id = $1 AND harness_role = 'primary' AND status != 'deprovisioned'",
+    )
+    .bind(tenant_id)
+    .fetch_one(&state.db)
+    .await
+    .map(|(c,)| c > 0)
+    .unwrap_or(false);
+
+    let harness_role = if has_primary { "specialist" } else { "primary" };
+
     // Insert the harness record.
     sqlx::query(
         r#"
         INSERT INTO harness_instances
             (id, tenant_id, name, harness_role, status, instance_size, environment)
-        VALUES ($1, $2, $3, 'primary', 'provisioning', $4, 'development')
+        VALUES ($1, $2, $3, $5, 'provisioning', $4, 'development')
         "#,
     )
     .bind(harness_id)
     .bind(tenant_id)
     .bind(&harness_name)
     .bind(size_str)
+    .bind(harness_role)
     .execute(&state.db)
     .await
     .map_err(|e| {

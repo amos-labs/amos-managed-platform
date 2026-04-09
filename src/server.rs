@@ -69,7 +69,12 @@ pub fn build_http_router(state: PlatformState) -> Router {
                     CorsLayer::new()
                         .allow_origin(Any)
                         .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
-                        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]),
+                        .allow_headers([
+                            header::CONTENT_TYPE,
+                            header::AUTHORIZATION,
+                            "X-Admin-Key".parse().unwrap(),
+                            "X-Harness-Token".parse().unwrap(),
+                        ]),
                 )
                 .layer(axum::middleware::from_fn(middleware::error_handler)),
         )
