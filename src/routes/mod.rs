@@ -4,6 +4,7 @@ use axum::{routing::get, Router};
 
 use crate::state::PlatformState;
 
+pub mod admin;
 pub mod auth;
 pub mod billing;
 pub mod discovery;
@@ -29,6 +30,7 @@ pub fn api_routes() -> Router<PlatformState> {
         .merge(provisioning::routes())
         .merge(sync::routes())
         .merge(releases::routes())
+        .merge(admin::routes())
         // Also serve the catalog at /api/v1 itself
         .route("/", get(discovery::api_catalog))
 }
