@@ -273,6 +273,10 @@ impl EcsProvisioner {
         if !self.brave_api_key.is_empty() {
             env_vars.push(kv("BRAVE_API_KEY", &self.brave_api_key));
         }
+        // Pass JWT secret so harness can validate platform-issued tokens.
+        if let Ok(jwt_secret) = std::env::var("AMOS__AUTH__JWT_SECRET") {
+            env_vars.push(kv("AMOS__AUTH__JWT_SECRET", &jwt_secret));
+        }
 
         // Multi-harness: pass role, packages, and harness ID
         env_vars.push(kv("AMOS_HARNESS_ROLE", &config.harness_role));

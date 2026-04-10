@@ -17,6 +17,9 @@
     {% endif %}
 
     <form class="space-y-5" action="/login" method="POST">
+      {% if let Some(r) = redirect %}
+      <input type="hidden" name="redirect" value="{{ r }}" />
+      {% endif %}
       <div>
         <label for="email" class="block text-sm font-medium text-gray-900">Email address</label>
         <input id="email" name="email" type="email" autocomplete="email" required

@@ -226,6 +226,7 @@ async fn teardown_alb_routing(state: &PlatformState, harness_id: Uuid) {
 #[template(path = "login.html")]
 struct LoginTemplate {
     error: Option<String>,
+    redirect: Option<String>,
 }
 
 #[derive(Template)]
@@ -315,6 +316,7 @@ struct UserInfo {
 struct LoginForm {
     email: String,
     password: String,
+    redirect: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -356,8 +358,12 @@ pub fn routes() -> Router<PlatformState> {
 
 // ── Login ───────────────────────────────────────────────────────────────
 
-async fn login_page() -> impl IntoResponse {
-    HtmlTemplate(LoginTemplate { error: None })
+async fn login_page(uri: axum::http::Uri) -> impl IntoResponse {
+    let redirect = uri
+        .query()
+        .and_then(|q| q.split('&').find_map(|p| p.strip_prefix("redirect=")))
+        .map(|v| urlencoding::decode(v).unwrap_or_default().into_owned());
+    HtmlTemplate(LoginTemplate { error: None, redirect })
 }
 
 async fn login_submit(
@@ -371,6 +377,7 @@ async fn login_submit(
         warn!(ip = %ip, "Login rate limited");
         return HtmlTemplate(LoginTemplate {
             error: Some("Too many login attempts. Please wait a minute and try again.".into()),
+            redirect: form.redirect.clone(),
         })
         .into_response();
     }
@@ -391,6 +398,7 @@ async fn login_submit(
         Ok(None) => {
             return HtmlTemplate(LoginTemplate {
                 error: Some("Invalid email or password.".into()),
+                redirect: form.redirect.clone(),
             })
             .into_response();
         }
@@ -398,6 +406,7 @@ async fn login_submit(
             error!("Login query failed: {}", e);
             return HtmlTemplate(LoginTemplate {
                 error: Some("An internal error occurred.".into()),
+                redirect: form.redirect.clone(),
             })
             .into_response();
         }
@@ -408,6 +417,7 @@ async fn login_submit(
     if !is_active {
         return HtmlTemplate(LoginTemplate {
             error: Some("Account is deactivated.".into()),
+            redirect: form.redirect.clone(),
         })
         .into_response();
     }
@@ -419,6 +429,7 @@ async fn login_submit(
             error!("Password verification error: {}", e);
             return HtmlTemplate(LoginTemplate {
                 error: Some("An internal error occurred.".into()),
+                redirect: form.redirect.clone(),
             })
             .into_response();
         }
@@ -427,6 +438,7 @@ async fn login_submit(
     if !valid {
         return HtmlTemplate(LoginTemplate {
             error: Some("Invalid email or password.".into()),
+            redirect: form.redirect.clone(),
         })
         .into_response();
     }
@@ -448,6 +460,7 @@ async fn login_submit(
             error!("Token creation failed: {}", e);
             return HtmlTemplate(LoginTemplate {
                 error: Some("An internal error occurred.".into()),
+                redirect: form.redirect.clone(),
             })
             .into_response();
         }
@@ -459,11 +472,29 @@ async fn login_submit(
         .execute(&state.db)
         .await;
 
-    // Set httponly cookie and redirect to dashboard
+    // Set httponly cookie for platform
     let cookie = format!(
         "{}={}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}",
         SESSION_COOKIE, token, access_expiry
     );
+
+    // If a redirect URL was provided (e.g., from a harness), redirect there
+    // with the token so the harness can set its own session cookie.
+    if let Some(ref redirect_url) = form.redirect {
+        if redirect_url.contains(".custom.amoslabs.com") || redirect_url.contains("localhost") {
+            // Extract the base URL (up to the path) and redirect to harness callback
+            let harness_base = if let Some(idx) = redirect_url.find(".custom.amoslabs.com") {
+                // Find the end of the hostname
+                let after_host = &redirect_url[idx + ".custom.amoslabs.com".len()..];
+                let path_start = after_host.find('/').map(|i| idx + ".custom.amoslabs.com".len() + i);
+                &redirect_url[..path_start.unwrap_or(redirect_url.len())]
+            } else {
+                redirect_url.as_str()
+            };
+            let callback_url = format!("{}/auth/callback?token={}", harness_base, token);
+            return ([(header::SET_COOKIE, cookie)], Redirect::to(&callback_url)).into_response();
+        }
+    }
 
     ([(header::SET_COOKIE, cookie)], Redirect::to("/dashboard")).into_response()
 }
