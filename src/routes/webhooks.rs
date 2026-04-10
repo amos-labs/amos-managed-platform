@@ -419,13 +419,35 @@ pub async fn provision_harness_for_tenant(state: &PlatformState, tenant_id: Uuid
             .execute(&state.db)
             .await;
 
+        // Create per-harness isolated database.
+        let base_db_url = ecs.harness_database_url();
+        let mut harness_env = HashMap::new();
+        if !base_db_url.is_empty() {
+            match crate::provisioning::db::create_harness_database(base_db_url, harness_id).await {
+                Ok(db_url) => {
+                    let db_name = crate::provisioning::db::database_name_for_harness(harness_id);
+                    harness_env.insert("AMOS__DATABASE__URL".to_string(), db_url);
+                    let _ = sqlx::query(
+                        "UPDATE harness_instances SET database_name = $1 WHERE id = $2",
+                    )
+                    .bind(&db_name)
+                    .bind(harness_id)
+                    .execute(&state.db)
+                    .await;
+                }
+                Err(e) => {
+                    error!("Failed to create harness database: {} — falling back to shared DB", e);
+                }
+            }
+        }
+
         let ecs_config = HarnessConfig {
             customer_id: tenant_id,
             region: "us-east-1".to_string(),
             instance_size: InstanceSize::Small,
             environment: "production".to_string(),
             platform_grpc_url: String::new(),
-            env_vars: HashMap::new(),
+            env_vars: harness_env,
             harness_role: "primary".to_string(),
             packages: vec![],
             harness_id: None,

@@ -1,6 +1,7 @@
 //! Harness provisioning and lifecycle management.
 
 pub mod alb;
+pub mod db;
 pub mod ecs;
 
 use bollard::{

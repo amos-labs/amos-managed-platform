@@ -220,6 +220,59 @@ async fn teardown_alb_routing(state: &PlatformState, harness_id: Uuid) {
     }
 }
 
+/// Resolve the per-harness database URL for an existing harness.
+///
+/// If the harness already has `database_name` set, builds the URL from that.
+/// Otherwise creates a new per-harness database and records the name.
+/// Returns env vars to inject into the harness config. Falls back to shared
+/// DB (empty map) if anything goes wrong.
+async fn resolve_harness_database(
+    db: &sqlx::PgPool,
+    base_db_url: &str,
+    harness_id: Uuid,
+) -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    if base_db_url.is_empty() {
+        return env;
+    }
+
+    // Check if harness already has an isolated database.
+    let existing: Option<String> =
+        sqlx::query_scalar("SELECT database_name FROM harness_instances WHERE id = $1")
+            .bind(harness_id)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+
+    if let Some(db_name) = existing {
+        let db_url = crate::provisioning::db::database_url_for_harness(base_db_url, &db_name);
+        env.insert("AMOS__DATABASE__URL".to_string(), db_url);
+    } else {
+        // Create new per-harness database.
+        match crate::provisioning::db::create_harness_database(base_db_url, harness_id).await {
+            Ok(db_url) => {
+                let db_name = crate::provisioning::db::database_name_for_harness(harness_id);
+                env.insert("AMOS__DATABASE__URL".to_string(), db_url);
+                let _ = sqlx::query(
+                    "UPDATE harness_instances SET database_name = $1 WHERE id = $2",
+                )
+                .bind(&db_name)
+                .bind(harness_id)
+                .execute(db)
+                .await;
+            }
+            Err(e) => {
+                error!(
+                    "Failed to create harness database: {} — falling back to shared DB",
+                    e
+                );
+            }
+        }
+    }
+    env
+}
+
 // ── Template Structs ────────────────────────────────────────────────────
 
 #[derive(Template)]
@@ -1389,13 +1442,17 @@ async fn harness_redeploy(
         // Tear down old ALB routing — the poller will set up new routing for the new task.
         teardown_alb_routing(&state, harness_id).await;
 
+        // Reuse existing per-harness database (or create if migrating from shared DB).
+        let harness_env =
+            resolve_harness_database(&state.db, ecs.harness_database_url(), harness_id).await;
+
         let ecs_config = HarnessConfig {
             customer_id: tenant_id,
             region: "us-east-1".to_string(),
             instance_size: InstanceSize::Small,
             environment: "production".to_string(),
             platform_grpc_url: String::new(),
-            env_vars: HashMap::new(),
+            env_vars: harness_env,
             harness_role: "primary".to_string(),
             packages: vec![],
             harness_id: None,
@@ -1516,13 +1573,17 @@ async fn harness_update(
     };
 
     if let Some(ref ecs) = state.ecs_provisioner {
+        // Resolve per-harness database for the update.
+        let harness_env =
+            resolve_harness_database(&state.db, ecs.harness_database_url(), harness_id).await;
+
         let ecs_config = HarnessConfig {
             customer_id: tenant_id,
             region: "us-east-1".to_string(),
             instance_size: InstanceSize::Small,
             environment: "production".to_string(),
             platform_grpc_url: String::new(),
-            env_vars: HashMap::new(),
+            env_vars: harness_env,
             harness_role: "primary".to_string(),
             packages: vec![],
             harness_id: None,
@@ -1668,13 +1729,17 @@ async fn harness_rollback(
     };
 
     if let Some(ref ecs) = state.ecs_provisioner {
+        // Resolve per-harness database for the rollback.
+        let harness_env =
+            resolve_harness_database(&state.db, ecs.harness_database_url(), harness_id).await;
+
         let ecs_config = HarnessConfig {
             customer_id: tenant_id,
             region: "us-east-1".to_string(),
             instance_size: InstanceSize::Small,
             environment: "production".to_string(),
             platform_grpc_url: String::new(),
-            env_vars: HashMap::new(),
+            env_vars: harness_env,
             harness_role: "primary".to_string(),
             packages: vec![],
             harness_id: None,
@@ -1769,6 +1834,25 @@ async fn harness_delete(
                     cid, harness_id, e
                 );
             }
+        }
+    }
+
+    // Drop the per-harness database if one was created.
+    let db_name: Option<String> =
+        sqlx::query_scalar("SELECT database_name FROM harness_instances WHERE id = $1")
+            .bind(harness_id)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten();
+    if let Some(db_name) = db_name {
+        let base_url = state
+            .ecs_provisioner
+            .as_ref()
+            .map(|e| e.harness_database_url().to_string())
+            .unwrap_or_default();
+        if !base_url.is_empty() {
+            crate::provisioning::db::drop_harness_database(&base_url, &db_name).await;
         }
     }
 
@@ -1911,13 +1995,17 @@ async fn deploy_new_harness(
             .execute(&state.db)
             .await;
 
+        // Create per-harness isolated database.
+        let harness_env =
+            resolve_harness_database(&state.db, ecs.harness_database_url(), harness_id).await;
+
         let ecs_config = HarnessConfig {
             customer_id: tenant_id,
             region: "us-east-1".to_string(),
             instance_size: InstanceSize::Small,
             environment: "production".to_string(),
             platform_grpc_url: String::new(),
-            env_vars: HashMap::new(),
+            env_vars: harness_env,
             harness_role: "primary".to_string(),
             packages: vec![],
             harness_id: None,

@@ -510,6 +510,11 @@ impl EcsProvisioner {
         Ok(())
     }
 
+    /// Get the base harness database URL (used for creating per-harness databases).
+    pub fn harness_database_url(&self) -> &str {
+        &self.harness_database_url
+    }
+
     /// Get logs hint — ECS logs are in CloudWatch, not fetchable inline.
     pub fn logs_hint(&self, tenant_slug: &str) -> String {
         format!(
