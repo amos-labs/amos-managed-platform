@@ -274,6 +274,12 @@ struct BillingUpgradeTemplate {
     current_plan: String,
 }
 
+#[derive(Template)]
+#[template(path = "self_host.html")]
+struct SelfHostTemplate {
+    tenant_name: String,
+}
+
 // ── View model types ────────────────────────────────────────────────────
 
 #[allow(dead_code)]
@@ -353,6 +359,7 @@ pub fn routes() -> Router<PlatformState> {
         .route("/dashboard/harness/{id}/update", post(harness_update))
         .route("/dashboard/harness/{id}/rollback", post(harness_rollback))
         .route("/dashboard/harness/{id}/delete", post(harness_delete))
+        .route("/self-host", get(self_host_page))
         .route("/logout", post(logout_submit))
 }
 
@@ -749,7 +756,7 @@ async fn dashboard_page(
     // Fetch harness instances (including endpoint info and version tracking).
     let harness_rows = sqlx::query_as::<_, (Uuid, String, Option<String>, String, String, bool, Option<i32>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)>(
         "SELECT id, status, subdomain, region, instance_size, healthy, external_port, internal_url, container_id, image_tag, previous_image_tag, name
-         FROM harness_instances WHERE tenant_id = $1 ORDER BY created_at DESC"
+         FROM harness_instances WHERE tenant_id = $1 AND status != 'deprovisioned' ORDER BY created_at DESC"
     )
     .bind(tenant_id)
     .fetch_all(&state.db)
@@ -2002,6 +2009,33 @@ async fn billing_upgrade_page(
         current_plan,
     })
     .into_response()
+}
+
+// ── Self-Host ──────────────────────────────────────────────────────────
+
+async fn self_host_page(
+    State(state): State<PlatformState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let claims = match extract_session_claims(&state, &headers) {
+        Some(c) => c,
+        None => return Redirect::to("/login").into_response(),
+    };
+
+    let tenant_id: Uuid = match claims.tenant_id.parse() {
+        Ok(id) => id,
+        Err(_) => return Redirect::to("/login").into_response(),
+    };
+
+    let tenant_name = sqlx::query_scalar::<_, String>("SELECT name FROM tenants WHERE id = $1")
+        .bind(tenant_id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "Unknown".into());
+
+    HtmlTemplate(SelfHostTemplate { tenant_name }).into_response()
 }
 
 /// Form for the checkout button on the upgrade page.

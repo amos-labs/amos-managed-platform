@@ -160,6 +160,7 @@ pub fn routes() -> Router<PlatformState> {
         .route("/admin/tenants/{id}/upgrade", post(upgrade_plan))
         .route("/admin/tenants/{id}/provision", post(provision_harness))
         .route("/admin/harnesses/{id}/restart", post(restart_harness))
+        .route("/admin/harnesses/{id}/rename", post(rename_harness))
         .route("/admin/harnesses/{id}/deprovision", post(deprovision_harness))
         .route("/admin/stats", get(get_stats))
 }
@@ -712,6 +713,55 @@ async fn restart_harness(
         status: "running".into(),
         restarted_at: Utc::now(),
     }))
+}
+
+/// POST /api/v1/admin/harnesses/{id}/rename
+///
+/// Rename a harness instance.
+async fn rename_harness(
+    _auth: AdminAuth,
+    State(state): State<PlatformState>,
+    Path(harness_id): Path<Uuid>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let name = body["name"].as_str().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Missing 'name' field".into(),
+            }),
+        )
+    })?;
+
+    let rows = sqlx::query("UPDATE harness_instances SET name = $1 WHERE id = $2")
+        .bind(name)
+        .bind(harness_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Database error: {}", e),
+                }),
+            )
+        })?;
+
+    if rows.rows_affected() == 0 {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "Harness not found".into(),
+            }),
+        ));
+    }
+
+    tracing::info!(harness_id = %harness_id, new_name = %name, "Admin renamed harness");
+
+    Ok(Json(serde_json::json!({
+        "harness_id": harness_id,
+        "name": name
+    })))
 }
 
 /// POST /api/v1/admin/harnesses/{id}/deprovision

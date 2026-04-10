@@ -1,0 +1,218 @@
+{% extends "base.html" %}
+
+{% block title %}Self-Host AMOS - Free{% endblock %}
+
+{% block body %}
+<div class="min-h-full bg-gray-50">
+  <!-- Navigation -->
+  <nav class="border-b border-gray-200 bg-white">
+    <div class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
+      <div class="flex h-14 justify-between">
+        <div class="flex items-center space-x-8">
+          <span class="text-lg font-bold text-gray-900">AMOS</span>
+          <a href="/dashboard" class="border-b-2 border-transparent px-1 pt-1 text-sm font-medium text-gray-500 hover:border-gray-300 hover:text-gray-700">Dashboard</a>
+          <a href="/settings" class="border-b-2 border-transparent px-1 pt-1 text-sm font-medium text-gray-500 hover:border-gray-300 hover:text-gray-700">Settings</a>
+        </div>
+        <div class="flex items-center">
+          <span class="text-sm text-gray-500">{{ tenant_name }}</span>
+        </div>
+      </div>
+    </div>
+  </nav>
+
+  <main class="mx-auto max-w-4xl px-4 py-10 sm:px-6 lg:px-8">
+    <div class="mb-6">
+      <a href="/dashboard" class="text-sm text-gray-500 hover:text-gray-700">&larr; Back to Dashboard</a>
+    </div>
+
+    <h1 class="text-3xl font-bold text-gray-900">Self-Host AMOS</h1>
+    <p class="mt-2 text-gray-600">Run your own AMOS harness on your infrastructure. Free forever, Apache 2.0 licensed.</p>
+
+    <!-- Quick Start -->
+    <div class="mt-8 rounded-lg border bg-white p-6 shadow-sm">
+      <h2 class="text-lg font-semibold text-gray-900 mb-1">Quick Start</h2>
+      <p class="text-sm text-gray-500 mb-4">Pull the image and run with Docker. Requires PostgreSQL and Redis.</p>
+      <div class="rounded-md bg-gray-900 p-4 font-mono text-sm text-green-400 overflow-x-auto">
+        <div class="text-gray-500"># Pull the latest AMOS harness image</div>
+        <div>docker pull ghcr.io/amos-labs/amos-harness:latest</div>
+        <div class="mt-3 text-gray-500"># Run with required environment variables</div>
+        <div>docker run -d --name amos-harness \</div>
+        <div class="pl-4">-p 3000:3000 \</div>
+        <div class="pl-4">-e AMOS__DATABASE__URL=postgres://user:pass@host:5432/amos \</div>
+        <div class="pl-4">-e AMOS__REDIS__URL=redis://host:6379 \</div>
+        <div class="pl-4">-e AWS_PROFILE=your-profile \</div>
+        <div class="pl-4">ghcr.io/amos-labs/amos-harness:latest</div>
+      </div>
+    </div>
+
+    <!-- Platform tabs -->
+    <div class="mt-8 space-y-6">
+      <!-- macOS -->
+      <div class="rounded-lg border bg-white shadow-sm">
+        <div class="border-b px-6 py-4">
+          <h3 class="text-base font-semibold text-gray-900">macOS (Docker Desktop)</h3>
+        </div>
+        <div class="px-6 py-5 space-y-4">
+          <div>
+            <h4 class="text-sm font-medium text-gray-700 mb-2">1. Install Docker Desktop</h4>
+            <p class="text-sm text-gray-500">Download from <a href="https://www.docker.com/products/docker-desktop/" target="_blank" class="text-indigo-600 hover:text-indigo-500 underline">docker.com</a> or install via Homebrew:</p>
+            <div class="mt-2 rounded-md bg-gray-900 p-3 font-mono text-sm text-green-400">brew install --cask docker</div>
+          </div>
+          <div>
+            <h4 class="text-sm font-medium text-gray-700 mb-2">2. Start infrastructure</h4>
+            <p class="text-sm text-gray-500">Run PostgreSQL and Redis:</p>
+            <div class="mt-2 rounded-md bg-gray-900 p-3 font-mono text-sm text-green-400 overflow-x-auto">
+              <div>docker run -d --name amos-postgres \</div>
+              <div class="pl-4">-e POSTGRES_USER=amos -e POSTGRES_PASSWORD=amos -e POSTGRES_DB=amos \</div>
+              <div class="pl-4">-p 5432:5432 postgres:16</div>
+              <div class="mt-2">docker run -d --name amos-redis -p 6379:6379 redis:7-alpine</div>
+            </div>
+          </div>
+          <div>
+            <h4 class="text-sm font-medium text-gray-700 mb-2">3. Run the harness</h4>
+            <div class="mt-2 rounded-md bg-gray-900 p-3 font-mono text-sm text-green-400 overflow-x-auto">
+              <div>docker run -d --name amos-harness \</div>
+              <div class="pl-4">-p 3000:3000 \</div>
+              <div class="pl-4">-e AMOS__DATABASE__URL=postgres://amos:amos@host.docker.internal:5432/amos \</div>
+              <div class="pl-4">-e AMOS__REDIS__URL=redis://host.docker.internal:6379 \</div>
+              <div class="pl-4">-e AWS_PROFILE=default \</div>
+              <div class="pl-4">ghcr.io/amos-labs/amos-harness:latest</div>
+            </div>
+          </div>
+          <div>
+            <h4 class="text-sm font-medium text-gray-700 mb-2">4. Open in browser</h4>
+            <p class="text-sm text-gray-500">Visit <code class="bg-gray-100 rounded px-1.5 py-0.5 text-gray-800">http://localhost:3000</code> to access your harness.</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Windows / Linux -->
+      <div class="rounded-lg border bg-white shadow-sm">
+        <div class="border-b px-6 py-4">
+          <h3 class="text-base font-semibold text-gray-900">Windows &amp; Linux (Docker)</h3>
+        </div>
+        <div class="px-6 py-5 space-y-4">
+          <div>
+            <h4 class="text-sm font-medium text-gray-700 mb-2">1. Install Docker</h4>
+            <p class="text-sm text-gray-500"><strong>Windows:</strong> Install <a href="https://www.docker.com/products/docker-desktop/" target="_blank" class="text-indigo-600 hover:text-indigo-500 underline">Docker Desktop for Windows</a> (requires WSL2).</p>
+            <p class="text-sm text-gray-500 mt-1"><strong>Linux:</strong> Install Docker Engine via your package manager.</p>
+            <div class="mt-2 rounded-md bg-gray-900 p-3 font-mono text-sm text-green-400">
+              <div class="text-gray-500"># Ubuntu/Debian</div>
+              <div>curl -fsSL https://get.docker.com | sh</div>
+            </div>
+          </div>
+          <div>
+            <h4 class="text-sm font-medium text-gray-700 mb-2">2. Use Docker Compose (recommended)</h4>
+            <p class="text-sm text-gray-500">Save this as <code class="bg-gray-100 rounded px-1.5 py-0.5 text-gray-800">docker-compose.yml</code> and run <code class="bg-gray-100 rounded px-1.5 py-0.5 text-gray-800">docker compose up -d</code>:</p>
+            <div class="mt-2 rounded-md bg-gray-900 p-3 font-mono text-sm text-green-400 overflow-x-auto whitespace-pre">services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: amos
+      POSTGRES_PASSWORD: amos
+      POSTGRES_DB: amos
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+
+  amos-harness:
+    image: ghcr.io/amos-labs/amos-harness:latest
+    ports: ["3000:3000"]
+    environment:
+      AMOS__DATABASE__URL: postgres://amos:amos@postgres:5432/amos
+      AMOS__REDIS__URL: redis://redis:6379
+    depends_on: [postgres, redis]
+
+volumes:
+  pgdata:</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- CLI -->
+      <div class="rounded-lg border bg-white shadow-sm">
+        <div class="border-b px-6 py-4">
+          <h3 class="text-base font-semibold text-gray-900">CLI (amos-cli)</h3>
+        </div>
+        <div class="px-6 py-5 space-y-4">
+          <div>
+            <h4 class="text-sm font-medium text-gray-700 mb-2">Install the AMOS CLI</h4>
+            <p class="text-sm text-gray-500">The CLI can manage local harness instances, run migrations, and configure your environment.</p>
+            <div class="mt-2 rounded-md bg-gray-900 p-3 font-mono text-sm text-green-400 overflow-x-auto">
+              <div class="text-gray-500"># Install via cargo (Rust toolchain required)</div>
+              <div>cargo install amos-cli</div>
+              <div class="mt-2 text-gray-500"># Or build from source</div>
+              <div>git clone https://github.com/amos-labs/amos-automate.git</div>
+              <div>cd amos-automate</div>
+              <div>cargo build --release --bin amos</div>
+              <div>./target/release/amos --help</div>
+            </div>
+          </div>
+          <div>
+            <h4 class="text-sm font-medium text-gray-700 mb-2">Setup and run</h4>
+            <div class="mt-2 rounded-md bg-gray-900 p-3 font-mono text-sm text-green-400 overflow-x-auto">
+              <div class="text-gray-500"># Initialize local environment</div>
+              <div>./scripts/dev-setup.sh</div>
+              <div class="mt-2 text-gray-500"># Run the harness</div>
+              <div>cargo run --bin amos-harness</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Requirements -->
+      <div class="rounded-lg border bg-white shadow-sm">
+        <div class="border-b px-6 py-4">
+          <h3 class="text-base font-semibold text-gray-900">Requirements</h3>
+        </div>
+        <div class="px-6 py-5">
+          <div class="grid gap-4 sm:grid-cols-2">
+            <div>
+              <h4 class="text-sm font-medium text-gray-700">Infrastructure</h4>
+              <ul class="mt-2 text-sm text-gray-500 space-y-1">
+                <li>PostgreSQL 15+ (with pgvector extension)</li>
+                <li>Redis 7+</li>
+                <li>2+ GB RAM</li>
+                <li>2+ CPU cores</li>
+              </ul>
+            </div>
+            <div>
+              <h4 class="text-sm font-medium text-gray-700">AI Provider</h4>
+              <ul class="mt-2 text-sm text-gray-500 space-y-1">
+                <li>AWS account with Bedrock access (Claude)</li>
+                <li>Or bring your own API key (BYOK)</li>
+                <li>Configure via the harness Settings page</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Help -->
+      <div class="rounded-lg border border-indigo-200 bg-indigo-50 p-6">
+        <div class="flex items-start gap-4">
+          <div>
+            <h3 class="text-sm font-semibold text-indigo-900">Need help?</h3>
+            <p class="mt-1 text-sm text-indigo-700">
+              Join our community or check the source code for detailed configuration options.
+            </p>
+            <div class="mt-3 flex gap-3">
+              <a href="https://github.com/amos-labs/amos-automate" target="_blank"
+                 class="inline-flex items-center rounded-md bg-white px-3 py-1.5 text-sm font-medium text-gray-700 shadow-sm border border-gray-300 hover:bg-gray-50">
+                GitHub
+              </a>
+              <a href="/billing/upgrade"
+                 class="inline-flex items-center rounded-md bg-indigo-600 px-3 py-1.5 text-sm font-medium text-white shadow-sm hover:bg-indigo-500">
+                Or let us host it for you &rarr;
+              </a>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+{% endblock %}

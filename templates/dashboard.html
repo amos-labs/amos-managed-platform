@@ -37,7 +37,7 @@
           + Deploy Hosted Harness
         </a>
         {% endif %}
-        <a href="https://docs.amoslabs.com/self-host" target="_blank"
+        <a href="/self-host"
            class="inline-flex items-center rounded-md border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 shadow-sm hover:bg-gray-50">
           Self-Host (Free)
         </a>
@@ -208,13 +208,6 @@
                 Open API &rarr;
               </a>
             {% endif %}
-            <form action="/dashboard/harness/{{ inst.full_id }}/delete" method="POST"
-                  class="inline"
-                  onsubmit="return confirm('Are you sure you want to delete this harness instance? This cannot be undone.');">
-              <button type="submit" class="inline-flex items-center rounded-md bg-red-50 px-3 py-1.5 text-xs font-medium text-red-700 hover:bg-red-100">
-                Delete
-              </button>
-            </form>
           </div>
         </div>
         {% endfor %}
