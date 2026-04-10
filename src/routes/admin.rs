@@ -159,6 +159,7 @@ pub fn routes() -> Router<PlatformState> {
         .route("/admin/tenants/{id}/upgrade", post(upgrade_plan))
         .route("/admin/tenants/{id}/provision", post(provision_harness))
         .route("/admin/harnesses/{id}/restart", post(restart_harness))
+        .route("/admin/harnesses/{id}/deprovision", post(deprovision_harness))
         .route("/admin/stats", get(get_stats))
 }
 
@@ -468,7 +469,7 @@ async fn provision_harness(
         r#"
         INSERT INTO harness_instances
             (id, tenant_id, name, harness_role, status, instance_size, environment)
-        VALUES ($1, $2, $3, $5, 'provisioning', $4, 'development')
+        VALUES ($1, $2, $3, $5, 'provisioning', $4, 'production')
         "#,
     )
     .bind(harness_id)
@@ -497,10 +498,10 @@ async fn provision_harness(
         customer_id: tenant_id,
         region: "us-west-2".into(),
         instance_size,
-        environment: "development".into(),
+        environment: "production".into(),
         platform_grpc_url: platform_url,
         env_vars: std::collections::HashMap::new(),
-        harness_role: "primary".to_string(),
+        harness_role: harness_role.to_string(),
         packages: vec![],
         harness_id: Some(harness_id),
     };
@@ -688,6 +689,72 @@ async fn restart_harness(
         status: "running".into(),
         restarted_at: Utc::now(),
     }))
+}
+
+/// POST /api/v1/admin/harnesses/{id}/deprovision
+///
+/// Mark a harness as deprovisioned and stop its container/task if running.
+async fn deprovision_harness(
+    _auth: AdminAuth,
+    State(state): State<PlatformState>,
+    Path(harness_id): Path<Uuid>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let row = sqlx::query_as::<_, (Option<String>, String)>(
+        "SELECT container_id, status FROM harness_instances WHERE id = $1",
+    )
+    .bind(harness_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Database error: {}", e),
+            }),
+        )
+    })?;
+
+    let (container_id, current_status) = row.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "Harness not found".into(),
+            }),
+        )
+    })?;
+
+    // Try to stop the container/task if it has one
+    if let Some(cid) = &container_id {
+        if current_status != "stopped" && current_status != "error" {
+            if let Some(ecs) = state.ecs_provisioner.as_ref() {
+                let _ = ecs.stop(cid).await;
+            } else if let Some(manager) = state.harness_manager.as_ref() {
+                let _ = manager.stop(cid).await;
+            }
+        }
+    }
+
+    sqlx::query(
+        "UPDATE harness_instances SET status = 'deprovisioned', stopped_at = NOW() WHERE id = $1",
+    )
+    .bind(harness_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Database error: {}", e),
+            }),
+        )
+    })?;
+
+    tracing::info!(harness_id = %harness_id, "Admin deprovisioned harness");
+
+    Ok(Json(serde_json::json!({
+        "harness_id": harness_id,
+        "status": "deprovisioned"
+    })))
 }
 
 /// GET /api/v1/admin/stats
