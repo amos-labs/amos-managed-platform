@@ -547,7 +547,7 @@ async fn provision_harness(
                 container_id = Some(task_arn.clone());
                 provider = "ecs".to_string();
                 let _ = sqlx::query(
-                    "UPDATE harness_instances SET container_id = $1, status = 'provisioning' WHERE id = $2",
+                    "UPDATE harness_instances SET container_id = $1, status = 'running', started_at = NOW() WHERE id = $2",
                 )
                 .bind(&task_arn)
                 .bind(harness_id)
@@ -590,7 +590,7 @@ async fn provision_harness(
         StatusCode::CREATED,
         Json(ProvisionResponse {
             harness_id,
-            status: "provisioning".into(),
+            status: if provider == "ecs" { "running" } else { "provisioning" }.into(),
             container_id,
             provisioned_at: Utc::now(),
             provider,
