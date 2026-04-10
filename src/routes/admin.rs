@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 use crate::{
     provisioning::{HarnessConfig, InstanceSize},
+    routes::ui::spawn_ecs_status_poller_public,
     state::PlatformState,
 };
 
@@ -464,12 +465,22 @@ async fn provision_harness(
 
     let harness_role = if has_primary { "specialist" } else { "primary" };
 
+    // Look up tenant slug for subdomain generation.
+    let tenant_slug: String = sqlx::query_scalar("SELECT slug FROM tenants WHERE id = $1")
+        .bind(tenant_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or_else(|_| format!("{}", &tenant_id.to_string()[..8]));
+
+    // Generate subdomain: {slug}-{4char} (matches normal provisioning flow).
+    let subdomain = format!("{}-{}", tenant_slug, &harness_id.to_string()[..4]);
+
     // Insert the harness record.
     sqlx::query(
         r#"
         INSERT INTO harness_instances
-            (id, tenant_id, name, harness_role, status, instance_size, environment)
-        VALUES ($1, $2, $3, $5, 'provisioning', $4, 'production')
+            (id, tenant_id, name, harness_role, status, instance_size, environment, subdomain)
+        VALUES ($1, $2, $3, $5, 'provisioning', $4, 'production', $6)
         "#,
     )
     .bind(harness_id)
@@ -477,6 +488,7 @@ async fn provision_harness(
     .bind(&harness_name)
     .bind(size_str)
     .bind(harness_role)
+    .bind(&subdomain)
     .execute(&state.db)
     .await
     .map_err(|e| {
@@ -547,12 +559,23 @@ async fn provision_harness(
                 container_id = Some(task_arn.clone());
                 provider = "ecs".to_string();
                 let _ = sqlx::query(
-                    "UPDATE harness_instances SET container_id = $1, status = 'running', started_at = NOW() WHERE id = $2",
+                    "UPDATE harness_instances SET container_id = $1, status = 'provisioning' WHERE id = $2",
                 )
                 .bind(&task_arn)
                 .bind(harness_id)
                 .execute(&state.db)
                 .await;
+
+                // Spawn background poller: monitors ECS task, sets up ALB routing,
+                // updates status to 'running' once the harness is reachable.
+                spawn_ecs_status_poller_public(
+                    ecs.clone(),
+                    state.db.clone(),
+                    task_arn.clone(),
+                    harness_id,
+                    state.alb_router.clone(),
+                    Some(subdomain.clone()),
+                );
             }
             Err(e) => {
                 let _ = sqlx::query("UPDATE harness_instances SET status = 'error' WHERE id = $1")
@@ -590,7 +613,7 @@ async fn provision_harness(
         StatusCode::CREATED,
         Json(ProvisionResponse {
             harness_id,
-            status: if provider == "ecs" { "running" } else { "provisioning" }.into(),
+            status: "provisioning".into(),
             container_id,
             provisioned_at: Utc::now(),
             provider,
