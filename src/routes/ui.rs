@@ -187,6 +187,11 @@ fn spawn_ecs_status_poller(
     });
 }
 
+/// Public wrapper for admin API access.
+pub async fn teardown_alb_routing_public(state: &PlatformState, harness_id: Uuid) {
+    teardown_alb_routing(state, harness_id).await;
+}
+
 /// Helper: tear down ALB routing for a harness instance (used by stop/delete).
 async fn teardown_alb_routing(state: &PlatformState, harness_id: Uuid) {
     if let Some(ref router) = state.alb_router {
@@ -218,6 +223,15 @@ async fn teardown_alb_routing(state: &PlatformState, harness_id: Uuid) {
             }
         }
     }
+}
+
+/// Public wrapper for admin API access.
+pub async fn resolve_harness_database_public(
+    db: &sqlx::PgPool,
+    base_db_url: &str,
+    harness_id: Uuid,
+) -> HashMap<String, String> {
+    resolve_harness_database(db, base_db_url, harness_id).await
 }
 
 /// Resolve the per-harness database URL for an existing harness.

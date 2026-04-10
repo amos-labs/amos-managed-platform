@@ -160,6 +160,7 @@ pub fn routes() -> Router<PlatformState> {
         .route("/admin/tenants/{id}/upgrade", post(upgrade_plan))
         .route("/admin/tenants/{id}/provision", post(provision_harness))
         .route("/admin/harnesses/{id}/restart", post(restart_harness))
+        .route("/admin/harnesses/{id}/redeploy", post(redeploy_harness))
         .route("/admin/harnesses/{id}/rename", post(rename_harness))
         .route("/admin/harnesses/{id}/deprovision", post(deprovision_harness))
         .route("/admin/stats", get(get_stats))
@@ -761,6 +762,129 @@ async fn rename_harness(
     Ok(Json(serde_json::json!({
         "harness_id": harness_id,
         "name": name
+    })))
+}
+
+/// POST /api/v1/admin/harnesses/{id}/redeploy
+///
+/// Stop the current harness task, create a per-harness isolated database
+/// (if one doesn't already exist), and provision a new ECS task.
+async fn redeploy_harness(
+    _auth: AdminAuth,
+    State(state): State<PlatformState>,
+    Path(harness_id): Path<Uuid>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    // Look up harness + tenant info.
+    let row = sqlx::query_as::<_, (Option<String>, Uuid, String)>(
+        "SELECT h.container_id, h.tenant_id, t.slug \
+         FROM harness_instances h JOIN tenants t ON t.id = h.tenant_id \
+         WHERE h.id = $1",
+    )
+    .bind(harness_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Database error: {}", e),
+            }),
+        )
+    })?;
+
+    let (container_id, tenant_id, tenant_slug) = row.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "Harness not found".into(),
+            }),
+        )
+    })?;
+
+    let ecs = state.ecs_provisioner.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "ECS provisioner not available".into(),
+            }),
+        )
+    })?;
+
+    // Stop old task.
+    if let Some(cid) = &container_id {
+        let _ = ecs.stop(cid).await;
+    }
+
+    // Tear down ALB routing.
+    crate::routes::ui::teardown_alb_routing_public(&state, harness_id).await;
+
+    let _ = sqlx::query(
+        "UPDATE harness_instances SET status = 'provisioning', healthy = FALSE WHERE id = $1",
+    )
+    .bind(harness_id)
+    .execute(&state.db)
+    .await;
+
+    // Resolve per-harness isolated database.
+    let base_db_url = ecs.harness_database_url();
+    let harness_env =
+        crate::routes::ui::resolve_harness_database_public(&state.db, base_db_url, harness_id)
+            .await;
+
+    let ecs_config = HarnessConfig {
+        customer_id: tenant_id,
+        region: "us-east-1".to_string(),
+        instance_size: InstanceSize::Small,
+        environment: "production".to_string(),
+        platform_grpc_url: String::new(),
+        env_vars: harness_env,
+        harness_role: "primary".to_string(),
+        packages: vec![],
+        harness_id: None,
+    };
+
+    let task_arn = ecs.provision(&ecs_config, &tenant_slug).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to provision: {}", e),
+            }),
+        )
+    })?;
+
+    let _ = sqlx::query(
+        "UPDATE harness_instances SET container_id = $1, provisioned_at = NOW() WHERE id = $2",
+    )
+    .bind(&task_arn)
+    .bind(harness_id)
+    .execute(&state.db)
+    .await;
+
+    // Fetch subdomain for ALB routing.
+    let subdomain: Option<String> =
+        sqlx::query_scalar("SELECT subdomain FROM harness_instances WHERE id = $1")
+            .bind(harness_id)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten();
+
+    // Poll ECS in the background.
+    spawn_ecs_status_poller_public(
+        ecs.clone(),
+        state.db.clone(),
+        task_arn.clone(),
+        harness_id,
+        state.alb_router.clone(),
+        subdomain,
+    );
+
+    tracing::info!(harness_id = %harness_id, task_arn = %task_arn, "Admin redeployed harness");
+
+    Ok(Json(serde_json::json!({
+        "harness_id": harness_id,
+        "task_arn": task_arn,
+        "status": "provisioning"
     })))
 }
 
