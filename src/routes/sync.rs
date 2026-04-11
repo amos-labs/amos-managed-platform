@@ -254,6 +254,14 @@ async fn get_config(
 
 // ── Activity Ingest ─────────────────────────────────────────────────────
 
+/// Per-model token usage entry from harness activity reports.
+#[derive(Debug, Deserialize)]
+struct ModelUsageEntry {
+    model_id: String,
+    tokens_input: u64,
+    tokens_output: u64,
+}
+
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct ActivityReport {
@@ -265,9 +273,14 @@ struct ActivityReport {
     tokens_output: u64,
     tools_executed: u64,
     models_used: Vec<String>,
+    /// Per-model token breakdown for metered billing.
+    #[serde(default)]
+    model_usage: Vec<ModelUsageEntry>,
     timestamp: String,
     /// Optional tenant_id for identifying which harness is reporting
     tenant_id: Option<String>,
+    /// Optional harness_id for per-harness billing
+    harness_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -355,6 +368,48 @@ async fn receive_activity(
                             }
                             Err(e) => {
                                 tracing::warn!("Failed to update usage metrics: {}", e);
+                            }
+                        }
+
+                        // Insert per-model usage records for metered billing
+                        if !report.model_usage.is_empty() {
+                            let harness_id = report
+                                .harness_id
+                                .as_deref()
+                                .and_then(|s| uuid::Uuid::parse_str(s).ok());
+
+                            for entry in &report.model_usage {
+                                if let Some(hid) = harness_id {
+                                    let cost = crate::billing::metered_billing::calculate_cost_microcents(
+                                        &entry.model_id,
+                                        entry.tokens_input,
+                                        entry.tokens_output,
+                                    );
+                                    let _ = sqlx::query(
+                                        r#"
+                                        INSERT INTO llm_usage_records
+                                        (tenant_id, harness_id, model_id, tokens_input, tokens_output,
+                                         cost_microcents, period_start, period_end)
+                                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                                        "#,
+                                    )
+                                    .bind(tenant_id)
+                                    .bind(hid)
+                                    .bind(&entry.model_id)
+                                    .bind(entry.tokens_input as i64)
+                                    .bind(entry.tokens_output as i64)
+                                    .bind(cost)
+                                    .bind(period_start_utc)
+                                    .bind(period_end_utc)
+                                    .execute(&state.db)
+                                    .await
+                                    .map_err(|e| {
+                                        tracing::warn!(
+                                            "Failed to insert llm_usage_record for {}: {}",
+                                            entry.model_id, e
+                                        );
+                                    });
+                                }
                             }
                         }
                     }

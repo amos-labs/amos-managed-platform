@@ -1,5 +1,6 @@
 //! Customer billing and subscription management.
 
+pub mod metered_billing;
 pub mod stripe_service;
 
 use chrono::{DateTime, Utc};

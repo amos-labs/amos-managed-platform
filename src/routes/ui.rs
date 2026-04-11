@@ -260,6 +260,11 @@ async fn resolve_harness_database(
             .flatten();
 
     if let Some(db_name) = existing {
+        // Ensure pgvector is installed on existing databases (may have been
+        // created before the extension was added).
+        if let Err(e) = crate::provisioning::db::ensure_pgvector(base_db_url, &db_name).await {
+            tracing::warn!("Failed to ensure pgvector on {}: {}", db_name, e);
+        }
         let db_url = crate::provisioning::db::database_url_for_harness(base_db_url, &db_name);
         env.insert("AMOS__DATABASE__URL".to_string(), db_url);
     } else {

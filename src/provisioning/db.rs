@@ -76,7 +76,45 @@ pub async fn create_harness_database(base_url: &str, harness_id: Uuid) -> Result
         info!(db_name = %db_name, harness_id = %harness_id, "Created per-harness database");
     }
 
-    Ok(database_url_for_harness(base_url, &db_name))
+    // Ensure pgvector extension is installed (required for memory embeddings).
+    // Connect to the harness database itself to run CREATE EXTENSION.
+    let harness_url = database_url_for_harness(base_url, &db_name);
+    let harness_opts: PgConnectOptions = harness_url
+        .parse()
+        .map_err(|e| AmosError::Internal(format!("Invalid harness DB URL: {}", e)))?;
+    let mut harness_conn = PgConnection::connect_with(&harness_opts.disable_statement_logging())
+        .await
+        .map_err(|e| AmosError::Internal(format!("Failed to connect to harness DB for extensions: {}", e)))?;
+
+    sqlx::query("CREATE EXTENSION IF NOT EXISTS vector")
+        .execute(&mut harness_conn)
+        .await
+        .map_err(|e| AmosError::Internal(format!("Failed to create pgvector extension: {}", e)))?;
+
+    info!(db_name = %db_name, "pgvector extension ensured");
+
+    Ok(harness_url)
+}
+
+/// Ensure pgvector extension is installed on an existing harness database.
+/// Called when the database already exists but may have been created before
+/// the extension was added.
+pub async fn ensure_pgvector(base_url: &str, db_name: &str) -> Result<()> {
+    let harness_url = database_url_for_harness(base_url, db_name);
+    let opts: PgConnectOptions = harness_url
+        .parse()
+        .map_err(|e| AmosError::Internal(format!("Invalid harness DB URL: {}", e)))?;
+    let mut conn = PgConnection::connect_with(&opts.disable_statement_logging())
+        .await
+        .map_err(|e| AmosError::Internal(format!("Failed to connect to harness DB: {}", e)))?;
+
+    sqlx::query("CREATE EXTENSION IF NOT EXISTS vector")
+        .execute(&mut conn)
+        .await
+        .map_err(|e| AmosError::Internal(format!("Failed to create pgvector extension: {}", e)))?;
+
+    info!(db_name = %db_name, "pgvector extension ensured");
+    Ok(())
 }
 
 /// Drop a harness database. Best-effort — logs errors but doesn't fail the caller.

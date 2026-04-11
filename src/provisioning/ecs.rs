@@ -278,6 +278,9 @@ impl EcsProvisioner {
             env_vars.push(kv("AMOS__AUTH__JWT_SECRET", &jwt_secret));
         }
 
+        // Managed deployments get shared Bedrock access (self-hosted won't have this).
+        env_vars.push(kv("SHARED_BEDROCK_ENABLED", "true"));
+
         // Multi-harness: pass role, packages, and harness ID
         env_vars.push(kv("AMOS_HARNESS_ROLE", &config.harness_role));
         if !config.packages.is_empty() {
