@@ -371,15 +371,35 @@ async fn receive_activity(
                             }
                         }
 
-                        // Insert per-model usage records for metered billing
+                        // Insert per-model usage records for metered billing.
+                        // Every token must be tracked — warn loudly if harness_id is missing.
                         if !report.model_usage.is_empty() {
-                            let harness_id = report
+                            let mut hid = report
                                 .harness_id
                                 .as_deref()
                                 .and_then(|s| uuid::Uuid::parse_str(s).ok());
 
-                            for entry in &report.model_usage {
-                                if let Some(hid) = harness_id {
+                            // Fallback: look up harness from tenant if not in report
+                            if hid.is_none() {
+                                hid = sqlx::query_scalar(
+                                    "SELECT id FROM harness_instances WHERE tenant_id = $1 AND status != 'deprovisioned' LIMIT 1"
+                                )
+                                .bind(tenant_id)
+                                .fetch_optional(&state.db)
+                                .await
+                                .ok()
+                                .flatten();
+
+                                if hid.is_some() {
+                                    tracing::warn!(
+                                        "Activity report missing harness_id, using fallback for tenant {}",
+                                        tenant_id
+                                    );
+                                }
+                            }
+
+                            if let Some(hid) = hid {
+                                for entry in &report.model_usage {
                                     let cost = crate::billing::metered_billing::calculate_cost_microcents(
                                         &entry.model_id,
                                         entry.tokens_input,
@@ -410,6 +430,11 @@ async fn receive_activity(
                                         );
                                     });
                                 }
+                            } else {
+                                tracing::error!(
+                                    "BILLING LEAK: {} model_usage entries from tenant {} dropped — no harness_id found",
+                                    report.model_usage.len(), tenant_id
+                                );
                             }
                         }
                     }
