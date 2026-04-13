@@ -257,9 +257,16 @@ impl EcsProvisioner {
         ];
 
         // Tell harness where the agent sidecar is (same task = localhost).
-        if agent_image.is_some() {
+        // Generate a shared secret so the sidecar can prove its identity and
+        // get elevated trust (level 5) when registering with the harness.
+        let sidecar_secret = if agent_image.is_some() {
+            let secret = uuid::Uuid::new_v4().to_string().replace('-', "");
             env_vars.push(kv("AGENT_URL", "http://localhost:3100"));
-        }
+            env_vars.push(kv("AMOS_SIDECAR_SECRET", &secret));
+            Some(secret)
+        } else {
+            None
+        };
 
         if !self.harness_database_url.is_empty() {
             env_vars.push(kv("AMOS__DATABASE__URL", &self.harness_database_url));
@@ -360,6 +367,9 @@ impl EcsProvisioner {
                 kv("RUST_BACKTRACE", "1"),
                 kv("AWS_REGION", &self.aws_region),
             ];
+            if let Some(ref secret) = sidecar_secret {
+                agent_env_vars.push(kv("AMOS_SIDECAR_SECRET", secret));
+            }
             if !self.brave_api_key.is_empty() {
                 agent_env_vars.push(kv("BRAVE_API_KEY", &self.brave_api_key));
             }
