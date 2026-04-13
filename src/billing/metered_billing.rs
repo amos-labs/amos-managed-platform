@@ -46,7 +46,7 @@ mod tests {
     fn sonnet_pricing() {
         // 1M input tokens at $3/MTok × 1.03 = $3.09 = 309 cents = 30_900 microcents
         let cost = calculate_cost_microcents(
-            "us.anthropic.claude-sonnet-4-6-20250514-v1:0",
+            "us.anthropic.claude-sonnet-4-6",
             1_000_000,
             0,
         );
@@ -54,7 +54,7 @@ mod tests {
 
         // 1M output tokens at $15/MTok × 1.03 = $15.45 = 1545 cents = 154_500 microcents
         let cost = calculate_cost_microcents(
-            "us.anthropic.claude-sonnet-4-6-20250514-v1:0",
+            "us.anthropic.claude-sonnet-4-6",
             0,
             1_000_000,
         );
@@ -76,7 +76,7 @@ mod tests {
     fn opus_pricing() {
         // 1M input at $15 × 1.03 = $15.45 = 154_500 microcents
         let cost = calculate_cost_microcents(
-            "us.anthropic.claude-opus-4-6-20250514-v1:0",
+            "us.anthropic.claude-opus-4-6-v1",
             1_000_000,
             0,
         );
@@ -84,7 +84,7 @@ mod tests {
 
         // 1M output at $75 × 1.03 = $77.25 = 772_500 microcents
         let cost = calculate_cost_microcents(
-            "us.anthropic.claude-opus-4-6-20250514-v1:0",
+            "us.anthropic.claude-opus-4-6-v1",
             0,
             1_000_000,
         );
@@ -98,7 +98,7 @@ mod tests {
         // Output: 0.2 × $15 × 1.03 × 10000 = 30_900
         // Total: 46_350
         let cost = calculate_cost_microcents(
-            "us.anthropic.claude-sonnet-4-6-20250514-v1:0",
+            "us.anthropic.claude-sonnet-4-6",
             500_000,
             200_000,
         );
@@ -114,7 +114,7 @@ mod tests {
     #[test]
     fn zero_tokens_returns_zero() {
         let cost = calculate_cost_microcents(
-            "us.anthropic.claude-sonnet-4-6-20250514-v1:0",
+            "us.anthropic.claude-sonnet-4-6",
             0,
             0,
         );
