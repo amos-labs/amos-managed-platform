@@ -273,13 +273,12 @@ async fn resolve_harness_database(
             Ok(db_url) => {
                 let db_name = crate::provisioning::db::database_name_for_harness(harness_id);
                 env.insert("AMOS__DATABASE__URL".to_string(), db_url);
-                let _ = sqlx::query(
-                    "UPDATE harness_instances SET database_name = $1 WHERE id = $2",
-                )
-                .bind(&db_name)
-                .bind(harness_id)
-                .execute(db)
-                .await;
+                let _ =
+                    sqlx::query("UPDATE harness_instances SET database_name = $1 WHERE id = $2")
+                        .bind(&db_name)
+                        .bind(harness_id)
+                        .execute(db)
+                        .await;
             }
             Err(e) => {
                 error!(
@@ -442,7 +441,10 @@ async fn login_page(uri: axum::http::Uri) -> impl IntoResponse {
         .query()
         .and_then(|q| q.split('&').find_map(|p| p.strip_prefix("redirect=")))
         .map(|v| urlencoding::decode(v).unwrap_or_default().into_owned());
-    HtmlTemplate(LoginTemplate { error: None, redirect })
+    HtmlTemplate(LoginTemplate {
+        error: None,
+        redirect,
+    })
 }
 
 async fn login_submit(
@@ -565,7 +567,9 @@ async fn login_submit(
             let harness_base = if let Some(idx) = redirect_url.find(".custom.amoslabs.com") {
                 // Find the end of the hostname
                 let after_host = &redirect_url[idx + ".custom.amoslabs.com".len()..];
-                let path_start = after_host.find('/').map(|i| idx + ".custom.amoslabs.com".len() + i);
+                let path_start = after_host
+                    .find('/')
+                    .map(|i| idx + ".custom.amoslabs.com".len() + i);
                 &redirect_url[..path_start.unwrap_or(redirect_url.len())]
             } else {
                 redirect_url.as_str()
@@ -914,7 +918,11 @@ async fn dashboard_page(
         tenant_name,
         tenant_slug,
         plan,
-        plan_price: if plan_enum.is_paid() { "Per harness".to_string() } else { "Free".to_string() },
+        plan_price: if plan_enum.is_paid() {
+            "Per harness".to_string()
+        } else {
+            "Free".to_string()
+        },
         stripe_subscription_status,
         instances,
         user_count,
@@ -1010,7 +1018,11 @@ async fn settings_page_inner(
         tenant_name,
         role: claims.role.clone(),
         plan: plan.clone(),
-        plan_price: if plan_enum.is_paid() { "Per harness".to_string() } else { "Free".to_string() },
+        plan_price: if plan_enum.is_paid() {
+            "Per harness".to_string()
+        } else {
+            "Free".to_string()
+        },
         stripe_subscription_status: stripe_sub_status.unwrap_or_else(|| "none".into()),
         has_stripe_customer: stripe_customer_id.is_some(),
         api_keys,

@@ -436,7 +436,10 @@ pub async fn provision_harness_for_tenant(state: &PlatformState, tenant_id: Uuid
                     .await;
                 }
                 Err(e) => {
-                    error!("Failed to create harness database: {} — falling back to shared DB", e);
+                    error!(
+                        "Failed to create harness database: {} — falling back to shared DB",
+                        e
+                    );
                 }
             }
         }

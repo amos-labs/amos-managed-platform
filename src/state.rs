@@ -38,7 +38,8 @@ impl StripeConfig {
             secret_key,
             publishable_key: std::env::var("AMOS__STRIPE__PUBLISHABLE_KEY").ok(),
             webhook_secret: std::env::var("AMOS__STRIPE__WEBHOOK_SECRET").ok(),
-            price_small: std::env::var("AMOS__STRIPE__PRICE_SMALL").ok()
+            price_small: std::env::var("AMOS__STRIPE__PRICE_SMALL")
+                .ok()
                 // Backwards compat: PRICE_HOSTED maps to small
                 .or_else(|| std::env::var("AMOS__STRIPE__PRICE_HOSTED").ok()),
             price_medium: std::env::var("AMOS__STRIPE__PRICE_MEDIUM").ok(),

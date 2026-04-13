@@ -54,13 +54,14 @@ pub async fn create_harness_database(base_url: &str, harness_id: Uuid) -> Result
         .map_err(|e| AmosError::Internal(format!("Failed to connect to postgres DB: {}", e)))?;
 
     // Check if database already exists
-    let exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)",
-    )
-    .bind(&db_name)
-    .fetch_one(&mut conn)
-    .await
-    .map_err(|e| AmosError::Internal(format!("Failed to check database existence: {}", e)))?;
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)")
+            .bind(&db_name)
+            .fetch_one(&mut conn)
+            .await
+            .map_err(|e| {
+                AmosError::Internal(format!("Failed to check database existence: {}", e))
+            })?;
 
     if exists {
         info!(db_name = %db_name, "Harness database already exists, reusing");
@@ -71,7 +72,9 @@ pub async fn create_harness_database(base_url: &str, harness_id: Uuid) -> Result
         sqlx::query(&create_sql)
             .execute(&mut conn)
             .await
-            .map_err(|e| AmosError::Internal(format!("Failed to create database '{}': {}", db_name, e)))?;
+            .map_err(|e| {
+                AmosError::Internal(format!("Failed to create database '{}': {}", db_name, e))
+            })?;
 
         info!(db_name = %db_name, harness_id = %harness_id, "Created per-harness database");
     }
@@ -84,7 +87,12 @@ pub async fn create_harness_database(base_url: &str, harness_id: Uuid) -> Result
         .map_err(|e| AmosError::Internal(format!("Invalid harness DB URL: {}", e)))?;
     let mut harness_conn = PgConnection::connect_with(&harness_opts.disable_statement_logging())
         .await
-        .map_err(|e| AmosError::Internal(format!("Failed to connect to harness DB for extensions: {}", e)))?;
+        .map_err(|e| {
+            AmosError::Internal(format!(
+                "Failed to connect to harness DB for extensions: {}",
+                e
+            ))
+        })?;
 
     sqlx::query("CREATE EXTENSION IF NOT EXISTS vector")
         .execute(&mut harness_conn)

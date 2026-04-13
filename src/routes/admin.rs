@@ -162,7 +162,10 @@ pub fn routes() -> Router<PlatformState> {
         .route("/admin/harnesses/{id}/restart", post(restart_harness))
         .route("/admin/harnesses/{id}/redeploy", post(redeploy_harness))
         .route("/admin/harnesses/{id}/rename", post(rename_harness))
-        .route("/admin/harnesses/{id}/deprovision", post(deprovision_harness))
+        .route(
+            "/admin/harnesses/{id}/deprovision",
+            post(deprovision_harness),
+        )
         .route("/admin/stats", get(get_stats))
 }
 
@@ -176,7 +179,19 @@ async fn list_tenants(
     State(state): State<PlatformState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     // First, fetch all tenants with owner email.
-    let tenant_rows = sqlx::query_as::<_, (Uuid, String, String, Option<String>, String, i32, Option<String>, DateTime<Utc>)>(
+    let tenant_rows = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            String,
+            String,
+            Option<String>,
+            String,
+            i32,
+            Option<String>,
+            DateTime<Utc>,
+        ),
+    >(
         r#"
         SELECT
             t.id,
@@ -205,7 +220,18 @@ async fn list_tenants(
     })?;
 
     // Fetch all harness instances in one query.
-    let harness_rows = sqlx::query_as::<_, (Uuid, Uuid, Option<String>, String, Option<String>, Option<String>, Option<String>)>(
+    let harness_rows = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            Uuid,
+            Option<String>,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ),
+    >(
         r#"
         SELECT
             h.id,
@@ -236,32 +262,31 @@ async fn list_tenants(
     let mut harness_map: std::collections::HashMap<Uuid, Vec<HarnessInfo>> =
         std::collections::HashMap::new();
     for (id, tenant_id, name, status, instance_size, internal_url, region) in harness_rows {
-        harness_map
-            .entry(tenant_id)
-            .or_default()
-            .push(HarnessInfo {
-                id,
-                name,
-                status,
-                instance_size,
-                internal_url,
-                region,
-            });
+        harness_map.entry(tenant_id).or_default().push(HarnessInfo {
+            id,
+            name,
+            status,
+            instance_size,
+            internal_url,
+            region,
+        });
     }
 
     let tenants: Vec<TenantSummary> = tenant_rows
         .into_iter()
         .map(
-            |(id, name, email, slug, plan, max_harnesses, stripe_status, created_at)| TenantSummary {
-                id,
-                name,
-                email,
-                organization: slug,
-                plan,
-                max_harnesses,
-                stripe_subscription_status: stripe_status,
-                created_at,
-                harnesses: harness_map.remove(&id).unwrap_or_default(),
+            |(id, name, email, slug, plan, max_harnesses, stripe_status, created_at)| {
+                TenantSummary {
+                    id,
+                    name,
+                    email,
+                    organization: slug,
+                    plan,
+                    max_harnesses,
+                    stripe_subscription_status: stripe_status,
+                    created_at,
+                    harnesses: harness_map.remove(&id).unwrap_or_default(),
+                }
             },
         )
         .collect();
@@ -279,7 +304,19 @@ async fn get_tenant(
     State(state): State<PlatformState>,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let tenant_row = sqlx::query_as::<_, (Uuid, String, String, Option<String>, String, i32, Option<String>, DateTime<Utc>)>(
+    let tenant_row = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            String,
+            String,
+            Option<String>,
+            String,
+            i32,
+            Option<String>,
+            DateTime<Utc>,
+        ),
+    >(
         r#"
         SELECT
             t.id,
@@ -307,8 +344,8 @@ async fn get_tenant(
         )
     })?;
 
-    let (tenant_id, name, email, slug, plan, max_harnesses, stripe_status, created_at) =
-        tenant_row.ok_or_else(|| {
+    let (tenant_id, name, email, slug, plan, max_harnesses, stripe_status, created_at) = tenant_row
+        .ok_or_else(|| {
             (
                 StatusCode::NOT_FOUND,
                 Json(ErrorResponse {
@@ -317,7 +354,17 @@ async fn get_tenant(
             )
         })?;
 
-    let harness_rows = sqlx::query_as::<_, (Uuid, Option<String>, String, Option<String>, Option<String>, Option<String>)>(
+    let harness_rows = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            Option<String>,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ),
+    >(
         r#"
         SELECT h.id, h.name, h.status, h.instance_size, h.internal_url, h.region
         FROM harness_instances h
@@ -339,14 +386,16 @@ async fn get_tenant(
 
     let harnesses: Vec<HarnessInfo> = harness_rows
         .into_iter()
-        .map(|(id, name, status, instance_size, internal_url, region)| HarnessInfo {
-            id,
-            name,
-            status,
-            instance_size,
-            internal_url,
-            region,
-        })
+        .map(
+            |(id, name, status, instance_size, internal_url, region)| HarnessInfo {
+                id,
+                name,
+                status,
+                instance_size,
+                internal_url,
+                region,
+            },
+        )
         .collect();
 
     Ok(Json(TenantSummary {
@@ -596,12 +645,10 @@ async fn provision_harness(
         // No provisioner: record stays in DB with 'provisioning' status.
         // This is acceptable for local dev without Docker.
         provider = "none".to_string();
-        let _ = sqlx::query(
-            "UPDATE harness_instances SET status = 'pending' WHERE id = $1",
-        )
-        .bind(harness_id)
-        .execute(&state.db)
-        .await;
+        let _ = sqlx::query("UPDATE harness_instances SET status = 'pending' WHERE id = $1")
+            .bind(harness_id)
+            .execute(&state.db)
+            .await;
     }
 
     tracing::info!(
@@ -843,14 +890,17 @@ async fn redeploy_harness(
         harness_id: None,
     };
 
-    let task_arn = ecs.provision(&ecs_config, &tenant_slug).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("Failed to provision: {}", e),
-            }),
-        )
-    })?;
+    let task_arn = ecs
+        .provision(&ecs_config, &tenant_slug)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to provision: {}", e),
+                }),
+            )
+        })?;
 
     let _ = sqlx::query(
         "UPDATE harness_instances SET container_id = $1, provisioned_at = NOW() WHERE id = $2",

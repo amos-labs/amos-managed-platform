@@ -259,7 +259,6 @@ async fn test_register_validation_errors() {
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(body["field"], "password");
-
 }
 
 #[tokio::test]
@@ -747,8 +746,12 @@ async fn test_get_customer_not_found() {
     let app = build_test_app(state);
 
     let fake_id = uuid::Uuid::new_v4();
-    let (status, _) =
-        get_with_auth(&app, &format!("/api/v1/billing/customers/{}", fake_id), None).await;
+    let (status, _) = get_with_auth(
+        &app,
+        &format!("/api/v1/billing/customers/{}", fake_id),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
@@ -760,8 +763,12 @@ async fn test_get_customer_detail() {
     let (_, _, tenant_id, _) =
         register_test_user(&app, "Detail Corp", "detail@test.com", "password123").await;
 
-    let (status, body) =
-        get_with_auth(&app, &format!("/api/v1/billing/customers/{}", tenant_id), None).await;
+    let (status, body) = get_with_auth(
+        &app,
+        &format!("/api/v1/billing/customers/{}", tenant_id),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["name"], "Detail Corp");
     assert_eq!(body["email"], "detail@test.com");
@@ -984,13 +991,12 @@ async fn test_subscription_status_updates_in_db() {
     .unwrap();
 
     // Verify the subscription status
-    let status: Option<String> = sqlx::query_scalar(
-        "SELECT stripe_subscription_status FROM tenants WHERE id = $1",
-    )
-    .bind(tenant_uuid)
-    .fetch_one(&state.db)
-    .await
-    .unwrap();
+    let status: Option<String> =
+        sqlx::query_scalar("SELECT stripe_subscription_status FROM tenants WHERE id = $1")
+            .bind(tenant_uuid)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
     assert_eq!(status, Some("active".to_string()));
 
     // Simulate payment failure: mark as past_due
@@ -1000,13 +1006,12 @@ async fn test_subscription_status_updates_in_db() {
         .await
         .unwrap();
 
-    let status: Option<String> = sqlx::query_scalar(
-        "SELECT stripe_subscription_status FROM tenants WHERE id = $1",
-    )
-    .bind(tenant_uuid)
-    .fetch_one(&state.db)
-    .await
-    .unwrap();
+    let status: Option<String> =
+        sqlx::query_scalar("SELECT stripe_subscription_status FROM tenants WHERE id = $1")
+            .bind(tenant_uuid)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
     assert_eq!(status, Some("past_due".to_string()));
 
     // Simulate invoice paid: clear past_due → active
@@ -1018,13 +1023,12 @@ async fn test_subscription_status_updates_in_db() {
     .await
     .unwrap();
 
-    let status: Option<String> = sqlx::query_scalar(
-        "SELECT stripe_subscription_status FROM tenants WHERE id = $1",
-    )
-    .bind(tenant_uuid)
-    .fetch_one(&state.db)
-    .await
-    .unwrap();
+    let status: Option<String> =
+        sqlx::query_scalar("SELECT stripe_subscription_status FROM tenants WHERE id = $1")
+            .bind(tenant_uuid)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
     assert_eq!(status, Some("active".to_string()));
 
     // Simulate subscription canceled
@@ -1034,13 +1038,12 @@ async fn test_subscription_status_updates_in_db() {
         .await
         .unwrap();
 
-    let status: Option<String> = sqlx::query_scalar(
-        "SELECT stripe_subscription_status FROM tenants WHERE id = $1",
-    )
-    .bind(tenant_uuid)
-    .fetch_one(&state.db)
-    .await
-    .unwrap();
+    let status: Option<String> =
+        sqlx::query_scalar("SELECT stripe_subscription_status FROM tenants WHERE id = $1")
+            .bind(tenant_uuid)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
     assert_eq!(status, Some("canceled".to_string()));
 }
 
@@ -1115,30 +1118,28 @@ async fn test_harness_stop_on_subscription_cancel() {
 
     // Mark as stopped (what stop_harness does after container stop)
     for hid in &harness_ids {
-        sqlx::query("UPDATE harness_instances SET status = 'stopped', healthy = FALSE WHERE id = $1")
-            .bind(hid)
-            .execute(&state.db)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE harness_instances SET status = 'stopped', healthy = FALSE WHERE id = $1",
+        )
+        .bind(hid)
+        .execute(&state.db)
+        .await
+        .unwrap();
     }
 
     // Verify harness is stopped
-    let status: String = sqlx::query_scalar(
-        "SELECT status FROM harness_instances WHERE id = $1",
-    )
-    .bind(harness_id)
-    .fetch_one(&state.db)
-    .await
-    .unwrap();
+    let status: String = sqlx::query_scalar("SELECT status FROM harness_instances WHERE id = $1")
+        .bind(harness_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
     assert_eq!(status, "stopped");
 
-    let healthy: bool = sqlx::query_scalar(
-        "SELECT healthy FROM harness_instances WHERE id = $1",
-    )
-    .bind(harness_id)
-    .fetch_one(&state.db)
-    .await
-    .unwrap();
+    let healthy: bool = sqlx::query_scalar("SELECT healthy FROM harness_instances WHERE id = $1")
+        .bind(harness_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
     assert!(!healthy);
 }
 

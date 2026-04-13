@@ -400,11 +400,12 @@ async fn receive_activity(
 
                             if let Some(hid) = hid {
                                 for entry in &report.model_usage {
-                                    let cost = crate::billing::metered_billing::calculate_cost_microcents(
-                                        &entry.model_id,
-                                        entry.tokens_input,
-                                        entry.tokens_output,
-                                    );
+                                    let cost =
+                                        crate::billing::metered_billing::calculate_cost_microcents(
+                                            &entry.model_id,
+                                            entry.tokens_input,
+                                            entry.tokens_output,
+                                        );
                                     let _ = sqlx::query(
                                         r#"
                                         INSERT INTO llm_usage_records
