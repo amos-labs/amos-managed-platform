@@ -7,8 +7,8 @@
 use aws_sdk_ecs::{
     types::{
         AssignPublicIp, AwsVpcConfiguration, Compatibility, ContainerDefinition, KeyValuePair,
-        LaunchType, LogConfiguration, LogDriver, NetworkConfiguration, NetworkMode, PortMapping,
-        TransportProtocol,
+        LaunchType, LinuxParameters, LogConfiguration, LogDriver, NetworkConfiguration,
+        NetworkMode, PortMapping, TransportProtocol,
     },
     Client as EcsClient,
 };
@@ -314,10 +314,18 @@ impl EcsProvisioner {
         );
 
         // Build harness container definition.
+        // Container security: init process reaps zombies, read-only root prevents
+        // filesystem tampering. Writable dirs (/tmp, /app/uploads, /workspace) are
+        // handled by tmpfs mounts or pre-created dirs in the Dockerfile.
+        let linux_params = LinuxParameters::builder()
+            .init_process_enabled(true)
+            .build();
+
         let harness_container = ContainerDefinition::builder()
             .name("amos-harness")
             .image(harness_image)
             .essential(true)
+            .linux_parameters(linux_params.clone())
             .port_mappings(
                 PortMapping::builder()
                     .container_port(3000)
@@ -378,6 +386,7 @@ impl EcsProvisioner {
                 .name("amos-agent")
                 .image(agent_image)
                 .essential(false) // Agent crash shouldn't kill the harness
+                .linux_parameters(linux_params)
                 .port_mappings(
                     PortMapping::builder()
                         .container_port(3100)
