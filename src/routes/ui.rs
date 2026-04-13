@@ -817,7 +817,7 @@ async fn dashboard_page(
         )
     });
 
-    let plan_enum = crate::billing::Plan::from_str(&plan);
+    let plan_enum = crate::billing::Plan::parse(&plan);
     let stripe_subscription_status = stripe_sub_status.unwrap_or_else(|| "none".into());
 
     // Fetch the latest available release version for update-available badge.
@@ -972,7 +972,7 @@ async fn settings_page_inner(
     let (tenant_name, plan, stripe_customer_id, stripe_sub_status) =
         tenant_row.unwrap_or_else(|| ("Unknown".into(), "free".into(), None, None));
 
-    let plan_enum = crate::billing::Plan::from_str(&plan);
+    let plan_enum = crate::billing::Plan::parse(&plan);
 
     // API keys
     let key_rows = sqlx::query_as::<_, (String, String, bool, String)>(

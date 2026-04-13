@@ -521,7 +521,7 @@ async fn provision_harness(
         .bind(tenant_id)
         .fetch_one(&state.db)
         .await
-        .unwrap_or_else(|_| format!("{}", &tenant_id.to_string()[..8]));
+        .unwrap_or_else(|_| tenant_id.to_string()[..8].to_string());
 
     // Generate subdomain: {slug}-{4char} (matches normal provisioning flow).
     let subdomain = format!("{}-{}", tenant_slug, &harness_id.to_string()[..4]);

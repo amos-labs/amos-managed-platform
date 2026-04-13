@@ -62,7 +62,7 @@ impl Plan {
     }
 
     /// Parse plan from string. Unknown values default to Free.
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse(s: &str) -> Self {
         match s {
             "hosted" => Plan::Hosted,
             // Legacy plan names map to Hosted for existing subscribers
@@ -141,7 +141,7 @@ impl HarnessSize {
     }
 
     /// Parse from string. Defaults to Small.
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse(s: &str) -> Self {
         match s {
             "medium" => HarnessSize::Medium,
             "large" => HarnessSize::Large,
@@ -204,12 +204,12 @@ mod tests {
 
     #[test]
     fn legacy_plans_map_to_hosted() {
-        assert_eq!(Plan::from_str("starter"), Plan::Hosted);
-        assert_eq!(Plan::from_str("growth"), Plan::Hosted);
-        assert_eq!(Plan::from_str("enterprise"), Plan::Hosted);
-        assert_eq!(Plan::from_str("hosted"), Plan::Hosted);
-        assert_eq!(Plan::from_str("free"), Plan::Free);
-        assert_eq!(Plan::from_str("unknown"), Plan::Free);
+        assert_eq!(Plan::parse("starter"), Plan::Hosted);
+        assert_eq!(Plan::parse("growth"), Plan::Hosted);
+        assert_eq!(Plan::parse("enterprise"), Plan::Hosted);
+        assert_eq!(Plan::parse("hosted"), Plan::Hosted);
+        assert_eq!(Plan::parse("free"), Plan::Free);
+        assert_eq!(Plan::parse("unknown"), Plan::Free);
     }
 
     #[test]
@@ -247,10 +247,10 @@ mod tests {
 
     #[test]
     fn harness_size_from_str() {
-        assert_eq!(HarnessSize::from_str("small"), HarnessSize::Small);
-        assert_eq!(HarnessSize::from_str("medium"), HarnessSize::Medium);
-        assert_eq!(HarnessSize::from_str("large"), HarnessSize::Large);
-        assert_eq!(HarnessSize::from_str("unknown"), HarnessSize::Small);
+        assert_eq!(HarnessSize::parse("small"), HarnessSize::Small);
+        assert_eq!(HarnessSize::parse("medium"), HarnessSize::Medium);
+        assert_eq!(HarnessSize::parse("large"), HarnessSize::Large);
+        assert_eq!(HarnessSize::parse("unknown"), HarnessSize::Small);
     }
 
     #[test]
