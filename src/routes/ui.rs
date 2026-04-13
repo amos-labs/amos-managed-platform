@@ -858,9 +858,11 @@ async fn dashboard_page(
                     .map(|s| format!("https://{}.custom.amoslabs.com", s))
                     .or(internal_url);
 
-                // Show update badge when latest release differs from current image_tag.
+                // Show update badge when latest release differs from current image_tag,
+                // or when image_tag is unknown (NULL = pre-versioning harness).
                 let update_available = match (&latest_release_version, &image_tag) {
                     (Some(latest), Some(current)) if latest != current => Some(latest.clone()),
+                    (Some(latest), None) => Some(latest.clone()),
                     _ => None,
                 };
 
