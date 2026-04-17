@@ -726,19 +726,6 @@ async fn register_submit(
         .into_response();
     }
 
-    // Create harness instance record (pending for all plans — paid plans get
-    // provisioned after Stripe checkout completes via webhook).
-    let harness_id = Uuid::new_v4();
-    let _ = sqlx::query(
-        "INSERT INTO harness_instances (id, tenant_id, subdomain, status)
-         VALUES ($1, $2, $3, 'pending')",
-    )
-    .bind(harness_id)
-    .bind(tenant_id)
-    .bind(&final_slug)
-    .execute(&state.db)
-    .await;
-
     // Issue JWT and set session cookie (needed for both flows)
     let jwt_secret = get_jwt_secret(&state);
     let access_expiry = state.config.auth.access_token_expiry_secs as i64;
