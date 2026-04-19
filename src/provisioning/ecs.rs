@@ -290,6 +290,18 @@ impl EcsProvisioner {
         // billed at Bedrock cost + 3% markup via the activity sync pipeline.
         env_vars.push(kv("SHARED_BEDROCK_ENABLED", "true"));
 
+        // Inject the image tag as the harness version so the in-harness
+        // update banner can compare it to the latest release and disappear
+        // correctly after the customer updates. Without this, the harness
+        // reports its hardcoded Cargo version ("0.1.0") forever — which
+        // never matches the platform's sha-* release tags, and the banner
+        // stays on even after a successful update.
+        if let Some(tag) = harness_image.rsplit(':').next() {
+            if !tag.is_empty() && !tag.contains('/') {
+                env_vars.push(kv("AMOS__DEPLOYMENT__HARNESS_VERSION", tag));
+            }
+        }
+
         // Multi-harness: pass role, packages, and harness ID
         env_vars.push(kv("AMOS_HARNESS_ROLE", &config.harness_role));
         if !config.packages.is_empty() {

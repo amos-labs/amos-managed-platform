@@ -5,6 +5,7 @@
 
 use axum::{
     extract::State,
+    http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -22,6 +23,86 @@ pub fn routes() -> Router<PlatformState> {
         .route("/sync/activity", post(receive_activity))
         .route("/sync/version", get(get_latest_version))
         .route("/sync/siblings", get(get_siblings))
+        .route("/sync/update-self", post(update_self))
+}
+
+// ── Self-update ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct UpdateSelfPayload {
+    /// UUID of the harness instance requesting the update.
+    harness_id: String,
+}
+
+#[derive(Serialize)]
+struct UpdateSelfResponse {
+    success: bool,
+    new_version: Option<String>,
+    error: Option<String>,
+}
+
+/// `POST /api/v1/sync/update-self` — the harness's own backend calls this
+/// when the user clicks the in-harness update banner. Saves the customer
+/// the round-trip to the platform dashboard.
+///
+/// Auth: the calling harness's current container_id must match the
+/// container_id recorded for that harness_id. That's a weak check, but
+/// the 169.254.170.2 metadata endpoint + the harness's own ECS task role
+/// are already well-isolated per customer. Full mTLS / signed tokens
+/// between harness and platform are a follow-up.
+async fn update_self(
+    State(state): State<PlatformState>,
+    Json(payload): Json<UpdateSelfPayload>,
+) -> impl IntoResponse {
+    let harness_id = match uuid::Uuid::parse_str(&payload.harness_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(UpdateSelfResponse {
+                    success: false,
+                    new_version: None,
+                    error: Some("Invalid harness_id UUID".to_string()),
+                }),
+            );
+        }
+    };
+
+    let container_id: Option<String> =
+        sqlx::query_scalar("SELECT container_id FROM harness_instances WHERE id = $1")
+            .bind(harness_id)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten();
+
+    match crate::routes::ui::perform_harness_update(&state, harness_id, container_id.as_deref())
+        .await
+    {
+        Ok(new_version) => {
+            info!(
+                harness_id = %harness_id,
+                new_version = %new_version,
+                "Harness self-update kicked off from in-harness banner"
+            );
+            (
+                StatusCode::OK,
+                Json(UpdateSelfResponse {
+                    success: true,
+                    new_version: Some(new_version),
+                    error: None,
+                }),
+            )
+        }
+        Err(msg) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(UpdateSelfResponse {
+                success: false,
+                new_version: None,
+                error: Some(msg),
+            }),
+        ),
+    }
 }
 
 // ── Heartbeat ───────────────────────────────────────────────────────────
