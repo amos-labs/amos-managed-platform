@@ -302,6 +302,17 @@ impl EcsProvisioner {
             }
         }
 
+        // Point the harness at the production relay so bounty discovery,
+        // heartbeat, and reputation sync all work. Without these vars the
+        // harness defaults to http://localhost:4100 with relay disabled,
+        // which is why discover_bounties returned "relay unreachable"
+        // from hosted harnesses. Override per-tenant via HarnessConfig.env_vars
+        // if a customer needs a custom relay (e.g. running their own).
+        let relay_url = std::env::var("AMOS_RELAY_URL")
+            .unwrap_or_else(|_| "https://relay.amoslabs.com".to_string());
+        env_vars.push(kv("AMOS__RELAY__URL", &relay_url));
+        env_vars.push(kv("AMOS__RELAY__ENABLED", "true"));
+
         // Multi-harness: pass role, packages, and harness ID
         env_vars.push(kv("AMOS_HARNESS_ROLE", &config.harness_role));
         if !config.packages.is_empty() {
