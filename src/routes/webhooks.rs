@@ -13,6 +13,16 @@ use uuid::Uuid;
 
 use crate::state::PlatformState;
 
+/// Monthly Bedrock credit grant for the $49.99/mo plan: $5 in microcents.
+/// Microcents = hundredths of a cent (1¢ = 100 microcents, $1 = 10,000
+/// microcents), matching `metered_billing::calculate_cost_microcents`.
+/// So $5.00 = 50,000 microcents.
+///
+/// Granted on checkout, reset on each invoice.paid. Haiku-only — gating
+/// happens in the harness pre-call check. See
+/// docs/SUBSCRIPTION_AND_ONBOARDING.md in amos-automate.
+const MONTHLY_CREDIT_GRANT_MICROCENTS: i64 = 50_000;
+
 /// Handle incoming Stripe webhook events.
 ///
 /// This endpoint is mounted **outside** the auth middleware so Stripe
@@ -161,19 +171,30 @@ async fn handle_checkout_completed(state: &PlatformState, event: &stripe::Event)
         "Checkout completed, activating subscription"
     );
 
-    // Update tenant with Stripe IDs and activate subscription
+    // Update tenant with Stripe IDs, activate subscription, and grant the
+    // initial $5 of Haiku-only Bedrock credits so the user can start using
+    // shared backend immediately while they set up BYOK.
     let _ = sqlx::query(
         "UPDATE tenants
          SET stripe_customer_id = $1,
              stripe_subscription_id = $2,
-             stripe_subscription_status = 'active'
+             stripe_subscription_status = 'active',
+             credit_balance_microcents = $4,
+             credits_granted_at = NOW()
          WHERE id = $3",
     )
     .bind(&customer_id)
     .bind(&subscription_id)
     .bind(tenant_id)
+    .bind(MONTHLY_CREDIT_GRANT_MICROCENTS)
     .execute(&state.db)
     .await;
+
+    info!(
+        tenant_id = %tenant_id,
+        microcents = MONTHLY_CREDIT_GRANT_MICROCENTS,
+        "Initial Bedrock credit grant"
+    );
 
     // Provision harness for the tenant
     provision_harness_for_tenant(state, tenant_id).await;
@@ -293,7 +314,10 @@ async fn handle_subscription_deleted(state: &PlatformState, event: &stripe::Even
     }
 }
 
-/// Handle invoice.paid: clear past_due status.
+/// Handle invoice.paid: clear past_due status and reset monthly Bedrock
+/// credits to $5. Fires on every successful payment — initial signup invoice
+/// and every renewal — so this is the recurring refresh point. No rollover
+/// by design.
 async fn handle_invoice_paid(state: &PlatformState, event: &stripe::Event) {
     use stripe::EventObject;
 
@@ -307,13 +331,23 @@ async fn handle_invoice_paid(state: &PlatformState, event: &stripe::Event) {
         None => return,
     };
 
-    info!(subscription_id = %sub_id, "Invoice paid, clearing past_due");
+    info!(
+        subscription_id = %sub_id,
+        microcents = MONTHLY_CREDIT_GRANT_MICROCENTS,
+        "Invoice paid, clearing past_due and resetting Bedrock credits"
+    );
 
     let _ = sqlx::query(
         "UPDATE tenants
-         SET stripe_subscription_status = 'active'
-         WHERE stripe_subscription_id = $1 AND stripe_subscription_status = 'past_due'",
+         SET stripe_subscription_status = CASE
+                 WHEN stripe_subscription_status = 'past_due' THEN 'active'
+                 ELSE stripe_subscription_status
+             END,
+             credit_balance_microcents = $1,
+             credits_granted_at = NOW()
+         WHERE stripe_subscription_id = $2",
     )
+    .bind(MONTHLY_CREDIT_GRANT_MICROCENTS)
     .bind(&sub_id)
     .execute(&state.db)
     .await;

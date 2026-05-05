@@ -24,6 +24,7 @@ pub fn routes() -> Router<PlatformState> {
         .route("/sync/version", get(get_latest_version))
         .route("/sync/siblings", get(get_siblings))
         .route("/sync/update-self", post(update_self))
+        .route("/sync/balance/:tenant_id", get(get_balance))
 }
 
 // ── Self-update ─────────────────────────────────────────────────────────
@@ -362,6 +363,13 @@ struct ActivityReport {
     tenant_id: Option<String>,
     /// Optional harness_id for per-harness billing
     harness_id: Option<String>,
+    /// True if the harness is in BYOK mode for this period — when set, the
+    /// platform skips deducting cost from `tenants.credit_balance_microcents`
+    /// because the user is paying their own provider directly.
+    /// Defaults to false for backward compatibility with older harnesses
+    /// that report against shared Bedrock.
+    #[serde(default)]
+    is_byok: bool,
 }
 
 #[derive(Serialize)]
@@ -480,6 +488,7 @@ async fn receive_activity(
                             }
 
                             if let Some(hid) = hid {
+                                let mut shared_cost_total: i64 = 0;
                                 for entry in &report.model_usage {
                                     let cost =
                                         crate::billing::metered_billing::calculate_cost_microcents(
@@ -509,6 +518,34 @@ async fn receive_activity(
                                         tracing::warn!(
                                             "Failed to insert llm_usage_record for {}: {}",
                                             entry.model_id, e
+                                        );
+                                    });
+
+                                    if !report.is_byok {
+                                        shared_cost_total = shared_cost_total.saturating_add(cost);
+                                    }
+                                }
+
+                                // Deduct shared-Bedrock cost from the tenant's monthly
+                                // credit balance. BYOK reports skip this — the user is
+                                // paying their provider directly. Clamp at zero so a
+                                // late-arriving over-spend doesn't drive the balance
+                                // negative; the worst-case overrun is bounded by one
+                                // sync interval, accepted by design.
+                                if shared_cost_total > 0 {
+                                    let _ = sqlx::query(
+                                        "UPDATE tenants
+                                         SET credit_balance_microcents = GREATEST(0, credit_balance_microcents - $1)
+                                         WHERE id = $2",
+                                    )
+                                    .bind(shared_cost_total)
+                                    .bind(tenant_id)
+                                    .execute(&state.db)
+                                    .await
+                                    .map_err(|e| {
+                                        tracing::warn!(
+                                            "Failed to deduct credits for tenant {}: {}",
+                                            tenant_id, e
                                         );
                                     });
                                 }
@@ -692,6 +729,82 @@ async fn get_siblings(
     Json(SiblingsResponse { siblings })
 }
 
+// ── Credit Balance ──────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct BalanceResponse {
+    /// Current Bedrock credit balance for this tenant, in microcents.
+    /// 0 means the tenant must use BYOK to keep using shared backend
+    /// for the rest of this billing cycle.
+    credit_balance_microcents: i64,
+    /// Same balance, formatted as a USD string for display ("4.32").
+    credit_balance_usd: String,
+    /// When the balance was last granted/reset (most recent
+    /// `invoice.paid` or initial checkout). May be null for tenants
+    /// who haven't been on a paid plan.
+    credits_granted_at: Option<DateTime<Utc>>,
+}
+
+/// `GET /api/v1/sync/balance/:tenant_id` — read the tenant's current
+/// monthly Bedrock credit balance. Used by:
+///
+/// - The harness pre-call gate (decides whether to allow shared-Bedrock
+///   calls or return a 402 with a "Set up a key" CTA).
+/// - The frontend banner that shows remaining credits to the user.
+///
+/// The balance itself is not sensitive — knowing a tenant has $X of
+/// credits doesn't expose secrets — so this endpoint sits behind the
+/// same weak identity model as the rest of the `/sync/*` namespace.
+async fn get_balance(
+    State(state): State<PlatformState>,
+    axum::extract::Path(tenant_id_str): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let tenant_id = match uuid::Uuid::parse_str(&tenant_id_str) {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid tenant_id"})),
+            )
+                .into_response();
+        }
+    };
+
+    let row: Option<(i64, Option<DateTime<Utc>>)> = sqlx::query_as(
+        "SELECT credit_balance_microcents, credits_granted_at FROM tenants WHERE id = $1",
+    )
+    .bind(tenant_id)
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten();
+
+    let (balance, granted_at) = match row {
+        Some(r) => r,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "tenant not found"})),
+            )
+                .into_response();
+        }
+    };
+
+    // Microcents (1/100 of a cent) -> dollars. 10_000 microcents = $1.00.
+    // So $5.00 = 50_000 microcents.
+    let usd = format!("{:.2}", balance as f64 / 10_000.0);
+
+    (
+        StatusCode::OK,
+        Json(BalanceResponse {
+            credit_balance_microcents: balance,
+            credit_balance_usd: usd,
+            credits_granted_at: granted_at,
+        }),
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -722,5 +835,78 @@ mod tests {
 
         let json = serde_json::to_string(&info).unwrap();
         assert!(json.contains("0.1.0"));
+    }
+
+    #[test]
+    fn balance_usd_conversion_matches_metered_billing_units() {
+        // Microcents are hundredths of a cent: 10_000 microcents = $1.00.
+        // Same convention used in `crate::billing::metered_billing`.
+        // Verifying we don't drift from that.
+        let cases = [
+            (50_000_i64, "5.00"),  // The $5 monthly grant
+            (10_000_i64, "1.00"),
+            (123_i64, "0.01"),
+            (0_i64, "0.00"),
+            (49_999_i64, "5.00"), // rounds to two decimals
+            (4_321_i64, "0.43"),
+        ];
+        for (microcents, expected_usd) in cases {
+            let actual = format!("{:.2}", microcents as f64 / 10_000.0);
+            assert_eq!(
+                actual, expected_usd,
+                "{} microcents should format as ${}",
+                microcents, expected_usd
+            );
+        }
+    }
+
+    #[test]
+    fn balance_response_serializes_correctly() {
+        let resp = BalanceResponse {
+            credit_balance_microcents: 42_500,
+            credit_balance_usd: "4.25".into(),
+            credits_granted_at: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"credit_balance_microcents\":42500"));
+        assert!(json.contains("\"credit_balance_usd\":\"4.25\""));
+        assert!(json.contains("\"credits_granted_at\":null"));
+    }
+
+    #[test]
+    fn activity_report_is_byok_defaults_to_false() {
+        // Older harnesses don't emit `is_byok`. Platform must default to
+        // false so their reports still deduct credits as expected.
+        let json = r#"{
+            "period_start": "2026-05-03T00:00:00Z",
+            "period_end": "2026-05-03T00:01:00Z",
+            "conversations": 0,
+            "messages": 0,
+            "tokens_input": 0,
+            "tokens_output": 0,
+            "tools_executed": 0,
+            "models_used": [],
+            "timestamp": "2026-05-03T00:01:00Z"
+        }"#;
+        let report: ActivityReport = serde_json::from_str(json).unwrap();
+        assert!(!report.is_byok);
+    }
+
+    #[test]
+    fn activity_report_is_byok_true_when_set() {
+        let json = r#"{
+            "period_start": "2026-05-03T00:00:00Z",
+            "period_end": "2026-05-03T00:01:00Z",
+            "conversations": 0,
+            "messages": 0,
+            "tokens_input": 0,
+            "tokens_output": 0,
+            "tools_executed": 0,
+            "models_used": [],
+            "timestamp": "2026-05-03T00:01:00Z",
+            "is_byok": true
+        }"#;
+        let report: ActivityReport = serde_json::from_str(json).unwrap();
+        assert!(report.is_byok);
     }
 }
