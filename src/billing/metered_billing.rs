@@ -7,15 +7,22 @@
 const MARKUP: f64 = 1.03;
 
 /// Per-model pricing in dollars per million tokens (input, output).
+/// Mirror of the catalog in amos-harness/src/routes/settings.rs — when
+/// you change one, change the other. Last sync: 2026-05-02 (AWS repriced
+/// Haiku up; Anthropic dropped Opus 4.6 to match 4.7).
 fn model_pricing(model_id: &str) -> Option<(f64, f64)> {
     // Match on Bedrock model ID prefixes
     let id = model_id.to_lowercase();
     if id.contains("haiku") {
-        Some((0.80, 4.00))
+        // Haiku 4.5: AWS Bedrock base $1.00 / $5.00 (was $0.80 / $4.00).
+        Some((1.00, 5.00))
     } else if id.contains("opus") {
-        Some((15.00, 75.00))
+        // Opus 4.6 and 4.7: base $5.00 / $25.00. 4.6 used to be $15/$75
+        // at launch — Anthropic dropped it to match 4.7. Until 2026-05-02
+        // we were overcharging customers 3x for shared-Bedrock Opus.
+        Some((5.00, 25.00))
     } else if id.contains("sonnet") || id.contains("claude") {
-        // Default Claude model = Sonnet pricing
+        // Default Claude model = Sonnet pricing.
         Some((3.00, 15.00))
     } else {
         None
@@ -55,21 +62,26 @@ mod tests {
 
     #[test]
     fn haiku_pricing() {
-        // 1M input at $0.80 × 1.03 = $0.824 = 82.4 cents = 8_240 microcents
+        // 1M input at $1.00 × 1.03 = $1.03 = 103 cents = 10_300 microcents
         let cost =
             calculate_cost_microcents("us.anthropic.claude-haiku-4-5-20251001-v1:0", 1_000_000, 0);
-        assert_eq!(cost, 8_240);
+        assert_eq!(cost, 10_300);
+
+        // 1M output at $5.00 × 1.03 = $5.15 = 51_500 microcents
+        let cost =
+            calculate_cost_microcents("us.anthropic.claude-haiku-4-5-20251001-v1:0", 0, 1_000_000);
+        assert_eq!(cost, 51_500);
     }
 
     #[test]
     fn opus_pricing() {
-        // 1M input at $15 × 1.03 = $15.45 = 154_500 microcents
+        // 1M input at $5.00 × 1.03 = $5.15 = 51_500 microcents
         let cost = calculate_cost_microcents("us.anthropic.claude-opus-4-6-v1", 1_000_000, 0);
-        assert_eq!(cost, 154_500);
+        assert_eq!(cost, 51_500);
 
-        // 1M output at $75 × 1.03 = $77.25 = 772_500 microcents
+        // 1M output at $25.00 × 1.03 = $25.75 = 257_500 microcents
         let cost = calculate_cost_microcents("us.anthropic.claude-opus-4-6-v1", 0, 1_000_000);
-        assert_eq!(cost, 772_500);
+        assert_eq!(cost, 257_500);
     }
 
     #[test]
