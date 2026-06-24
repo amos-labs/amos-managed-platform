@@ -7,6 +7,7 @@ use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::sync::Arc;
 use tracing::{info, warn};
 
+use crate::billing::usage_metering::UsageMeter;
 use crate::provisioning::alb::{AlbRouter, AlbRouterConfig};
 use crate::provisioning::app_deploy::AppManager;
 use crate::provisioning::aws_app::{AwsAppProvisioner, AwsAppProvisionerConfig};
@@ -106,6 +107,9 @@ pub struct PlatformState {
     pub image_builder: Option<Arc<ImageBuilder>>,
     /// AWS Fargate renderer for multi-service app deploys (deploy_app provider=aws).
     pub aws_app_provisioner: Option<Arc<AwsAppProvisioner>>,
+    /// CloudWatch-backed usage meter for exact app-hosting billing (unit-hours
+    /// + egress). Initialized alongside the AWS app provisioner.
+    pub usage_meter: Option<Arc<UsageMeter>>,
     /// Stripe API client (None if Stripe not configured).
     pub stripe_client: Option<StripeClient>,
     /// Stripe configuration (price IDs, webhook secret).
@@ -242,25 +246,40 @@ impl PlatformState {
             }
         };
 
-        // Initialize the AWS Fargate app renderer (deploy_app provider=aws).
-        // Gated on AWS_APP_ENABLED=true.
-        let aws_app_provisioner = match AwsAppProvisionerConfig::from_env() {
-            Some(cfg) => match AwsAppProvisioner::new(cfg).await {
-                Ok(p) => {
-                    info!("AWS app provisioner initialized (Fargate deploys enabled)");
-                    Some(Arc::new(p))
-                }
-                Err(e) => {
-                    warn!(
-                        "AWS app provisioner initialization failed (optional): {}",
-                        e
-                    );
-                    None
-                }
-            },
+        // Initialize the AWS Fargate app renderer (deploy_app provider=aws) and
+        // the CloudWatch usage meter that bills it. Both gated on the same
+        // AWS_APP_ENABLED config (cluster + region).
+        let (aws_app_provisioner, usage_meter) = match AwsAppProvisionerConfig::from_env() {
+            Some(cfg) => {
+                // Build the usage meter from the same cluster/region before the
+                // provisioner consumes the config.
+                let cluster = cfg.cluster.clone();
+                let region = cfg.region.clone();
+                let aws_conf = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                    .region(aws_config::Region::new(region))
+                    .load()
+                    .await;
+                let meter = Some(Arc::new(UsageMeter::new(&aws_conf, cluster)));
+                info!("Usage meter initialized (CloudWatch metered app-hosting billing)");
+
+                let provisioner = match AwsAppProvisioner::new(cfg).await {
+                    Ok(p) => {
+                        info!("AWS app provisioner initialized (Fargate deploys enabled)");
+                        Some(Arc::new(p))
+                    }
+                    Err(e) => {
+                        warn!(
+                            "AWS app provisioner initialization failed (optional): {}",
+                            e
+                        );
+                        None
+                    }
+                };
+                (provisioner, meter)
+            }
             None => {
                 info!("AWS app provisioner not configured (AWS_APP_ENABLED != true)");
-                None
+                (None, None)
             }
         };
 
@@ -286,6 +305,7 @@ impl PlatformState {
             alb_router,
             image_builder,
             aws_app_provisioner,
+            usage_meter,
             stripe_client,
             stripe_config,
         })

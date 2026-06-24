@@ -3,6 +3,7 @@
 pub mod app_hosting;
 pub mod metered_billing;
 pub mod stripe_service;
+pub mod usage_metering;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

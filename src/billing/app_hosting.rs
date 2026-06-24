@@ -127,6 +127,68 @@ pub fn container_units(cpu_units: u32, mem_mib: u32) -> u32 {
     vcpu.max(mem_units).max(1.0) as u32
 }
 
+/// Reference hours in a billing month, used to prorate the per-unit-*month*
+/// overage rate to a per-unit-*hour* rate for exact metered billing (730 ≈
+/// 365.25 × 24 / 12). Continuous running for a full month then bills the same
+/// as the snapshot model.
+pub const HOURS_PER_MONTH: f64 = 730.0;
+
+/// Exact, period-metered charge: bills compute on **unit-hours** integrated
+/// over the period (from CloudWatch), not a point-in-time unit count, so
+/// scaling and scale-to-zero are billed precisely. For an app that runs at a
+/// constant N units for a full month this equals [`compute_charge`] at N.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AppHostingPeriodCharge {
+    pub tier: AppHostingTier,
+    pub unit_hours: f64,
+    pub included_unit_hours: f64,
+    pub overage_unit_hours: f64,
+    pub base_cents: u64,
+    pub overage_cents: u64,
+    pub egress_gb: f64,
+    pub included_egress_gb: u64,
+    pub egress_overage_gb: f64,
+    pub egress_overage_cents: u64,
+    pub total_cents: u64,
+}
+
+/// Compute the metered charge for a billing period given integrated
+/// `unit_hours`, `egress_gb`, and the period length in hours. The base covers
+/// `included_units` running for the whole period (= `included_units ×
+/// period_hours` unit-hours); beyond that, overage is billed per unit-hour at
+/// the per-unit-month rate prorated by [`HOURS_PER_MONTH`].
+pub fn compute_period_charge(
+    tier: AppHostingTier,
+    unit_hours: f64,
+    egress_gb: f64,
+    period_hours: f64,
+) -> AppHostingPeriodCharge {
+    let included_unit_hours = tier.included_units() as f64 * period_hours;
+    let overage_unit_hours = (unit_hours - included_unit_hours).max(0.0);
+    let overage_rate_per_unit_hour = tier.overage_cents_per_unit() as f64 / HOURS_PER_MONTH;
+    let overage_cents = (overage_unit_hours * overage_rate_per_unit_hour).round() as u64;
+
+    let included_egress = tier.included_egress_gb();
+    let egress_overage_gb = (egress_gb - included_egress as f64).max(0.0);
+    let egress_overage_cents =
+        (egress_overage_gb * tier.egress_overage_cents_per_gb() as f64).round() as u64;
+
+    let base_cents = tier.base_cents();
+    AppHostingPeriodCharge {
+        tier,
+        unit_hours,
+        included_unit_hours,
+        overage_unit_hours,
+        base_cents,
+        overage_cents,
+        egress_gb,
+        included_egress_gb: included_egress,
+        egress_overage_gb,
+        egress_overage_cents,
+        total_cents: base_cents + overage_cents + egress_overage_cents,
+    }
+}
+
 /// A line-item breakdown of an app-hosting charge for a billing period.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppHostingCharge {
@@ -286,6 +348,53 @@ mod tests {
         let c = compute_charge(AppHostingTier::Compliance, 8, 300);
         assert_eq!(c.egress_overage_gb, 0); // 300 < 500 included
         assert_eq!(c.total_cents, 89_900);
+    }
+
+    #[test]
+    fn period_charge_matches_snapshot_for_continuous_month() {
+        // Cuspr on Pro at a constant 8 units for a full month should bill the
+        // same as the snapshot model ($349, fully included).
+        let p = compute_period_charge(
+            AppHostingTier::Pro,
+            8.0 * HOURS_PER_MONTH,
+            0.0,
+            HOURS_PER_MONTH,
+        );
+        assert_eq!(p.overage_unit_hours, 0.0);
+        assert_eq!(p.total_cents, 34_900);
+
+        // Constant 12 units for a full month = the snapshot's $449 (4 over × $25).
+        let p = compute_period_charge(
+            AppHostingTier::Pro,
+            12.0 * HOURS_PER_MONTH,
+            0.0,
+            HOURS_PER_MONTH,
+        );
+        assert_eq!(p.total_cents, 44_900);
+    }
+
+    #[test]
+    fn period_charge_prorates_partial_usage() {
+        // 12 units but only for half the month: overage unit-hours are halved,
+        // so overage is ~half of the $100 continuous overage ($50) over base.
+        let p = compute_period_charge(
+            AppHostingTier::Pro,
+            8.0 * HOURS_PER_MONTH + 4.0 * (HOURS_PER_MONTH / 2.0),
+            0.0,
+            HOURS_PER_MONTH,
+        );
+        assert_eq!(p.overage_cents, 5_000); // half of $100
+        assert_eq!(p.total_cents, 39_900); // $349 + $50
+    }
+
+    #[test]
+    fn period_egress_overage_billed() {
+        // Within compute included units, but 400 GB egress on Pro (250 incl) =
+        // 150 × $0.18 = $27 over the $349 base.
+        let p = compute_period_charge(AppHostingTier::Pro, 0.0, 400.0, HOURS_PER_MONTH);
+        assert_eq!(p.egress_overage_gb, 150.0);
+        assert_eq!(p.egress_overage_cents, 2_700);
+        assert_eq!(p.total_cents, 37_600);
     }
 
     #[test]
