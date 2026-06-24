@@ -149,12 +149,16 @@ async fn handle_mcp(
                     format!("unknown tool '{name}'"),
                 ),
                 Err(ToolError::InvalidParams(msg)) => rpc_err(id, rpc_error::INVALID_PARAMS, msg),
-                // Execution errors are reported as tool results with isError=true
-                // (per MCP spec) rather than as protocol errors, so the model can
-                // read the failure and adapt.
+                // Execution + authorization failures are reported as tool
+                // results with isError=true (per MCP spec) rather than protocol
+                // errors, so the model can read the failure and adapt.
                 Err(ToolError::Execution(msg)) => {
                     rpc_result(id, tool_text_result(&json!({ "error": msg }), true))
                 }
+                Err(ToolError::Forbidden(msg)) => rpc_result(
+                    id,
+                    tool_text_result(&json!({ "error": msg, "code": "forbidden" }), true),
+                ),
             }
         }
         _ => rpc_err(
@@ -191,10 +195,11 @@ pub(crate) async fn authenticate(state: &PlatformState, headers: &HeaderMap) -> 
         return Some(claims);
     }
 
-    // 2. API key (hashed lookup).
+    // 2. API key (hashed lookup). Its `scopes` constrain the AI/machine
+    //    principal (the AI axis) to a subset of the creating user's role.
     let key_hash = auth::hash_token(token);
-    let row = sqlx::query_as::<_, (Uuid, Uuid)>(
-        "SELECT tenant_id, created_by FROM api_keys
+    let row = sqlx::query_as::<_, (Uuid, Uuid, Vec<String>)>(
+        "SELECT tenant_id, created_by, scopes FROM api_keys
          WHERE key_hash = $1 AND is_active = TRUE
          AND (expires_at IS NULL OR expires_at > NOW())",
     )
@@ -202,7 +207,7 @@ pub(crate) async fn authenticate(state: &PlatformState, headers: &HeaderMap) -> 
     .fetch_optional(&state.db)
     .await
     .ok()??;
-    let (tenant_id, created_by) = row;
+    let (tenant_id, created_by, key_scopes) = row;
 
     let (role, tenant_slug) = sqlx::query_as::<_, (String, String)>(
         "SELECT u.role, t.slug FROM users u
@@ -221,6 +226,7 @@ pub(crate) async fn authenticate(state: &PlatformState, headers: &HeaderMap) -> 
         tenant_slug,
         iat: chrono::Utc::now().timestamp(),
         exp: chrono::Utc::now().timestamp() + 3600,
+        scopes: Some(key_scopes),
     })
 }
 
@@ -252,6 +258,8 @@ enum ToolError {
     NotFound,
     InvalidParams(String),
     Execution(String),
+    /// The principal lacks the scope required for the tool (RBAC).
+    Forbidden(String),
 }
 
 impl<E: std::fmt::Display> From<E> for ToolError {
@@ -266,6 +274,17 @@ async fn dispatch_tool(
     name: &str,
     args: Value,
 ) -> Result<Value, ToolError> {
+    // RBAC: enforce the tool's required scope before doing any work. JWT users
+    // derive scopes from their role; API keys are narrowed to their scope list.
+    if let Some(required) = crate::rbac::required_scope(name) {
+        let effective = crate::rbac::effective_scopes(&claims.role, claims.scopes.as_deref());
+        if !crate::rbac::allows(&effective, required) {
+            return Err(ToolError::Forbidden(format!(
+                "missing required scope '{required}' for tool '{name}'"
+            )));
+        }
+    }
+
     match name {
         "list_harnesses" => tool_list_harnesses(state, claims, args).await,
         "provision_harness" => tool_provision_harness(state, claims, args).await,
