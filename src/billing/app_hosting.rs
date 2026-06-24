@@ -58,6 +58,28 @@ impl AppHostingTier {
         }
     }
 
+    /// Data-transfer (egress to internet) included per month, in GB. AWS
+    /// egress (~$0.09/GB) is a major real cost — especially for mesh/media-heavy
+    /// apps like Cuspr (a 3D-viewer load pulls tens of MB) — so each tier
+    /// includes an allowance and bills overage to cover it.
+    pub fn included_egress_gb(&self) -> u64 {
+        match self {
+            AppHostingTier::Starter => 50,
+            AppHostingTier::Pro => 250,
+            AppHostingTier::Compliance => 500,
+        }
+    }
+
+    /// Per-GB egress overage beyond the included allowance, in US cents
+    /// (covers AWS data-out + margin).
+    pub fn egress_overage_cents_per_gb(&self) -> u64 {
+        match self {
+            AppHostingTier::Starter => 20,
+            AppHostingTier::Pro => 18,
+            AppHostingTier::Compliance => 15,
+        }
+    }
+
     /// Isolation level (drives the Terraform substrate that's provisioned).
     pub fn isolation(&self) -> &'static str {
         match self {
@@ -114,15 +136,31 @@ pub struct AppHostingCharge {
     pub overage_units: u32,
     pub base_cents: u64,
     pub overage_cents: u64,
+    /// Data egress used this period (GB) and the overage beyond the allowance.
+    pub egress_gb: u64,
+    pub included_egress_gb: u64,
+    pub egress_overage_gb: u64,
+    pub egress_overage_cents: u64,
     pub total_cents: u64,
 }
 
-/// Compute the monthly charge for a tier given total deployed container units.
-pub fn compute_charge(tier: AppHostingTier, units_deployed: u32) -> AppHostingCharge {
+/// Compute the monthly charge for a tier given total deployed container units
+/// and data egress (GB). Both compute (units) and data transfer (egress) bill
+/// overage beyond the tier's allowances, so AWS data-out costs are covered.
+pub fn compute_charge(
+    tier: AppHostingTier,
+    units_deployed: u32,
+    egress_gb: u64,
+) -> AppHostingCharge {
     let included = tier.included_units();
     let overage_units = units_deployed.saturating_sub(included);
     let base_cents = tier.base_cents();
     let overage_cents = overage_units as u64 * tier.overage_cents_per_unit();
+
+    let included_egress = tier.included_egress_gb();
+    let egress_overage_gb = egress_gb.saturating_sub(included_egress);
+    let egress_overage_cents = egress_overage_gb * tier.egress_overage_cents_per_gb();
+
     AppHostingCharge {
         tier,
         units_deployed,
@@ -130,7 +168,11 @@ pub fn compute_charge(tier: AppHostingTier, units_deployed: u32) -> AppHostingCh
         overage_units,
         base_cents,
         overage_cents,
-        total_cents: base_cents + overage_cents,
+        egress_gb,
+        included_egress_gb: included_egress,
+        egress_overage_gb,
+        egress_overage_cents,
+        total_cents: base_cents + overage_cents + egress_overage_cents,
     }
 }
 
@@ -180,7 +222,9 @@ pub async fn tenant_summary(pool: &sqlx::PgPool, tenant_id: uuid::Uuid) -> Tenan
         })
         .sum();
 
-    let charge = tier.map(|t| compute_charge(t, deployed_units));
+    // Egress metering (from CloudWatch/ALB/VPC data-out metrics) is a follow-up;
+    // 0 for now means only base + container-unit overage show until it's wired.
+    let charge = tier.map(|t| compute_charge(t, deployed_units, 0));
 
     TenantBillingSummary {
         plan,
@@ -212,7 +256,7 @@ mod tests {
 
     #[test]
     fn cuspr_on_pro_is_fully_included() {
-        let c = compute_charge(AppHostingTier::Pro, 8);
+        let c = compute_charge(AppHostingTier::Pro, 8, 0);
         assert_eq!(c.overage_units, 0);
         assert_eq!(c.total_cents, 34_900); // $349, no overage
     }
@@ -220,10 +264,28 @@ mod tests {
     #[test]
     fn scaling_adds_metered_overage() {
         // Cuspr scaled to 12 units on Pro: 4 over * $25 = $100 over $349 = $449.
-        let c = compute_charge(AppHostingTier::Pro, 12);
+        let c = compute_charge(AppHostingTier::Pro, 12, 0);
         assert_eq!(c.overage_units, 4);
         assert_eq!(c.overage_cents, 10_000);
         assert_eq!(c.total_cents, 44_900);
+    }
+
+    #[test]
+    fn egress_overage_is_billed() {
+        // Pro: 8 units (included), but 400 GB egress vs 250 included =
+        // 150 over * $0.18 = $27 over the $349 base = $376.
+        let c = compute_charge(AppHostingTier::Pro, 8, 400);
+        assert_eq!(c.overage_cents, 0);
+        assert_eq!(c.egress_overage_gb, 150);
+        assert_eq!(c.egress_overage_cents, 2_700);
+        assert_eq!(c.total_cents, 37_600);
+    }
+
+    #[test]
+    fn egress_within_allowance_is_free() {
+        let c = compute_charge(AppHostingTier::Compliance, 8, 300);
+        assert_eq!(c.egress_overage_gb, 0); // 300 < 500 included
+        assert_eq!(c.total_cents, 89_900);
     }
 
     #[test]

@@ -86,6 +86,33 @@ pub async fn create_portal_session(
     Ok(session.url)
 }
 
+/// Subscribe a customer to an app-hosting tier price.
+///
+/// Created with `default_incomplete` payment behaviour: until a payment method
+/// is attached the subscription stays `incomplete` and **nothing is charged**,
+/// so the billing record can be provisioned before collecting payment. Returns
+/// the subscription id + status.
+pub async fn create_app_subscription(
+    client: &Client,
+    customer_id: stripe::CustomerId,
+    price_id: &str,
+    tenant_id: Uuid,
+) -> Result<(String, String), stripe::StripeError> {
+    let mut params = stripe::CreateSubscription::new(customer_id);
+    params.items = Some(vec![stripe::CreateSubscriptionItems {
+        price: Some(price_id.to_string()),
+        ..Default::default()
+    }]);
+    params.payment_behavior = Some(stripe::SubscriptionPaymentBehavior::DefaultIncomplete);
+    params.metadata = Some(
+        [("tenant_id".to_string(), tenant_id.to_string())]
+            .into_iter()
+            .collect(),
+    );
+    let sub = stripe::Subscription::create(client, params).await?;
+    Ok((sub.id.to_string(), sub.status.to_string()))
+}
+
 /// Cancel a Stripe subscription at period end.
 pub async fn cancel_subscription(
     client: &Client,
@@ -120,6 +147,9 @@ mod tests {
             price_small: Some("price_small_123".into()),
             price_medium: Some("price_medium_456".into()),
             price_large: Some("price_large_789".into()),
+            price_app_starter: None,
+            price_app_pro: None,
+            price_app_compliance: None,
         }
     }
 
@@ -156,6 +186,9 @@ mod tests {
             price_small: None,
             price_medium: None,
             price_large: None,
+            price_app_starter: None,
+            price_app_pro: None,
+            price_app_compliance: None,
         };
         assert_eq!(cfg.price_id_for_size("small"), None);
         assert_eq!(cfg.price_id_for_size("medium"), None);
