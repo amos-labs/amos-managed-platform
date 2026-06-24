@@ -289,6 +289,22 @@ mod tests {
     }
 
     #[test]
+    fn harness_sizes_are_not_app_tiers() {
+        // The checkout router + webhook branch on `parse(plan).is_some()` to
+        // tell an app-hosting tier from a harness size. Sizes must NOT parse as
+        // tiers, or they'd skip harness provisioning.
+        for size in ["small", "medium", "large", "hosted"] {
+            assert_eq!(
+                AppHostingTier::parse(size),
+                None,
+                "size {size} leaked as a tier"
+            );
+        }
+        // App-tier keys do parse.
+        assert!(AppHostingTier::parse("app_compliance").is_some());
+    }
+
+    #[test]
     fn tiers_parse_round_trip() {
         for t in [
             AppHostingTier::Starter,

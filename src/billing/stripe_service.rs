@@ -30,6 +30,11 @@ pub async fn create_customer(
 
 /// Create a Stripe Checkout Session for a new subscription.
 ///
+/// `plan` is the plan key being purchased (harness size like `small`, or an
+/// app-hosting tier like `app_compliance`). It is stamped into the session +
+/// subscription metadata so the webhook knows which plan to record on the
+/// tenant and whether to provision a harness (sizes) or not (app tiers).
+///
 /// Returns the checkout URL the user should be redirected to.
 pub async fn create_checkout_session(
     client: &Client,
@@ -38,7 +43,17 @@ pub async fn create_checkout_session(
     success_url: &str,
     cancel_url: &str,
     tenant_id: Uuid,
+    plan: &str,
 ) -> Result<String, stripe::StripeError> {
+    let meta = || {
+        [
+            ("tenant_id".to_string(), tenant_id.to_string()),
+            ("plan".to_string(), plan.to_string()),
+        ]
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>()
+    };
+
     let mut params = CreateCheckoutSession::new();
     params.customer = Some(customer_id.parse().map_err(|_| {
         stripe::StripeError::ClientError(format!("Invalid customer ID: {}", customer_id))
@@ -51,17 +66,9 @@ pub async fn create_checkout_session(
         quantity: Some(1),
         ..Default::default()
     }]);
-    params.metadata = Some(
-        [("tenant_id".to_string(), tenant_id.to_string())]
-            .into_iter()
-            .collect(),
-    );
+    params.metadata = Some(meta());
     params.subscription_data = Some(stripe::CreateCheckoutSessionSubscriptionData {
-        metadata: Some(
-            [("tenant_id".to_string(), tenant_id.to_string())]
-                .into_iter()
-                .collect(),
-        ),
+        metadata: Some(meta()),
         ..Default::default()
     });
 
