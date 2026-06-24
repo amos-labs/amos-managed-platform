@@ -31,6 +31,7 @@ pub mod mcp;
 pub mod middleware;
 pub mod proof;
 pub mod provisioning;
+pub mod rbac;
 pub mod routes;
 pub mod server;
 pub mod services;

@@ -26,6 +26,12 @@ pub struct Claims {
     pub iat: i64,
     /// Expiration (Unix timestamp).
     pub exp: i64,
+    /// For API-key principals (the AI/machine axis): the key's explicit scope
+    /// list, which narrows the creator's role scopes. `None` for JWT users
+    /// (scopes derive from `role`). Not part of the JWT payload — populated at
+    /// authenticate time for API keys — so it stays absent from issued tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<Vec<String>>,
 }
 
 /// Token pair returned after login or refresh.
@@ -77,6 +83,9 @@ pub fn create_access_token(
         tenant_slug: tenant_slug.to_string(),
         iat: now.timestamp(),
         exp: (now + Duration::seconds(expiry_secs)).timestamp(),
+        // JWT users derive scopes from their role; only API keys carry an
+        // explicit scope subset (set at authenticate time).
+        scopes: None,
     };
 
     encode(

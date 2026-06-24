@@ -116,8 +116,8 @@ pub async fn require_api_key(
     // JWT failed, try API key validation
     let key_hash = auth::hash_token(token);
 
-    let api_key_result = sqlx::query_as::<_, (Uuid, Uuid, Uuid)>(
-        "SELECT id, tenant_id, created_by FROM api_keys
+    let api_key_result = sqlx::query_as::<_, (Uuid, Uuid, Uuid, Vec<String>)>(
+        "SELECT id, tenant_id, created_by, scopes FROM api_keys
          WHERE key_hash = $1 AND is_active = TRUE
          AND (expires_at IS NULL OR expires_at > NOW())",
     )
@@ -126,7 +126,7 @@ pub async fn require_api_key(
     .await;
 
     match api_key_result {
-        Ok(Some((api_key_id, tenant_id, created_by_user_id))) => {
+        Ok(Some((api_key_id, tenant_id, created_by_user_id, key_scopes))) => {
             // API key is valid, need to fetch user role and tenant slug to create synthetic Claims
             let user_result = sqlx::query_as::<_, (String, String)>(
                 "SELECT u.role, t.slug FROM users u
@@ -158,6 +158,7 @@ pub async fn require_api_key(
                         tenant_slug,
                         iat: chrono::Utc::now().timestamp(),
                         exp: chrono::Utc::now().timestamp() + 3600, // synthetic expiry
+                        scopes: Some(key_scopes),
                     };
 
                     req.extensions_mut().insert(claims);
