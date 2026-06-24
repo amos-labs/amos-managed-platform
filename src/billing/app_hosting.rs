@@ -50,11 +50,16 @@ impl AppHostingTier {
     }
 
     /// Per-unit-month overage cost beyond the included pool, in US cents.
+    ///
+    /// Set **above** the marginal cost of a unit (1 vCPU + 2 GB ≈ $29–36/mo on
+    /// Fargate) so scaling past the included pool stays profitable — roughly
+    /// 1.5–1.7× cost, easing by tier for volume. (Earlier rates of $20–30 were
+    /// below cost and lost margin on every overage unit.)
     pub fn overage_cents_per_unit(&self) -> u64 {
         match self {
-            AppHostingTier::Starter => 3_000,
-            AppHostingTier::Pro => 2_500,
-            AppHostingTier::Compliance => 2_000,
+            AppHostingTier::Starter => 6_000,
+            AppHostingTier::Pro => 5_500,
+            AppHostingTier::Compliance => 5_000,
         }
     }
 
@@ -325,11 +330,11 @@ mod tests {
 
     #[test]
     fn scaling_adds_metered_overage() {
-        // Cuspr scaled to 12 units on Pro: 4 over * $25 = $100 over $349 = $449.
+        // Cuspr scaled to 12 units on Pro: 4 over * $55 = $220 over $349 = $569.
         let c = compute_charge(AppHostingTier::Pro, 12, 0);
         assert_eq!(c.overage_units, 4);
-        assert_eq!(c.overage_cents, 10_000);
-        assert_eq!(c.total_cents, 44_900);
+        assert_eq!(c.overage_cents, 22_000);
+        assert_eq!(c.total_cents, 56_900);
     }
 
     #[test]
@@ -363,28 +368,28 @@ mod tests {
         assert_eq!(p.overage_unit_hours, 0.0);
         assert_eq!(p.total_cents, 34_900);
 
-        // Constant 12 units for a full month = the snapshot's $449 (4 over × $25).
+        // Constant 12 units for a full month = the snapshot's $569 (4 over × $55).
         let p = compute_period_charge(
             AppHostingTier::Pro,
             12.0 * HOURS_PER_MONTH,
             0.0,
             HOURS_PER_MONTH,
         );
-        assert_eq!(p.total_cents, 44_900);
+        assert_eq!(p.total_cents, 56_900);
     }
 
     #[test]
     fn period_charge_prorates_partial_usage() {
         // 12 units but only for half the month: overage unit-hours are halved,
-        // so overage is ~half of the $100 continuous overage ($50) over base.
+        // so overage is ~half of the $220 continuous overage ($110) over base.
         let p = compute_period_charge(
             AppHostingTier::Pro,
             8.0 * HOURS_PER_MONTH + 4.0 * (HOURS_PER_MONTH / 2.0),
             0.0,
             HOURS_PER_MONTH,
         );
-        assert_eq!(p.overage_cents, 5_000); // half of $100
-        assert_eq!(p.total_cents, 39_900); // $349 + $50
+        assert_eq!(p.overage_cents, 11_000); // half of $220
+        assert_eq!(p.total_cents, 45_900); // $349 + $110
     }
 
     #[test]
