@@ -843,7 +843,7 @@ mod tests {
         // Same convention used in `crate::billing::metered_billing`.
         // Verifying we don't drift from that.
         let cases = [
-            (50_000_i64, "5.00"),  // The $5 monthly grant
+            (50_000_i64, "5.00"), // The $5 monthly grant
             (10_000_i64, "1.00"),
             (123_i64, "0.01"),
             (0_i64, "0.00"),

@@ -234,7 +234,10 @@ impl PlatformState {
                     Some(Arc::new(p))
                 }
                 Err(e) => {
-                    warn!("AWS app provisioner initialization failed (optional): {}", e);
+                    warn!(
+                        "AWS app provisioner initialization failed (optional): {}",
+                        e
+                    );
                     None
                 }
             },

@@ -21,12 +21,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .get(2)
         .cloned()
         .unwrap_or_else(|| "amos-build-smoke".to_string());
-    let dockerfile = args.get(3).cloned().unwrap_or_else(|| "Dockerfile".to_string());
-    let tag = args.get(4).cloned().unwrap_or_else(|| "rust-v1".to_string());
+    let dockerfile = args
+        .get(3)
+        .cloned()
+        .unwrap_or_else(|| "Dockerfile".to_string());
+    let tag = args
+        .get(4)
+        .cloned()
+        .unwrap_or_else(|| "rust-v1".to_string());
 
     let config = ImageBuilderConfig::from_env()
         .ok_or("AMOS_BUILD_SOURCE_BUCKET not set — cannot run live build")?;
-    println!("config: project={} bucket={}", config.project_name, config.source_bucket);
+    println!(
+        "config: project={} bucket={}",
+        config.project_name, config.source_bucket
+    );
 
     let builder = ImageBuilder::new(config).await?;
 
@@ -44,7 +53,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(15)).await;
         let s = builder.build_state(&build_id, &image_name, &tag).await?;
-        println!("status={} phase={} done={}", s.status, s.current_phase, s.done);
+        println!(
+            "status={} phase={} done={}",
+            s.status, s.current_phase, s.done
+        );
         if s.done {
             println!("succeeded={}", s.succeeded);
             println!("digest={:?}", s.image_digest);

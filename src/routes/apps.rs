@@ -36,12 +36,14 @@ async fn tenant_of(
     state: &PlatformState,
     headers: &HeaderMap,
 ) -> Result<(Uuid, String), (StatusCode, Json<serde_json::Value>)> {
-    let claims = crate::mcp::authenticate(state, headers).await.ok_or_else(|| {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "missing or invalid bearer token"})),
-        )
-    })?;
+    let claims = crate::mcp::authenticate(state, headers)
+        .await
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "missing or invalid bearer token"})),
+            )
+        })?;
     let tenant_id = Uuid::parse_str(&claims.tenant_id).map_err(|_| {
         (
             StatusCode::UNAUTHORIZED,
@@ -53,8 +55,7 @@ async fn tenant_of(
 
 /// Map an orchestrator error to an HTTP status + JSON body.
 fn err_response(e: AmosError) -> (StatusCode, Json<serde_json::Value>) {
-    let status =
-        StatusCode::from_u16(e.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let status = StatusCode::from_u16(e.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     (status, Json(json!({ "error": e.to_string() })))
 }
 

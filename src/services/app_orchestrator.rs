@@ -146,7 +146,10 @@ async fn run_provision(
             // Accountability for failures matters as much as for successes.
             let receipt = base_receipt()
                 .check("provision", CheckStatus::Failed, e.to_string())
-                .summary(format!("Deploy of '{}' failed during provisioning", spec.name));
+                .summary(format!(
+                    "Deploy of '{}' failed during provisioning",
+                    spec.name
+                ));
             if let Err(emit_err) = proof::emit(&state.db, &receipt).await {
                 tracing::warn!(%deployment_id, "failed to emit deploy receipt: {emit_err}");
             }
@@ -276,7 +279,16 @@ pub async fn deploy_app_aws(
     let bg_spec = spec.clone();
     let bg_actor = actor.to_string();
     tokio::spawn(async move {
-        run_provision_aws(&bg_state, deployment_id, tenant_id, &bg_actor, bg_spec, target, callback_url).await;
+        run_provision_aws(
+            &bg_state,
+            deployment_id,
+            tenant_id,
+            &bg_actor,
+            bg_spec,
+            target,
+            callback_url,
+        )
+        .await;
     });
 
     Ok(json!({
@@ -340,12 +352,11 @@ async fn run_provision_aws(
             .execute(&state.db)
             .await;
             // Non-managed services are now running under the ECS task.
-            let _ = sqlx::query(
-                "UPDATE app_services SET status = 'running' WHERE deployment_id = $1",
-            )
-            .bind(deployment_id)
-            .execute(&state.db)
-            .await;
+            let _ =
+                sqlx::query("UPDATE app_services SET status = 'running' WHERE deployment_id = $1")
+                    .bind(deployment_id)
+                    .execute(&state.db)
+                    .await;
 
             let mut receipt = base()
                 .check(
@@ -356,7 +367,10 @@ async fn run_provision_aws(
                 .check(
                     "ecs_service_deployed",
                     CheckStatus::Passed,
-                    result.service_arn.clone().unwrap_or_else(|| result.service_name.clone()),
+                    result
+                        .service_arn
+                        .clone()
+                        .unwrap_or_else(|| result.service_name.clone()),
                 )
                 .outputs(aws_meta)
                 .summary(format!(
@@ -368,18 +382,25 @@ async fn run_provision_aws(
                 receipt = receipt.check(
                     "managed_resources_injected",
                     CheckStatus::Passed,
-                    format!("skipped as containers: {}", result.managed_skipped.join(", ")),
+                    format!(
+                        "skipped as containers: {}",
+                        result.managed_skipped.join(", ")
+                    ),
                 );
             }
             if let Err(e) = proof::emit(&state.db, &receipt).await {
                 tracing::warn!(%deployment_id, "failed to emit aws deploy receipt: {e}");
             }
             if let Some(url) = &callback_url {
-                ping_back(url, json!({
-                    "event": "deploy_app.completed", "deployment_id": deployment_id,
-                    "name": spec.name, "provider": "aws", "verified": receipt.verified(),
-                    "summary": receipt.result_summary, "status": "running",
-                })).await;
+                ping_back(
+                    url,
+                    json!({
+                        "event": "deploy_app.completed", "deployment_id": deployment_id,
+                        "name": spec.name, "provider": "aws", "verified": receipt.verified(),
+                        "summary": receipt.result_summary, "status": "running",
+                    }),
+                )
+                .await;
             }
         }
         Err(e) => {
@@ -395,11 +416,15 @@ async fn run_provision_aws(
                 tracing::warn!(%deployment_id, "failed to emit aws deploy receipt: {emit_err}");
             }
             if let Some(url) = &callback_url {
-                ping_back(url, json!({
-                    "event": "deploy_app.failed", "deployment_id": deployment_id,
-                    "name": spec.name, "provider": "aws", "verified": false,
-                    "summary": receipt.result_summary, "status": "error",
-                })).await;
+                ping_back(
+                    url,
+                    json!({
+                        "event": "deploy_app.failed", "deployment_id": deployment_id,
+                        "name": spec.name, "provider": "aws", "verified": false,
+                        "summary": receipt.result_summary, "status": "error",
+                    }),
+                )
+                .await;
             }
         }
     }
@@ -446,26 +471,29 @@ pub async fn list_apps(state: &PlatformState, tenant_id: Uuid) -> Result<Value> 
 }
 
 /// Live status of one deployment: DB rows joined with live container state.
-pub async fn app_status(state: &PlatformState, tenant_id: Uuid, deployment_id: Uuid) -> Result<Value> {
+pub async fn app_status(
+    state: &PlatformState,
+    tenant_id: Uuid,
+    deployment_id: Uuid,
+) -> Result<Value> {
     let (name, db_status, network_id) = deployment_row(state, tenant_id, deployment_id).await?;
     let app_manager = state.app_manager.as_ref();
 
     // Provider determines where "live" status comes from.
-    let provider: String = sqlx::query_scalar(
-        "SELECT provider FROM app_deployments WHERE id = $1",
-    )
-    .bind(deployment_id)
-    .fetch_one(&state.db)
-    .await
-    .map_err(AmosError::Database)?;
+    let provider: String = sqlx::query_scalar("SELECT provider FROM app_deployments WHERE id = $1")
+        .bind(deployment_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(AmosError::Database)?;
 
     // AWS deploys: surface the live ECS rollout (state, running/desired,
     // per-container status) so deploy progress is visible from app_status.
     if provider == "ecs" {
         let aws = match state.aws_app_provisioner.as_ref() {
-            Some(p) => p.service_status(&name).await.unwrap_or_else(|e| {
-                json!({ "error": format!("ECS status unavailable: {e}") })
-            }),
+            Some(p) => p
+                .service_status(&name)
+                .await
+                .unwrap_or_else(|e| json!({ "error": format!("ECS status unavailable: {e}") })),
             None => json!({ "error": "AWS app provisioner not available" }),
         };
         let svc_rows = sqlx::query_as::<_, (String, bool, String)>(
@@ -580,7 +608,9 @@ pub async fn app_logs(
     })?;
 
     let logs = app_manager.logs(&container_id, tail).await?;
-    Ok(json!({ "deployment_id": deployment_id, "service": service, "provider": "docker", "logs": logs }))
+    Ok(
+        json!({ "deployment_id": deployment_id, "service": service, "provider": "docker", "logs": logs }),
+    )
 }
 
 /// start / stop / restart / deprovision a deployment (or a single service).

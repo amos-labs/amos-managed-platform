@@ -103,10 +103,7 @@ pub fn app_spec_from_compose_str(yaml: &str, compose_dir: &Path) -> Result<AppSp
     let parsed: ComposeFile =
         serde_yaml::from_str(yaml).map_err(|e| format!("invalid compose YAML: {e}"))?;
 
-    let app_name = parsed
-        .name
-        .clone()
-        .unwrap_or_else(|| "app".to_string());
+    let app_name = parsed.name.clone().unwrap_or_else(|| "app".to_string());
 
     let mut services = Vec::new();
     for (svc_name, svc) in &parsed.services {
@@ -150,9 +147,14 @@ fn convert_service(
         (_, Some(build)) => {
             let (context, dockerfile) = match build {
                 ComposeBuild::Short(ctx) => (ctx.clone(), "Dockerfile".to_string()),
-                ComposeBuild::Long { context, dockerfile } => (
+                ComposeBuild::Long {
+                    context,
+                    dockerfile,
+                } => (
                     context.clone().unwrap_or_else(|| ".".to_string()),
-                    dockerfile.clone().unwrap_or_else(|| "Dockerfile".to_string()),
+                    dockerfile
+                        .clone()
+                        .unwrap_or_else(|| "Dockerfile".to_string()),
                 ),
             };
             ImageSource::Build {
@@ -216,8 +218,17 @@ fn is_managed_image(image: &str) -> bool {
         .unwrap_or(image)
         .to_ascii_lowercase();
     const MANAGED: &[&str] = &[
-        "postgres", "postgresql", "redis", "valkey", "mysql", "mariadb",
-        "mongo", "mongodb", "pgvector", "ankane/pgvector", "memcached",
+        "postgres",
+        "postgresql",
+        "redis",
+        "valkey",
+        "mysql",
+        "mariadb",
+        "mongo",
+        "mongodb",
+        "pgvector",
+        "ankane/pgvector",
+        "memcached",
     ];
     MANAGED.iter().any(|m| name == *m || name.starts_with(m))
 }
@@ -497,7 +508,11 @@ services:
     fn build_vs_pull_and_tag() {
         let s = spec();
         match &s.service("api").unwrap().image {
-            ImageSource::Build { tag, dockerfile, context } => {
+            ImageSource::Build {
+                tag,
+                dockerfile,
+                context,
+            } => {
                 assert_eq!(tag, "amos-cuspr-api:latest");
                 assert_eq!(dockerfile, "containers/app/Containerfile.dev");
                 assert_eq!(context, "/srv/cuspr/."); // resolved against compose dir

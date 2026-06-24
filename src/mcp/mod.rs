@@ -100,7 +100,11 @@ async fn handle_mcp(
             }
             return (
                 StatusCode::UNAUTHORIZED,
-                rpc_err(id, rpc_error::INVALID_REQUEST, "missing or invalid bearer token"),
+                rpc_err(
+                    id,
+                    rpc_error::INVALID_REQUEST,
+                    "missing or invalid bearer token",
+                ),
             )
                 .into_response();
         }
@@ -123,13 +127,15 @@ async fn handle_mcp(
                         "version": crate::VERSION,
                     },
                     "instructions": "AMOS managed-environment control plane. Use these tools to \
-provision, inspect, operate, and configure governed AMOS environments without re-discovering \
-infrastructure. Tools are scoped to your tenant.",
+                provision, inspect, operate, and configure governed AMOS environments without re-discovering \
+                infrastructure. Tools are scoped to your tenant.",
                 }),
             )
         }
         // Notifications carry no id and expect no response body.
-        "notifications/initialized" | "notifications/cancelled" => StatusCode::ACCEPTED.into_response(),
+        "notifications/initialized" | "notifications/cancelled" => {
+            StatusCode::ACCEPTED.into_response()
+        }
         "ping" => rpc_result(id, json!({})),
         "tools/list" => rpc_result(id, json!({ "tools": tool_definitions() })),
         "tools/call" => {
@@ -137,12 +143,12 @@ infrastructure. Tools are scoped to your tenant.",
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
             match dispatch_tool(&state, &claims, name, args).await {
                 Ok(value) => rpc_result(id, tool_text_result(&value, false)),
-                Err(ToolError::NotFound) => {
-                    rpc_err(id, rpc_error::METHOD_NOT_FOUND, format!("unknown tool '{name}'"))
-                }
-                Err(ToolError::InvalidParams(msg)) => {
-                    rpc_err(id, rpc_error::INVALID_PARAMS, msg)
-                }
+                Err(ToolError::NotFound) => rpc_err(
+                    id,
+                    rpc_error::METHOD_NOT_FOUND,
+                    format!("unknown tool '{name}'"),
+                ),
+                Err(ToolError::InvalidParams(msg)) => rpc_err(id, rpc_error::INVALID_PARAMS, msg),
                 // Execution errors are reported as tool results with isError=true
                 // (per MCP spec) rather than as protocol errors, so the model can
                 // read the failure and adapt.
@@ -151,7 +157,11 @@ infrastructure. Tools are scoped to your tenant.",
                 }
             }
         }
-        _ => rpc_err(id, rpc_error::METHOD_NOT_FOUND, format!("unknown method '{method}'")),
+        _ => rpc_err(
+            id,
+            rpc_error::METHOD_NOT_FOUND,
+            format!("unknown method '{method}'"),
+        ),
     }
 }
 
@@ -315,7 +325,12 @@ async fn tool_deploy_app(
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
         return crate::services::app_orchestrator::deploy_app_aws(
-            state, tenant_id, actor, spec, target, callback_url,
+            state,
+            tenant_id,
+            actor,
+            spec,
+            target,
+            callback_url,
         )
         .await
         .map_err(map_amos_err);
@@ -338,9 +353,8 @@ async fn tool_deploy_app(
         .await
         .map_err(map_amos_err)
     } else if let Some(spec_val) = args.get("spec") {
-        let spec: crate::provisioning::app_spec::AppSpec =
-            serde_json::from_value(spec_val.clone())
-                .map_err(|e| ToolError::InvalidParams(format!("invalid app spec: {e}")))?;
+        let spec: crate::provisioning::app_spec::AppSpec = serde_json::from_value(spec_val.clone())
+            .map_err(|e| ToolError::InvalidParams(format!("invalid app spec: {e}")))?;
         crate::services::app_orchestrator::deploy_app(state, tenant_id, actor, spec)
             .await
             .map_err(map_amos_err)
@@ -357,9 +371,15 @@ fn resolve_spec_arg(args: &Value) -> Result<crate::provisioning::app_spec::AppSp
         serde_json::from_value(spec_val.clone())
             .map_err(|e| ToolError::InvalidParams(format!("invalid app spec: {e}")))
     } else if let Some(yaml) = args.get("compose_yaml").and_then(|v| v.as_str()) {
-        let dir = args.get("compose_dir").and_then(|v| v.as_str()).unwrap_or(".");
-        crate::provisioning::compose_intake::app_spec_from_compose_str(yaml, std::path::Path::new(dir))
-            .map_err(ToolError::InvalidParams)
+        let dir = args
+            .get("compose_dir")
+            .and_then(|v| v.as_str())
+            .unwrap_or(".");
+        crate::provisioning::compose_intake::app_spec_from_compose_str(
+            yaml,
+            std::path::Path::new(dir),
+        )
+        .map_err(ToolError::InvalidParams)
     } else {
         Err(ToolError::InvalidParams(
             "provide either 'spec' or 'compose_yaml'".into(),
@@ -381,7 +401,10 @@ fn parse_aws_target(aws: Option<&Value>) -> crate::provisioning::aws_app::AwsDep
         public_url: s("public_url"),
         cpu: s("cpu"),
         memory: s("memory"),
-        ephemeral_storage_gib: a.get("ephemeral_storage_gib").and_then(|v| v.as_i64()).map(|v| v as i32),
+        ephemeral_storage_gib: a
+            .get("ephemeral_storage_gib")
+            .and_then(|v| v.as_i64())
+            .map(|v| v as i32),
         task_role_arn: s("task_role_arn"),
     }
 }
@@ -463,10 +486,7 @@ async fn tool_build_image(
         build_args,
     };
 
-    let build_id = builder
-        .start_build(&req)
-        .await
-        .map_err(map_amos_err)?;
+    let build_id = builder.start_build(&req).await.map_err(map_amos_err)?;
 
     // Poll the build to completion in the background and emit a proof receipt —
     // builds take minutes; blocking the MCP call would time out. Callers watch
@@ -483,7 +503,15 @@ async fn tool_build_image(
     let bg_ctx = context_dir.clone();
     tokio::spawn(async move {
         run_build_to_receipt(
-            &bg, builder, &bg_build_id, &bg_image, &bg_tag, &bg_df, &bg_ctx, tenant_id, &actor,
+            &bg,
+            builder,
+            &bg_build_id,
+            &bg_image,
+            &bg_tag,
+            &bg_df,
+            &bg_ctx,
+            tenant_id,
+            &actor,
             callback_url,
         )
         .await;
@@ -586,7 +614,11 @@ async fn run_build_to_receipt(
             .outputs(serde_json::json!({ "logs_url": s.logs_url }))
             .summary(format!("Build of {image_name}:{tag} failed ({})", s.status)),
         None => receipt
-            .check("image_built", CheckStatus::Failed, "build did not finish within poll window")
+            .check(
+                "image_built",
+                CheckStatus::Failed,
+                "build did not finish within poll window",
+            )
             .summary(format!("Build of {image_name}:{tag} timed out")),
     };
 
@@ -618,10 +650,7 @@ async fn tool_build_status(
         .ok_or_else(|| ToolError::Execution("image builder not configured".into()))?;
     let build_id = arg_str(&args, "build_id")?;
     let image_name = arg_str(&args, "image_name")?;
-    let tag = args
-        .get("tag")
-        .and_then(|v| v.as_str())
-        .unwrap_or("latest");
+    let tag = args.get("tag").and_then(|v| v.as_str()).unwrap_or("latest");
 
     let s = builder
         .build_state(&build_id, &image_name, tag)
@@ -660,10 +689,7 @@ async fn tool_app_logs(
     let tenant_id = resolve_tenant(claims, &args)?;
     let deployment_id = arg_uuid(&args, "deployment_id")?;
     let service = arg_str(&args, "service")?;
-    let tail = args
-        .get("tail")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(200) as usize;
+    let tail = args.get("tail").and_then(|v| v.as_u64()).unwrap_or(200) as usize;
     crate::services::app_orchestrator::app_logs(state, tenant_id, deployment_id, &service, tail)
         .await
         .map_err(map_amos_err)
@@ -720,7 +746,8 @@ fn arg_str(args: &Value, key: &str) -> Result<String, ToolError> {
 
 fn arg_uuid(args: &Value, key: &str) -> Result<Uuid, ToolError> {
     let s = arg_str(args, key)?;
-    Uuid::parse_str(&s).map_err(|_| ToolError::InvalidParams(format!("'{key}' is not a valid UUID")))
+    Uuid::parse_str(&s)
+        .map_err(|_| ToolError::InvalidParams(format!("'{key}' is not a valid UUID")))
 }
 
 fn parse_instance_size(args: &Value) -> InstanceSize {
@@ -856,11 +883,19 @@ async fn tool_provision_harness(
         let packages: Vec<String> = args
             .get("packages")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_else(|| {
                 row_pkgs
                     .as_array()
-                    .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default()
             });
         // Move the existing row into 'provisioning' with the requested sizing.
@@ -892,7 +927,11 @@ async fn tool_provision_harness(
         let packages: Vec<String> = args
             .get("packages")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         let harness_id = Uuid::new_v4();
         sqlx::query(
@@ -929,9 +968,10 @@ async fn tool_provision_harness(
     };
 
     let (container_id, provider, status) = if let Some(manager) = state.harness_manager.as_ref() {
-        let cid = manager.provision(&config).await.map_err(|e| {
-            ToolError::Execution(format!("docker provisioning failed: {e}"))
-        })?;
+        let cid = manager
+            .provision(&config)
+            .await
+            .map_err(|e| ToolError::Execution(format!("docker provisioning failed: {e}")))?;
         let _ = manager.start(&cid).await;
         (cid, "docker", "running")
     } else if let Some(ecs) = state.ecs_provisioner.as_ref() {
@@ -1094,11 +1134,12 @@ async fn tool_harness_control(
         }
     };
 
-    let _ = sqlx::query("UPDATE harness_instances SET status = $1, updated_at = NOW() WHERE id = $2")
-        .bind(new_status)
-        .bind(harness_id)
-        .execute(&state.db)
-        .await;
+    let _ =
+        sqlx::query("UPDATE harness_instances SET status = $1, updated_at = NOW() WHERE id = $2")
+            .bind(new_status)
+            .bind(harness_id)
+            .execute(&state.db)
+            .await;
 
     Ok(json!({ "harness_id": harness_id, "action": action, "status": new_status }))
 }

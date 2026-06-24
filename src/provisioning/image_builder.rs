@@ -68,8 +68,8 @@ impl ImageBuilderConfig {
     /// `AMOS_BUILD_SOURCE_BUCKET` is set — the gate for cloud builds.
     pub fn from_env() -> Option<Self> {
         let source_bucket = std::env::var("AMOS_BUILD_SOURCE_BUCKET").ok()?;
-        let project_name =
-            std::env::var("AMOS_BUILD_PROJECT").unwrap_or_else(|_| "amos-image-builder".to_string());
+        let project_name = std::env::var("AMOS_BUILD_PROJECT")
+            .unwrap_or_else(|_| "amos-image-builder".to_string());
         let aws_region = std::env::var("AWS_REGION")
             .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
             .unwrap_or_else(|_| "us-east-1".to_string());
@@ -233,7 +233,12 @@ impl ImageBuilder {
     }
 
     /// Poll a build's state. On success, reads the pushed digest from ECR.
-    pub async fn build_state(&self, build_id: &str, image_name: &str, tag: &str) -> Result<BuildState> {
+    pub async fn build_state(
+        &self,
+        build_id: &str,
+        image_name: &str,
+        tag: &str,
+    ) -> Result<BuildState> {
         let resp = self
             .codebuild
             .batch_get_builds()
@@ -242,13 +247,10 @@ impl ImageBuilder {
             .await
             .map_err(|e| AmosError::Internal(format!("failed to get build: {e}")))?;
 
-        let build = resp
-            .builds()
-            .first()
-            .ok_or_else(|| AmosError::NotFound {
-                entity: "codebuild build".into(),
-                id: build_id.to_string(),
-            })?;
+        let build = resp.builds().first().ok_or_else(|| AmosError::NotFound {
+            entity: "codebuild build".into(),
+            id: build_id.to_string(),
+        })?;
 
         let status = build
             .build_status()

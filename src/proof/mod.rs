@@ -328,7 +328,10 @@ mod tests {
     fn guardrails_accumulate() {
         let r = receipt();
         assert_eq!(r.policy.guardrails.len(), 2);
-        assert!(r.policy.guardrails.contains(&"tenant_isolation".to_string()));
+        assert!(r
+            .policy
+            .guardrails
+            .contains(&"tenant_isolation".to_string()));
     }
 
     #[test]

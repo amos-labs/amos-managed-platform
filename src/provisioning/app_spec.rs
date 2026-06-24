@@ -306,7 +306,10 @@ impl AppSpec {
             for dep in &svc.depends_on {
                 // edge dep -> svc (dep must start before svc)
                 *indegree.entry(svc.name.as_str()).or_insert(0) += 1;
-                dependents.entry(dep.as_str()).or_default().push(svc.name.as_str());
+                dependents
+                    .entry(dep.as_str())
+                    .or_default()
+                    .push(svc.name.as_str());
             }
         }
 

@@ -91,7 +91,12 @@ impl AppManager {
         format!("amos-app-{}-{}", deployment_id, service)
     }
 
-    fn labels(deployment_id: Uuid, tenant_id: Uuid, app: &str, service: Option<&str>) -> HashMap<String, String> {
+    fn labels(
+        deployment_id: Uuid,
+        tenant_id: Uuid,
+        app: &str,
+        service: Option<&str>,
+    ) -> HashMap<String, String> {
         let mut labels = HashMap::from([
             (LABEL_APP.to_string(), app.to_string()),
             (LABEL_DEPLOYMENT.to_string(), deployment_id.to_string()),
@@ -261,7 +266,11 @@ impl AppManager {
             } else {
                 Some(port_bindings)
             },
-            mounts: if mounts.is_empty() { None } else { Some(mounts) },
+            mounts: if mounts.is_empty() {
+                None
+            } else {
+                Some(mounts)
+            },
             nano_cpus: svc.resources.nano_cpus(),
             memory: svc.resources.memory_bytes(),
             restart_policy,
@@ -327,7 +336,10 @@ impl AppManager {
                 AmosError::Internal(format!("Failed to start container {}: {}", svc.name, e))
             })?;
 
-        let host_ports = self.inspect_host_ports(&create.id, svc).await.unwrap_or_default();
+        let host_ports = self
+            .inspect_host_ports(&create.id, svc)
+            .await
+            .unwrap_or_default();
 
         Ok(ServiceDeployResult {
             service_name: svc.name.clone(),
@@ -379,7 +391,8 @@ impl AppManager {
                 dockerfile,
                 tag,
             } => {
-                self.build_image(&svc.name, context, dockerfile, tag).await?;
+                self.build_image(&svc.name, context, dockerfile, tag)
+                    .await?;
                 Ok(tag.clone())
             }
         }
@@ -412,9 +425,7 @@ impl AppManager {
         let tar_bytes = tokio::task::spawn_blocking(move || tar_context(&context_for_tar))
             .await
             .map_err(|e| AmosError::Internal(format!("tar task join error: {e}")))?
-            .map_err(|e| {
-                AmosError::Internal(format!("failed to package build context: {e}"))
-            })?;
+            .map_err(|e| AmosError::Internal(format!("failed to package build context: {e}")))?;
 
         let options = bollard::image::BuildImageOptions {
             dockerfile: dockerfile.to_string(),
@@ -515,7 +526,10 @@ impl AppManager {
             Err(bollard::errors::Error::DockerResponseServerError {
                 status_code: 304, ..
             }) => Ok(()),
-            Err(e) => Err(AmosError::Internal(format!("Failed to stop container: {}", e))),
+            Err(e) => Err(AmosError::Internal(format!(
+                "Failed to stop container: {}",
+                e
+            ))),
         }
     }
 

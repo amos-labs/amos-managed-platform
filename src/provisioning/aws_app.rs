@@ -12,13 +12,13 @@
 //! aren't part of the portable spec — they ride in on an [`AwsDeployTarget`].
 //! Shared substrate (cluster, subnets, region) comes from env.
 
+use aws_sdk_cloudwatchlogs::Client as LogsClient;
 use aws_sdk_ecs::types::{
     AssignPublicIp, AwsVpcConfiguration, Compatibility, ContainerDefinition, CpuArchitecture,
     EphemeralStorage, KeyValuePair, LaunchType, LoadBalancer, LogConfiguration, LogDriver,
     MountPoint, NetworkConfiguration, NetworkMode, OsFamily, PortMapping, RuntimePlatform, Secret,
     TransportProtocol, Volume,
 };
-use aws_sdk_cloudwatchlogs::Client as LogsClient;
 use aws_sdk_ecs::Client as EcsClient;
 use std::collections::HashMap;
 use tracing::info;
@@ -60,17 +60,16 @@ impl AwsAppProvisionerConfig {
         }
         let cluster = std::env::var("ECS_CLUSTER")
             .unwrap_or_else(|_| "swarm-infrastructure-cluster".to_string());
-        let subnets = split_csv(
-            &std::env::var("ECS_SUBNETS")
-                .unwrap_or_else(|_| "subnet-0cfcbfd1c0ef057e7,subnet-0c5928d36478a1be4".to_string()),
-        );
+        let subnets =
+            split_csv(&std::env::var("ECS_SUBNETS").unwrap_or_else(|_| {
+                "subnet-0cfcbfd1c0ef057e7,subnet-0c5928d36478a1be4".to_string()
+            }));
         let security_groups = split_csv(
             &std::env::var("ECS_SECURITY_GROUPS")
                 .unwrap_or_else(|_| "sg-0967e26d543a5ce47".to_string()),
         );
-        let execution_role_arn = std::env::var("ECS_EXECUTION_ROLE_ARN").unwrap_or_else(|_| {
-            "arn:aws:iam::637423327454:role/ecsTaskExecutionRole".to_string()
-        });
+        let execution_role_arn = std::env::var("ECS_EXECUTION_ROLE_ARN")
+            .unwrap_or_else(|_| "arn:aws:iam::637423327454:role/ecsTaskExecutionRole".to_string());
         // Default the task role to the exec role (matches the Cuspr deploy,
         // where one role carried both secret-read and S3 access).
         let task_role_arn =
@@ -152,7 +151,11 @@ impl AwsAppProvisioner {
 
     /// Render the spec to a task definition, register it, and create/update the
     /// ECS service.
-    pub async fn deploy(&self, spec: &AppSpec, target: &AwsDeployTarget) -> Result<AwsDeployResult> {
+    pub async fn deploy(
+        &self,
+        spec: &AppSpec,
+        target: &AwsDeployTarget,
+    ) -> Result<AwsDeployResult> {
         spec.validate().map_err(AmosError::Validation)?;
 
         let log_group = format!("/ecs/{}", spec.name);
@@ -224,7 +227,12 @@ impl AwsAppProvisioner {
             .memory(target.memory.clone().unwrap_or_else(|| "16384".to_string()))
             .runtime_platform(runtime_platform)
             .execution_role_arn(&self.execution_role_arn)
-            .task_role_arn(target.task_role_arn.clone().unwrap_or_else(|| self.task_role_arn.clone()))
+            .task_role_arn(
+                target
+                    .task_role_arn
+                    .clone()
+                    .unwrap_or_else(|| self.task_role_arn.clone()),
+            )
             .ephemeral_storage(
                 EphemeralStorage::builder()
                     .size_in_gib(target.ephemeral_storage_gib.unwrap_or(40))
@@ -280,9 +288,7 @@ impl AwsAppProvisioner {
                                 .set_security_groups(Some(self.security_groups.clone()))
                                 .assign_public_ip(AssignPublicIp::Enabled)
                                 .build()
-                                .map_err(|e| {
-                                    AmosError::Internal(format!("vpc config: {e}"))
-                                })?,
+                                .map_err(|e| AmosError::Internal(format!("vpc config: {e}")))?,
                         )
                         .build(),
                 );
@@ -418,14 +424,18 @@ impl AwsAppProvisioner {
             .map_err(|e| AmosError::Internal(format!("describe_services: {e}")))?;
         let svc = resp.services().first();
         let primary = svc.and_then(|s| {
-            s.deployments().iter().find(|d| d.status() == Some("PRIMARY"))
+            s.deployments()
+                .iter()
+                .find(|d| d.status() == Some("PRIMARY"))
         });
         let rollout_state = primary
             .and_then(|d| d.rollout_state())
             .map(|r| r.as_str().to_string());
         let running = svc.map(|s| s.running_count()).unwrap_or(0);
         let desired = svc.map(|s| s.desired_count()).unwrap_or(0);
-        let task_def = primary.and_then(|d| d.task_definition()).map(|s| s.to_string());
+        let task_def = primary
+            .and_then(|d| d.task_definition())
+            .map(|s| s.to_string());
 
         // Per-container last-status from the service's current task.
         let mut containers = Vec::new();
@@ -527,7 +537,12 @@ impl AwsAppProvisioner {
         }
 
         for v in &svc.volumes {
-            if let super::app_spec::VolumeMount::Named { volume, target, read_only } = v {
+            if let super::app_spec::VolumeMount::Named {
+                volume,
+                target,
+                read_only,
+            } = v
+            {
                 builder = builder.mount_points(
                     MountPoint::builder()
                         .source_volume(volume)
@@ -570,10 +585,7 @@ impl AwsAppProvisioner {
             .send()
             .await
             .map_err(|e| AmosError::Internal(format!("describe_services failed: {e}")))?;
-        Ok(resp
-            .services()
-            .iter()
-            .any(|s| s.status() == Some("ACTIVE")))
+        Ok(resp.services().iter().any(|s| s.status() == Some("ACTIVE")))
     }
 }
 
@@ -593,10 +605,22 @@ mod tests {
     fn svc(name: &str, managed: bool, port: Option<u16>) -> ServiceSpec {
         ServiceSpec {
             name: name.to_string(),
-            kind: if managed { ServiceKind::Managed } else { ServiceKind::Service },
-            image: ImageSource::Pull { reference: format!("{name}:latest") },
+            kind: if managed {
+                ServiceKind::Managed
+            } else {
+                ServiceKind::Service
+            },
+            image: ImageSource::Pull {
+                reference: format!("{name}:latest"),
+            },
             ports: port
-                .map(|p| vec![PortMap { container_port: p, host_port: None, protocol: "tcp".into() }])
+                .map(|p| {
+                    vec![PortMap {
+                        container_port: p,
+                        host_port: None,
+                        protocol: "tcp".into(),
+                    }]
+                })
                 .unwrap_or_default(),
             env: BTreeMap::new(),
             secrets: BTreeMap::new(),
