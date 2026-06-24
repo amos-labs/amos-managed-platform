@@ -363,6 +363,18 @@ struct AppsTemplate {
     deployed_units: u32,
     included_units: u32,
     monthly_charge: String,
+    /// Selectable hosting tiers (shown when the tenant is not yet on one).
+    tiers: Vec<TierCard>,
+}
+
+/// A self-serve app-hosting tier offered on the Apps page.
+struct TierCard {
+    plan_key: String,
+    name: String,
+    price: String,
+    included_units: u32,
+    included_egress_gb: u64,
+    isolation: String,
 }
 
 struct AppRow {
@@ -546,6 +558,23 @@ async fn apps_page(State(state): State<PlatformState>, headers: axum::http::Head
         None => (false, summary.plan.clone(), 0, "—".to_string()),
     };
 
+    use crate::billing::app_hosting::AppHostingTier;
+    let tiers = [
+        AppHostingTier::Starter,
+        AppHostingTier::Pro,
+        AppHostingTier::Compliance,
+    ]
+    .into_iter()
+    .map(|t| TierCard {
+        plan_key: t.plan_key().to_string(),
+        name: t.display_name().to_string(),
+        price: format!("${}/mo", t.base_cents() / 100),
+        included_units: t.included_units(),
+        included_egress_gb: t.included_egress_gb(),
+        isolation: t.isolation().replace('_', " "),
+    })
+    .collect();
+
     HtmlTemplate(AppsTemplate {
         tenant_name,
         tenant_slug,
@@ -555,6 +584,7 @@ async fn apps_page(State(state): State<PlatformState>, headers: axum::http::Head
         deployed_units: summary.deployed_units,
         included_units,
         monthly_charge,
+        tiers,
     })
     .into_response()
 }
@@ -2370,8 +2400,13 @@ async fn self_host_page(
 /// Form for the checkout button on the upgrade page.
 #[derive(Deserialize)]
 struct CheckoutForm {
-    /// Harness size: "small", "medium", or "large"
-    size: String,
+    /// Harness size: "small", "medium", or "large" (harness checkout).
+    #[serde(default)]
+    size: Option<String>,
+    /// App-hosting tier plan key: "app_starter" | "app_pro" | "app_compliance"
+    /// (self-serve app-hosting checkout). Takes precedence over `size`.
+    #[serde(default)]
+    plan: Option<String>,
 }
 
 /// `POST /billing/checkout` — create Stripe Checkout session for plan upgrade.
@@ -2397,15 +2432,26 @@ async fn billing_checkout(
         }
     };
 
-    // Resolve price by harness size
-    let size = match form.size.as_str() {
-        "small" | "medium" | "large" => form.size.as_str(),
-        _ => "small",
-    };
-    let price_id = match stripe_cfg.price_id_for_size(size) {
-        Some(p) => p,
-        None => {
-            return Redirect::to("/billing/upgrade?error=Invalid+plan").into_response();
+    // Resolve the plan + Stripe price. An app-hosting tier (app_*) takes
+    // precedence over a harness size; both flow through the same Checkout.
+    let (plan, price_id) = if let Some(tier) = form
+        .plan
+        .as_deref()
+        .and_then(crate::billing::app_hosting::AppHostingTier::parse)
+    {
+        match stripe_cfg.price_id_for_app_tier(tier.plan_key()) {
+            Some(p) => (tier.plan_key().to_string(), p),
+            None => return Redirect::to("/apps?error=Plan+not+available").into_response(),
+        }
+    } else {
+        let size = match form.size.as_deref() {
+            Some("medium") => "medium",
+            Some("large") => "large",
+            _ => "small",
+        };
+        match stripe_cfg.price_id_for_size(size) {
+            Some(p) => (size.to_string(), p),
+            None => return Redirect::to("/billing/upgrade?error=Invalid+plan").into_response(),
         }
     };
 
@@ -2462,11 +2508,19 @@ async fn billing_checkout(
         state.config.server.host,
         state.config.server.port
     );
+    // App-tier checkouts begin + cancel from the Apps page; harness-size
+    // checkouts use the upgrade page.
+    let is_app_tier = plan.starts_with("app_");
+    let cancel_path = if is_app_tier {
+        "/apps"
+    } else {
+        "/billing/upgrade"
+    };
     let success_url = format!(
         "{}/billing/success?session_id={{CHECKOUT_SESSION_ID}}",
         base_url
     );
-    let cancel_url = format!("{}/billing/upgrade", base_url);
+    let cancel_url = format!("{}{}", base_url, cancel_path);
 
     match crate::billing::stripe_service::create_checkout_session(
         client,
@@ -2475,14 +2529,15 @@ async fn billing_checkout(
         &success_url,
         &cancel_url,
         tenant_id,
+        &plan,
     )
     .await
     {
         Ok(url) if !url.is_empty() => Redirect::to(&url).into_response(),
-        Ok(_) => Redirect::to("/billing/upgrade?error=Checkout+failed").into_response(),
+        Ok(_) => Redirect::to(&format!("{}?error=Checkout+failed", cancel_path)).into_response(),
         Err(e) => {
             error!("Failed to create checkout session: {}", e);
-            Redirect::to("/billing/upgrade?error=Checkout+failed").into_response()
+            Redirect::to(&format!("{}?error=Checkout+failed", cancel_path)).into_response()
         }
     }
 }

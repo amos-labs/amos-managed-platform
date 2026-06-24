@@ -165,20 +165,37 @@ async fn handle_checkout_completed(state: &PlatformState, event: &stripe::Event)
         }
     };
 
+    // Plan purchased (from checkout metadata). App-hosting tiers (`app_*`) host
+    // a deployed app, not a harness, so they record the tier as the plan and
+    // skip harness provisioning. Harness sizes keep the existing behaviour.
+    let plan = session
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("plan"))
+        .cloned();
+    let is_app_tier = plan
+        .as_deref()
+        .and_then(crate::billing::app_hosting::AppHostingTier::parse)
+        .is_some();
+
     info!(
         tenant_id = %tenant_id,
         subscription_id = %subscription_id,
+        plan = ?plan,
+        is_app_tier,
         "Checkout completed, activating subscription"
     );
 
-    // Update tenant with Stripe IDs, activate subscription, and grant the
-    // initial $5 of Haiku-only Bedrock credits so the user can start using
-    // shared backend immediately while they set up BYOK.
+    // Update tenant with Stripe IDs, activate subscription, record the plan if
+    // one was supplied, and grant the initial $5 of Haiku-only Bedrock credits
+    // so the user can start using shared backend immediately while they set up
+    // BYOK.
     let _ = sqlx::query(
         "UPDATE tenants
          SET stripe_customer_id = $1,
              stripe_subscription_id = $2,
              stripe_subscription_status = 'active',
+             plan = COALESCE($5, plan),
              credit_balance_microcents = $4,
              credits_granted_at = NOW()
          WHERE id = $3",
@@ -187,6 +204,7 @@ async fn handle_checkout_completed(state: &PlatformState, event: &stripe::Event)
     .bind(&subscription_id)
     .bind(tenant_id)
     .bind(MONTHLY_CREDIT_GRANT_MICROCENTS)
+    .bind(&plan)
     .execute(&state.db)
     .await;
 
@@ -196,8 +214,13 @@ async fn handle_checkout_completed(state: &PlatformState, event: &stripe::Event)
         "Initial Bedrock credit grant"
     );
 
-    // Provision harness for the tenant
-    provision_harness_for_tenant(state, tenant_id).await;
+    // App-hosting tenants run a deployed app (via deploy_app), not a harness —
+    // don't provision a harness for them.
+    if is_app_tier {
+        info!(tenant_id = %tenant_id, "App-hosting tier — skipping harness provisioning");
+    } else {
+        provision_harness_for_tenant(state, tenant_id).await;
+    }
 }
 
 /// Handle customer.subscription.updated: sync status changes.
