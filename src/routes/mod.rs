@@ -5,6 +5,7 @@ use axum::{routing::get, Router};
 use crate::state::PlatformState;
 
 pub mod admin;
+pub mod apps;
 pub mod auth;
 pub mod billing;
 pub mod discovery;
@@ -28,6 +29,7 @@ pub fn api_routes() -> Router<PlatformState> {
         .merge(governance::routes())
         .merge(billing::routes())
         .merge(provisioning::routes())
+        .merge(apps::routes())
         .merge(sync::routes())
         .merge(releases::routes())
         .merge(admin::routes())

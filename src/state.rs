@@ -8,7 +8,10 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::provisioning::alb::{AlbRouter, AlbRouterConfig};
+use crate::provisioning::app_deploy::AppManager;
+use crate::provisioning::aws_app::{AwsAppProvisioner, AwsAppProvisionerConfig};
 use crate::provisioning::ecs::{EcsProvisioner, EcsProvisionerConfig};
+use crate::provisioning::image_builder::{ImageBuilder, ImageBuilderConfig};
 use crate::provisioning::HarnessManager;
 use crate::solana::SolanaClient;
 
@@ -76,10 +79,16 @@ pub struct PlatformState {
     pub solana: Option<Arc<SolanaClient>>,
     /// Harness provisioning manager (Docker API — local dev).
     pub harness_manager: Option<Arc<HarnessManager>>,
+    /// Multi-service application provisioner (Docker API — local dev).
+    pub app_manager: Option<Arc<AppManager>>,
     /// ECS Fargate provisioner (production — used when Docker unavailable).
     pub ecs_provisioner: Option<Arc<EcsProvisioner>>,
     /// ALB router for subdomain-based harness routing (production).
     pub alb_router: Option<Arc<AlbRouter>>,
+    /// Cloud image builder (build-as-a-service via CodeBuild → ECR).
+    pub image_builder: Option<Arc<ImageBuilder>>,
+    /// AWS Fargate renderer for multi-service app deploys (deploy_app provider=aws).
+    pub aws_app_provisioner: Option<Arc<AwsAppProvisioner>>,
     /// Stripe API client (None if Stripe not configured).
     pub stripe_client: Option<StripeClient>,
     /// Stripe configuration (price IDs, webhook secret).
@@ -136,6 +145,19 @@ impl PlatformState {
             }
         };
 
+        // Initialize multi-service app provisioner (Docker API — local dev).
+        // Shares the same daemon as the harness manager.
+        let app_manager = match AppManager::new() {
+            Ok(manager) => {
+                info!("App manager initialized (Docker connected)");
+                Some(Arc::new(manager))
+            }
+            Err(e) => {
+                warn!("App manager initialization failed (optional): {}", e);
+                None
+            }
+        };
+
         // Initialize ECS provisioner (production — used when Docker is not available).
         // Only activates when ECS_HARNESS_IMAGE env var is set.
         let ecs_provisioner = if harness_manager.is_none() {
@@ -183,6 +205,48 @@ impl PlatformState {
             None
         };
 
+        // Initialize the cloud image builder (build-as-a-service). Independent
+        // of Docker/ECS — it just needs AWS creds + the CodeBuild substrate.
+        // Gated on AMOS_BUILD_SOURCE_BUCKET.
+        let image_builder = match ImageBuilderConfig::from_env() {
+            Some(cfg) => match ImageBuilder::new(cfg).await {
+                Ok(b) => {
+                    info!("Image builder initialized (CodeBuild build-as-a-service)");
+                    Some(Arc::new(b))
+                }
+                Err(e) => {
+                    warn!("Image builder initialization failed (optional): {}", e);
+                    None
+                }
+            },
+            None => {
+                info!("Image builder not configured (AMOS_BUILD_SOURCE_BUCKET not set)");
+                None
+            }
+        };
+
+        // Initialize the AWS Fargate app renderer (deploy_app provider=aws).
+        // Gated on AWS_APP_ENABLED=true.
+        let aws_app_provisioner = match AwsAppProvisionerConfig::from_env() {
+            Some(cfg) => match AwsAppProvisioner::new(cfg).await {
+                Ok(p) => {
+                    info!("AWS app provisioner initialized (Fargate deploys enabled)");
+                    Some(Arc::new(p))
+                }
+                Err(e) => {
+                    warn!(
+                        "AWS app provisioner initialization failed (optional): {}",
+                        e
+                    );
+                    None
+                }
+            },
+            None => {
+                info!("AWS app provisioner not configured (AWS_APP_ENABLED != true)");
+                None
+            }
+        };
+
         // Initialize Stripe client (optional, requires AMOS__STRIPE__SECRET_KEY).
         let stripe_config = StripeConfig::from_env();
         let stripe_client = stripe_config.as_ref().map(|cfg| {
@@ -200,8 +264,11 @@ impl PlatformState {
             config: Arc::new(config),
             solana,
             harness_manager,
+            app_manager,
             ecs_provisioner,
             alb_router,
+            image_builder,
+            aws_app_provisioner,
             stripe_client,
             stripe_config,
         })

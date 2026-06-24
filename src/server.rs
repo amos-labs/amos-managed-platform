@@ -52,6 +52,8 @@ pub fn build_http_router(state: PlatformState) -> Router {
             "/webhooks/stripe",
             axum::routing::post(routes::webhooks::stripe_webhook),
         )
+        // MCP control plane: Claude Code operates AMOS envs via JSON-RPC over HTTP at /mcp
+        .merge(crate::mcp::routes())
         // Root path: redirect browsers to login, serve API catalog for agents
         .route("/", axum::routing::get(routes::discovery::root_handler))
         .nest("/api/v1", api_routes)
@@ -61,9 +63,13 @@ pub fn build_http_router(state: PlatformState) -> Router {
             ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())
                 .layer(CompressionLayer::new())
+                // 180s: most calls are fast, but build_image synchronously zips
+                // + uploads a full app build context (thousands of files) before
+                // CodeBuild takes over asynchronously — that legitimately exceeds
+                // a 30s ceiling for large repos.
                 .layer(TimeoutLayer::with_status_code(
                     StatusCode::REQUEST_TIMEOUT,
-                    Duration::from_secs(30),
+                    Duration::from_secs(180),
                 ))
                 .layer(
                     CorsLayer::new()

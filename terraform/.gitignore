@@ -1,0 +1,6 @@
+# Never commit state (contains secrets) or provider binaries
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan

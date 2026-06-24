@@ -27,7 +27,9 @@
 pub mod auth;
 pub mod billing;
 pub mod governance;
+pub mod mcp;
 pub mod middleware;
+pub mod proof;
 pub mod provisioning;
 pub mod routes;
 pub mod server;

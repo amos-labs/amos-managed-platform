@@ -1,8 +1,13 @@
 //! Harness provisioning and lifecycle management.
 
 pub mod alb;
+pub mod app_deploy;
+pub mod app_spec;
+pub mod aws_app;
+pub mod compose_intake;
 pub mod db;
 pub mod ecs;
+pub mod image_builder;
 
 use bollard::{
     container::{
