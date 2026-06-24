@@ -31,6 +31,13 @@ prost = "0.13"
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde_yaml = "0.9"
+
+# Image build context packaging (compose `build:` services)
+tar = "0.4"
+ignore = "0.4"
+bytes = "1"
+shlex = "1"
 
 # Database
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid", "json"] }
@@ -67,6 +74,13 @@ bollard = "0.18"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-ecs = "1"
 aws-sdk-elasticloadbalancingv2 = "1"
+# Build-as-a-service: cloud image builds via CodeBuild (S3 context -> ECR).
+aws-sdk-codebuild = "1"
+aws-sdk-s3 = "1"
+aws-sdk-ecr = "1"
+aws-sdk-cloudwatchlogs = "1"
+# Zip the build context for CodeBuild's S3 source (it expects a ZIP archive).
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 # Stripe billing
 async-stripe = { version = "0.41", features = ["runtime-tokio-hyper-rustls", "checkout", "billing", "webhook-events"] }

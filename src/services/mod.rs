@@ -7,6 +7,7 @@
 //! - Contribution tracking and reward calculations
 //! - On-chain bounty proof submission
 
+pub mod app_orchestrator;
 pub mod bounty_service;
 
 pub use bounty_service::BountyService;

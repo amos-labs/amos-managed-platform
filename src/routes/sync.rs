@@ -24,7 +24,7 @@ pub fn routes() -> Router<PlatformState> {
         .route("/sync/version", get(get_latest_version))
         .route("/sync/siblings", get(get_siblings))
         .route("/sync/update-self", post(update_self))
-        .route("/sync/balance/:tenant_id", get(get_balance))
+        .route("/sync/balance/{tenant_id}", get(get_balance))
 }
 
 // ── Self-update ─────────────────────────────────────────────────────────
