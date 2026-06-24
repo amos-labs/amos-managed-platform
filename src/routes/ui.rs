@@ -363,6 +363,11 @@ struct AppsTemplate {
     deployed_units: u32,
     included_units: u32,
     monthly_charge: String,
+    /// Exact month-to-date metered usage (when the CloudWatch meter is live).
+    metered: bool,
+    period_unit_hours: String,
+    period_egress_gb: String,
+    period_charge: String,
     /// Selectable hosting tiers (shown when the tenant is not yet on one).
     tiers: Vec<TierCard>,
 }
@@ -558,6 +563,35 @@ async fn apps_page(State(state): State<PlatformState>, headers: axum::http::Head
         None => (false, summary.plan.clone(), 0, "—".to_string()),
     };
 
+    // Exact, metered position for the current month-to-date (CloudWatch
+    // unit-hours + egress), when the usage meter is available.
+    let (metered, period_unit_hours, period_egress_gb, period_charge) =
+        match (on_app_tier, state.usage_meter.as_ref()) {
+            (true, Some(meter)) => {
+                use chrono::Datelike;
+                let now = chrono::Utc::now();
+                let month_start = chrono::NaiveDate::from_ymd_opt(now.year(), now.month(), 1)
+                    .and_then(|d| d.and_hms_opt(0, 0, 0))
+                    .map(|dt| dt.and_utc())
+                    .unwrap_or(now);
+                let s = meter
+                    .tenant_period_summary(&state.db, tenant_id, month_start, now)
+                    .await;
+                let charge = s
+                    .charge
+                    .as_ref()
+                    .map(|c| format!("${:.2}", c.total_cents as f64 / 100.0))
+                    .unwrap_or_else(|| "—".to_string());
+                (
+                    true,
+                    format!("{:.1}", s.usage.unit_hours),
+                    format!("{:.2}", s.usage.egress_gb),
+                    charge,
+                )
+            }
+            _ => (false, String::new(), String::new(), String::new()),
+        };
+
     use crate::billing::app_hosting::AppHostingTier;
     let tiers = [
         AppHostingTier::Starter,
@@ -584,6 +618,10 @@ async fn apps_page(State(state): State<PlatformState>, headers: axum::http::Head
         deployed_units: summary.deployed_units,
         included_units,
         monthly_charge,
+        metered,
+        period_unit_hours,
+        period_egress_gb,
+        period_charge,
         tiers,
     })
     .into_response()

@@ -44,7 +44,13 @@
         <div class="text-xs font-medium uppercase tracking-wide text-indigo-400">Monthly</div>
         <div class="text-lg font-semibold text-gray-900">{{ monthly_charge }}</div>
       </div>
-      <div class="ml-auto text-xs text-gray-500 max-w-xs">A unit = 1 vCPU + 2 GB. Base covers the included pool; extra containers are metered.</div>
+      {% if metered %}
+      <div>
+        <div class="text-xs font-medium uppercase tracking-wide text-indigo-400">This month to date</div>
+        <div class="text-lg font-semibold text-gray-900">{{ period_charge }} <span class="text-sm font-normal text-gray-500">· {{ period_unit_hours }} unit-hrs · {{ period_egress_gb }} GB out</span></div>
+      </div>
+      {% endif %}
+      <div class="ml-auto text-xs text-gray-500 max-w-xs">A unit = 1 vCPU + 2 GB. Base covers the included pool; extra containers + egress are metered by the hour/GB.</div>
     </div>
     {% else %}
     <div class="mb-8">

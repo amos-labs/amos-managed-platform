@@ -79,6 +79,9 @@ aws-sdk-codebuild = "1"
 aws-sdk-s3 = "1"
 aws-sdk-ecr = "1"
 aws-sdk-cloudwatchlogs = "1"
+# Usage metering: per-service CpuReserved/MemoryReserved/NetworkTxBytes from
+# Container Insights -> exact unit-hours + egress for app-hosting billing.
+aws-sdk-cloudwatch = "1"
 # Zip the build context for CodeBuild's S3 source (it expects a ZIP archive).
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
