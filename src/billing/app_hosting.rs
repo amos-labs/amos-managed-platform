@@ -134,6 +134,62 @@ pub fn compute_charge(tier: AppHostingTier, units_deployed: u32) -> AppHostingCh
     }
 }
 
+/// A tenant's current app-hosting billing position.
+#[derive(Debug, Clone)]
+pub struct TenantBillingSummary {
+    /// Raw plan string on the tenant.
+    pub plan: String,
+    /// Parsed app-hosting tier, if the plan is one.
+    pub tier: Option<AppHostingTier>,
+    /// Total deployed container units across the tenant's running apps.
+    pub deployed_units: u32,
+    /// The computed charge, if on an app-hosting tier.
+    pub charge: Option<AppHostingCharge>,
+}
+
+/// Roll up a tenant's app-hosting billing: its tier × the container units it
+/// actually has deployed (latest running deployment per app, units from
+/// `aws_meta.container_units`).
+pub async fn tenant_summary(pool: &sqlx::PgPool, tenant_id: uuid::Uuid) -> TenantBillingSummary {
+    let plan: String = sqlx::query_scalar("SELECT plan FROM tenants WHERE id = $1")
+        .bind(tenant_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let tier = AppHostingTier::parse(&plan);
+
+    // One charge per app: take the latest running deployment per app name.
+    let rows = sqlx::query_as::<_, (Option<serde_json::Value>,)>(
+        "SELECT DISTINCT ON (name) aws_meta
+         FROM app_deployments
+         WHERE tenant_id = $1 AND status = 'running'
+         ORDER BY name, created_at DESC",
+    )
+    .bind(tenant_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    let deployed_units: u32 = rows
+        .into_iter()
+        .map(|(meta,)| {
+            meta.and_then(|m| m.get("container_units").and_then(|v| v.as_u64()))
+                .unwrap_or(0) as u32
+        })
+        .sum();
+
+    let charge = tier.map(|t| compute_charge(t, deployed_units));
+
+    TenantBillingSummary {
+        plan,
+        tier,
+        deployed_units,
+        charge,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -357,6 +357,12 @@ struct AppsTemplate {
     tenant_name: String,
     tenant_slug: String,
     apps: Vec<AppRow>,
+    /// App-hosting billing summary.
+    on_app_tier: bool,
+    plan_display: String,
+    deployed_units: u32,
+    included_units: u32,
+    monthly_charge: String,
 }
 
 struct AppRow {
@@ -525,10 +531,30 @@ async fn apps_page(State(state): State<PlatformState>, headers: axum::http::Head
         });
     }
 
+    // App-hosting billing summary (tier + deployed container units + charge).
+    let summary = crate::billing::app_hosting::tenant_summary(&state.db, tenant_id).await;
+    let (on_app_tier, plan_display, included_units, monthly_charge) = match summary.tier {
+        Some(tier) => {
+            let cents = summary.charge.as_ref().map(|c| c.total_cents).unwrap_or(0);
+            (
+                true,
+                tier.display_name().to_string(),
+                tier.included_units(),
+                format!("${:.2}/mo", cents as f64 / 100.0),
+            )
+        }
+        None => (false, summary.plan.clone(), 0, "—".to_string()),
+    };
+
     HtmlTemplate(AppsTemplate {
         tenant_name,
         tenant_slug,
         apps,
+        on_app_tier,
+        plan_display,
+        deployed_units: summary.deployed_units,
+        included_units,
+        monthly_charge,
     })
     .into_response()
 }

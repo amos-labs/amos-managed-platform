@@ -25,10 +25,28 @@
   </nav>
 
   <main class="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
-    <div class="mb-8">
+    <div class="mb-6">
       <h1 class="text-2xl font-bold text-gray-900">Apps</h1>
       <p class="mt-1 text-sm text-gray-500">Multi-service applications running in your environment ({{ tenant_slug }}). Operate them via the MCP <code>app_*</code> tools.</p>
     </div>
+
+    {% if on_app_tier %}
+    <div class="mb-8 flex flex-wrap items-center gap-6 rounded-lg border border-indigo-100 bg-indigo-50 px-5 py-4">
+      <div>
+        <div class="text-xs font-medium uppercase tracking-wide text-indigo-400">Plan</div>
+        <div class="text-lg font-semibold text-gray-900">{{ plan_display }}</div>
+      </div>
+      <div>
+        <div class="text-xs font-medium uppercase tracking-wide text-indigo-400">Container units</div>
+        <div class="text-lg font-semibold text-gray-900">{{ deployed_units }} <span class="text-sm font-normal text-gray-500">/ {{ included_units }} included</span></div>
+      </div>
+      <div>
+        <div class="text-xs font-medium uppercase tracking-wide text-indigo-400">Monthly</div>
+        <div class="text-lg font-semibold text-gray-900">{{ monthly_charge }}</div>
+      </div>
+      <div class="ml-auto text-xs text-gray-500 max-w-xs">A unit = 1 vCPU + 2 GB. Base covers the included pool; extra containers are metered.</div>
+    </div>
+    {% endif %}
 
     {% if apps.is_empty() %}
     <div class="rounded-md border border-dashed border-gray-300 bg-white p-8 text-center text-sm text-gray-500">

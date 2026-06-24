@@ -338,11 +338,30 @@ async fn run_provision_aws(
 
     match provisioner.deploy(&spec, &target).await {
         Ok(result) => {
+            // Container units for billing (tiered base + container usage). The
+            // task's cpu/mem map to "standard container" units the billing
+            // rollup sums per tenant.
+            let cpu_units: u32 = target
+                .cpu
+                .as_deref()
+                .unwrap_or("4096")
+                .parse()
+                .unwrap_or(4096);
+            let mem_mib: u32 = target
+                .memory
+                .as_deref()
+                .unwrap_or("16384")
+                .parse()
+                .unwrap_or(16384);
+            let container_units = crate::billing::app_hosting::container_units(cpu_units, mem_mib);
             let aws_meta = json!({
                 "task_def_arn": result.task_def_arn,
                 "service_arn": result.service_arn,
                 "public_url": result.public_url,
                 "managed_skipped": result.managed_skipped,
+                "cpu": cpu_units,
+                "memory_mib": mem_mib,
+                "container_units": container_units,
             });
             let _ = sqlx::query(
                 "UPDATE app_deployments SET status = 'running', aws_meta = $1 WHERE id = $2",
