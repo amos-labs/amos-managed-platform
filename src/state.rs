@@ -31,6 +31,10 @@ pub struct StripeConfig {
     pub price_small: Option<String>,
     pub price_medium: Option<String>,
     pub price_large: Option<String>,
+    /// Price ID per app-hosting tier (Starter/Pro/Compliance).
+    pub price_app_starter: Option<String>,
+    pub price_app_pro: Option<String>,
+    pub price_app_compliance: Option<String>,
 }
 
 impl StripeConfig {
@@ -47,7 +51,20 @@ impl StripeConfig {
                 .or_else(|| std::env::var("AMOS__STRIPE__PRICE_HOSTED").ok()),
             price_medium: std::env::var("AMOS__STRIPE__PRICE_MEDIUM").ok(),
             price_large: std::env::var("AMOS__STRIPE__PRICE_LARGE").ok(),
+            price_app_starter: std::env::var("AMOS__STRIPE__PRICE_APP_STARTER").ok(),
+            price_app_pro: std::env::var("AMOS__STRIPE__PRICE_APP_PRO").ok(),
+            price_app_compliance: std::env::var("AMOS__STRIPE__PRICE_APP_COMPLIANCE").ok(),
         })
+    }
+
+    /// Stripe Price ID for an app-hosting tier plan key (`app_starter` etc.).
+    pub fn price_id_for_app_tier(&self, plan_key: &str) -> Option<&str> {
+        match plan_key {
+            "app_starter" => self.price_app_starter.as_deref(),
+            "app_pro" => self.price_app_pro.as_deref(),
+            "app_compliance" => self.price_app_compliance.as_deref(),
+            _ => None,
+        }
     }
 
     /// Get the Stripe Price ID for a harness size.
