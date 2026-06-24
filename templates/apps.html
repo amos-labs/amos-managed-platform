@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+
+{% block title %}Apps - AMOS Platform{% endblock %}
+
+{% block body %}
+<div class="min-h-full">
+  <nav class="border-b border-gray-200 bg-white">
+    <div class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
+      <div class="flex h-14 justify-between">
+        <div class="flex items-center space-x-8">
+          <span class="text-lg font-bold text-gray-900">AMOS</span>
+          <a href="/dashboard" class="border-b-2 border-transparent px-1 pt-1 text-sm font-medium text-gray-500 hover:border-gray-300 hover:text-gray-700">Dashboard</a>
+          <a href="/apps" class="border-b-2 border-indigo-500 px-1 pt-1 text-sm font-medium text-gray-900">Apps</a>
+          <a href="/receipts" class="border-b-2 border-transparent px-1 pt-1 text-sm font-medium text-gray-500 hover:border-gray-300 hover:text-gray-700">Receipts</a>
+          <a href="/settings" class="border-b-2 border-transparent px-1 pt-1 text-sm font-medium text-gray-500 hover:border-gray-300 hover:text-gray-700">Settings</a>
+        </div>
+        <div class="flex items-center space-x-4">
+          <span class="text-sm text-gray-500">{{ tenant_name }}</span>
+          <form action="/logout" method="POST" class="inline">
+            <button type="submit" class="text-sm text-gray-500 hover:text-gray-700">Sign out</button>
+          </form>
+        </div>
+      </div>
+    </div>
+  </nav>
+
+  <main class="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
+    <div class="mb-8">
+      <h1 class="text-2xl font-bold text-gray-900">Apps</h1>
+      <p class="mt-1 text-sm text-gray-500">Multi-service applications running in your environment ({{ tenant_slug }}). Operate them via the MCP <code>app_*</code> tools.</p>
+    </div>
+
+    {% if apps.is_empty() %}
+    <div class="rounded-md border border-dashed border-gray-300 bg-white p-8 text-center text-sm text-gray-500">
+      No apps deployed yet. Deploy one with the <code>deploy_app</code> MCP tool.
+    </div>
+    {% else %}
+    <div class="space-y-6">
+      {% for app in apps %}
+      <div class="overflow-hidden rounded-lg border border-gray-200 bg-white shadow-sm">
+        <div class="flex items-center justify-between border-b border-gray-100 px-5 py-4">
+          <div class="flex items-center gap-3">
+            <h2 class="text-base font-semibold text-gray-900">{{ app.name }}</h2>
+            <span class="inline-flex items-center rounded-full bg-gray-100 px-2 py-0.5 text-xs font-medium text-gray-600">{{ app.provider }}</span>
+            {% if app.status == "running" %}
+            <span class="inline-flex items-center rounded-full bg-green-100 px-2 py-0.5 text-xs font-medium text-green-700">running</span>
+            {% else if app.status == "provisioning" %}
+            <span class="inline-flex items-center rounded-full bg-yellow-100 px-2 py-0.5 text-xs font-medium text-yellow-700">{{ app.status }}</span>
+            {% else if app.status == "error" %}
+            <span class="inline-flex items-center rounded-full bg-red-100 px-2 py-0.5 text-xs font-medium text-red-700">error</span>
+            {% else %}
+            <span class="inline-flex items-center rounded-full bg-gray-100 px-2 py-0.5 text-xs font-medium text-gray-600">{{ app.status }}</span>
+            {% endif %}
+          </div>
+          {% if app.public_url.is_some() %}
+          <a href="{{ app.public_url.as_ref().unwrap() }}" target="_blank" rel="noopener" class="text-sm font-medium text-indigo-600 hover:text-indigo-500">{{ app.public_url.as_ref().unwrap() }} &rarr;</a>
+          {% endif %}
+        </div>
+        <table class="min-w-full divide-y divide-gray-100">
+          <thead class="bg-gray-50">
+            <tr>
+              <th class="px-5 py-2 text-left text-xs font-medium uppercase tracking-wide text-gray-400">Service</th>
+              <th class="px-5 py-2 text-left text-xs font-medium uppercase tracking-wide text-gray-400">Status</th>
+              <th class="px-5 py-2 text-left text-xs font-medium uppercase tracking-wide text-gray-400">Public</th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-gray-50">
+            {% for svc in app.services %}
+            <tr>
+              <td class="px-5 py-2 text-sm font-medium text-gray-900">{{ svc.service_name }}</td>
+              <td class="px-5 py-2 text-sm">
+                {% if svc.status == "running" %}
+                <span class="text-green-700">{{ svc.status }}</span>
+                {% else if svc.status == "error" %}
+                <span class="text-red-700">{{ svc.status }}</span>
+                {% else %}
+                <span class="text-gray-500">{{ svc.status }}</span>
+                {% endif %}
+              </td>
+              <td class="px-5 py-2 text-sm text-gray-500">{% if svc.expose_public %}yes{% else %}&mdash;{% endif %}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endfor %}
+    </div>
+    {% endif %}
+  </main>
+</div>
+{% endblock %}

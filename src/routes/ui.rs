@@ -351,6 +351,44 @@ struct SelfHostTemplate {
     tenant_name: String,
 }
 
+#[derive(Template)]
+#[template(path = "apps.html")]
+struct AppsTemplate {
+    tenant_name: String,
+    tenant_slug: String,
+    apps: Vec<AppRow>,
+}
+
+struct AppRow {
+    name: String,
+    provider: String,
+    status: String,
+    public_url: Option<String>,
+    services: Vec<SvcRow>,
+}
+
+struct SvcRow {
+    service_name: String,
+    status: String,
+    expose_public: bool,
+}
+
+#[derive(Template)]
+#[template(path = "receipts.html")]
+struct ReceiptsTemplate {
+    tenant_name: String,
+    tenant_slug: String,
+    receipts: Vec<ReceiptRow>,
+}
+
+struct ReceiptRow {
+    created_at: String,
+    operation: String,
+    actor: String,
+    verified: bool,
+    summary: String,
+}
+
 // ── View model types ────────────────────────────────────────────────────
 
 #[allow(dead_code)]
@@ -411,9 +449,158 @@ struct CreateApiKeyForm {
 
 // ── Routes ──────────────────────────────────────────────────────────────
 
+/// Fetch a tenant's display name + slug, falling back to the claims slug.
+async fn tenant_name_slug(
+    state: &PlatformState,
+    tenant_id: Uuid,
+    fallback_slug: &str,
+) -> (String, String) {
+    sqlx::query_as::<_, (String, String)>("SELECT name, slug FROM tenants WHERE id = $1")
+        .bind(tenant_id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| ("Unknown".into(), fallback_slug.to_string()))
+}
+
+/// Apps page: the tenant's multi-service deployments + per-service status.
+async fn apps_page(State(state): State<PlatformState>, headers: axum::http::HeaderMap) -> Response {
+    let claims = match extract_session_claims(&state, &headers) {
+        Some(c) => c,
+        None => return Redirect::to("/login").into_response(),
+    };
+    let tenant_id: Uuid = match claims.tenant_id.parse() {
+        Ok(id) => id,
+        Err(_) => return Redirect::to("/login").into_response(),
+    };
+    let (tenant_name, tenant_slug) = tenant_name_slug(&state, tenant_id, &claims.tenant_slug).await;
+
+    let deployments =
+        sqlx::query_as::<_, (Uuid, String, String, String, Option<serde_json::Value>)>(
+            "SELECT id, name, provider, status, aws_meta
+         FROM app_deployments
+         WHERE tenant_id = $1 AND status != 'deprovisioned'
+         ORDER BY created_at DESC",
+        )
+        .bind(tenant_id)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+
+    let mut apps = Vec::new();
+    for (id, name, provider, status, aws_meta) in deployments {
+        let svc_rows = sqlx::query_as::<_, (String, String, bool)>(
+            "SELECT service_name, status, expose_public FROM app_services
+             WHERE deployment_id = $1 ORDER BY service_name",
+        )
+        .bind(id)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+        let services = svc_rows
+            .into_iter()
+            .map(|(service_name, status, expose_public)| SvcRow {
+                service_name,
+                status,
+                expose_public,
+            })
+            .collect();
+        let public_url = aws_meta
+            .as_ref()
+            .and_then(|m| m.get("public_url"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        // Present the storage provider name users recognize.
+        let provider_label = if provider == "ecs" {
+            "aws".to_string()
+        } else {
+            provider
+        };
+        apps.push(AppRow {
+            name,
+            provider: provider_label,
+            status,
+            public_url,
+            services,
+        });
+    }
+
+    HtmlTemplate(AppsTemplate {
+        tenant_name,
+        tenant_slug,
+        apps,
+    })
+    .into_response()
+}
+
+/// Receipts page: the proof-carrying operation audit log.
+async fn receipts_page(
+    State(state): State<PlatformState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let claims = match extract_session_claims(&state, &headers) {
+        Some(c) => c,
+        None => return Redirect::to("/login").into_response(),
+    };
+    let tenant_id: Uuid = match claims.tenant_id.parse() {
+        Ok(id) => id,
+        Err(_) => return Redirect::to("/login").into_response(),
+    };
+    let (tenant_name, tenant_slug) = tenant_name_slug(&state, tenant_id, &claims.tenant_slug).await;
+
+    let rows = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            bool,
+            chrono::DateTime<chrono::Utc>,
+            serde_json::Value,
+        ),
+    >(
+        "SELECT operation, actor, verified, created_at, receipt
+         FROM operation_receipts
+         WHERE tenant_id = $1
+         ORDER BY created_at DESC
+         LIMIT 50",
+    )
+    .bind(tenant_id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    let receipts = rows
+        .into_iter()
+        .map(
+            |(operation, actor, verified, created_at, receipt)| ReceiptRow {
+                created_at: created_at.format("%Y-%m-%d %H:%M UTC").to_string(),
+                operation,
+                // Actor ids are long; show a short prefix.
+                actor: actor.chars().take(8).collect(),
+                verified,
+                summary: receipt
+                    .get("result_summary")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            },
+        )
+        .collect();
+
+    HtmlTemplate(ReceiptsTemplate {
+        tenant_name,
+        tenant_slug,
+        receipts,
+    })
+    .into_response()
+}
+
 pub fn routes() -> Router<PlatformState> {
     Router::new()
         .route("/login", get(login_page).post(login_submit))
+        .route("/apps", get(apps_page))
+        .route("/receipts", get(receipts_page))
         .route("/register", get(register_page).post(register_submit))
         .route("/dashboard", get(dashboard_page))
         .route("/settings", get(settings_page))
