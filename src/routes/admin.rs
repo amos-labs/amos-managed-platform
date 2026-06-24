@@ -83,6 +83,39 @@ struct TenantSummary {
     stripe_subscription_status: Option<String>,
     created_at: DateTime<Utc>,
     harnesses: Vec<HarnessInfo>,
+    /// Hosted app deployments (detail view only; empty in the list).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    apps: Vec<AppInfo>,
+    /// App-hosting billing position (detail view only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    billing: Option<AppBillingInfo>,
+}
+
+/// A hosted app deployment, for the admin tenant detail view.
+#[derive(Serialize)]
+struct AppInfo {
+    name: String,
+    provider: String,
+    status: String,
+    container_units: u32,
+}
+
+/// A tenant's app-hosting billing position, for the admin tenant detail view.
+/// `monthly_run_rate` is the snapshot rate; the `period_*` fields are the exact
+/// month-to-date metered position (present only when the usage meter is live).
+#[derive(Serialize)]
+struct AppBillingInfo {
+    plan: String,
+    tier: Option<String>,
+    deployed_units: u32,
+    included_units: u32,
+    monthly_run_rate: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    period_unit_hours: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    period_egress_gb: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    period_charge_cents: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -286,6 +319,8 @@ async fn list_tenants(
                     stripe_subscription_status: stripe_status,
                     created_at,
                     harnesses: harness_map.remove(&id).unwrap_or_default(),
+                    apps: Vec::new(),
+                    billing: None,
                 }
             },
         )
@@ -398,6 +433,75 @@ async fn get_tenant(
         )
         .collect();
 
+    // Hosted app deployments (units from aws_meta), for the app-stats view.
+    let app_rows = sqlx::query_as::<_, (String, String, String, Option<serde_json::Value>)>(
+        r#"
+        SELECT DISTINCT ON (name) name, provider, status, aws_meta
+        FROM app_deployments
+        WHERE tenant_id = $1 AND status != 'deprovisioned'
+        ORDER BY name, created_at DESC
+        "#,
+    )
+    .bind(tenant_id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    let apps: Vec<AppInfo> = app_rows
+        .into_iter()
+        .map(|(name, provider, status, meta)| {
+            let container_units = meta
+                .and_then(|m| m.get("container_units").and_then(|v| v.as_u64()))
+                .unwrap_or(0) as u32;
+            AppInfo {
+                name,
+                // Present the provider name users recognize.
+                provider: if provider == "ecs" {
+                    "aws".into()
+                } else {
+                    provider
+                },
+                status,
+                container_units,
+            }
+        })
+        .collect();
+
+    // App-hosting billing: snapshot run-rate + exact month-to-date metered
+    // position (when the usage meter is live).
+    let summary = crate::billing::app_hosting::tenant_summary(&state.db, tenant_id).await;
+    let billing = summary.tier.map(|tier| {
+        let run_cents = summary.charge.as_ref().map(|c| c.total_cents).unwrap_or(0);
+        AppBillingInfo {
+            plan: summary.plan.clone(),
+            tier: Some(tier.display_name().to_string()),
+            deployed_units: summary.deployed_units,
+            included_units: tier.included_units(),
+            monthly_run_rate: format!("${:.2}/mo", run_cents as f64 / 100.0),
+            period_unit_hours: None,
+            period_egress_gb: None,
+            period_charge_cents: None,
+        }
+    });
+    let billing = match (billing, state.usage_meter.as_ref()) {
+        (Some(mut b), Some(meter)) => {
+            use chrono::Datelike;
+            let now = Utc::now();
+            let month_start = chrono::NaiveDate::from_ymd_opt(now.year(), now.month(), 1)
+                .and_then(|d| d.and_hms_opt(0, 0, 0))
+                .map(|dt| dt.and_utc())
+                .unwrap_or(now);
+            let s = meter
+                .tenant_period_summary(&state.db, tenant_id, month_start, now)
+                .await;
+            b.period_unit_hours = Some((s.usage.unit_hours * 10.0).round() / 10.0);
+            b.period_egress_gb = Some((s.usage.egress_gb * 100.0).round() / 100.0);
+            b.period_charge_cents = s.charge.as_ref().map(|c| c.total_cents);
+            Some(b)
+        }
+        (b, _) => b,
+    };
+
     Ok(Json(TenantSummary {
         id: tenant_id,
         name,
@@ -408,6 +512,8 @@ async fn get_tenant(
         stripe_subscription_status: stripe_status,
         created_at,
         harnesses,
+        apps,
+        billing,
     }))
 }
 
