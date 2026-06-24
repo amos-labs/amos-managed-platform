@@ -377,7 +377,6 @@ struct SvcRow {
 #[template(path = "receipts.html")]
 struct ReceiptsTemplate {
     tenant_name: String,
-    tenant_slug: String,
     receipts: Vec<ReceiptRow>,
 }
 
@@ -547,7 +546,8 @@ async fn receipts_page(
         Ok(id) => id,
         Err(_) => return Redirect::to("/login").into_response(),
     };
-    let (tenant_name, tenant_slug) = tenant_name_slug(&state, tenant_id, &claims.tenant_slug).await;
+    let (tenant_name, _tenant_slug) =
+        tenant_name_slug(&state, tenant_id, &claims.tenant_slug).await;
 
     let rows = sqlx::query_as::<
         _,
@@ -590,7 +590,6 @@ async fn receipts_page(
 
     HtmlTemplate(ReceiptsTemplate {
         tenant_name,
-        tenant_slug,
         receipts,
     })
     .into_response()
