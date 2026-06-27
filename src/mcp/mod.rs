@@ -1031,133 +1031,156 @@ async fn run_deploy_to_receipt(
         let ecs = aws_sdk_ecs::Client::new(&cfg);
         let cluster = std::env::var("ECS_CLUSTER")
             .unwrap_or_else(|_| "swarm-infrastructure-cluster".to_string());
-        for svc in &ecs_services {
-            // Current task def of the service.
-            let td_arn = match ecs
-                .describe_services()
-                .cluster(&cluster)
-                .services(svc)
-                .send()
-                .await
-            {
-                Ok(r) => r
-                    .services()
-                    .first()
-                    .and_then(|s| s.task_definition().map(str::to_string)),
-                Err(e) => {
+
+        // ── RELEASE PHASE ── run the manifest's release command ONCE on the
+        // freshly-built (digest-pinned) image, BEFORE rolling any service. A
+        // non-zero exit ABORTS the deploy: no service is rolled, so the running
+        // version keeps serving. No `release` in the manifest → skipped entirely
+        // (existing manifests deploy exactly as before).
+        if let Some(release_cmd) = manifest.release.as_deref() {
+            match run_release_phase(&ecs, &cfg, &cluster, &ecs_services, &pins, release_cmd).await {
+                Ok(detail) => results.push(("release".to_string(), true, detail)),
+                Err(detail) => {
                     all_ok = false;
-                    results.push((svc.clone(), false, format!("describe_services failed: {e}")));
-                    continue;
-                }
-            };
-            let Some(td_arn) = td_arn else {
-                all_ok = false;
-                results.push((svc.clone(), false, "service has no task definition".into()));
-                continue;
-            };
-            let base_td = match ecs
-                .describe_task_definition()
-                .task_definition(&td_arn)
-                .send()
-                .await
-            {
-                Ok(r) => r.task_definition().cloned(),
-                Err(e) => {
-                    all_ok = false;
-                    results.push((
-                        svc.clone(),
-                        false,
-                        format!("describe_task_definition failed: {e}"),
-                    ));
-                    continue;
-                }
-            };
-            let Some(base_td) = base_td else {
-                all_ok = false;
-                results.push((svc.clone(), false, "task definition not found".into()));
-                continue;
-            };
-            // Digest-pin matching containers.
-            let containers =
-                match crate::provisioning::env_provision::clone_containers_with_image_pins(
-                    base_td.container_definitions(),
-                    &pins,
-                ) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        all_ok = false;
-                        results.push((svc.clone(), false, format!("pin images failed: {e}")));
-                        continue;
-                    }
-                };
-            let matched: Vec<String> = base_td
-                .container_definitions()
-                .iter()
-                .filter_map(|c| c.image())
-                .filter_map(crate::provisioning::env_provision::repo_of)
-                .filter_map(|repo| pins.get(repo).cloned())
-                .collect();
-            if matched.is_empty() {
-                tracing::warn!(service = %svc, "deploy: no container image matched a freshly-built repo — rolling unchanged image (likely a manifest/ecs_services misconfig)");
-            }
-            // Register a new task def revision with the pinned containers.
-            let family = base_td.family().unwrap_or(svc).to_string();
-            let mut reg = ecs
-                .register_task_definition()
-                .family(&family)
-                .set_container_definitions(Some(containers))
-                .set_cpu(base_td.cpu().map(str::to_string))
-                .set_memory(base_td.memory().map(str::to_string))
-                .set_network_mode(base_td.network_mode().cloned())
-                .set_requires_compatibilities(Some(base_td.requires_compatibilities().to_vec()))
-                .set_execution_role_arn(base_td.execution_role_arn().map(str::to_string))
-                .set_task_role_arn(base_td.task_role_arn().map(str::to_string))
-                .set_runtime_platform(base_td.runtime_platform().cloned());
-            if !base_td.volumes().is_empty() {
-                reg = reg.set_volumes(Some(base_td.volumes().to_vec()));
-            }
-            let new_td_arn = match reg.send().await {
-                Ok(r) => r
-                    .task_definition()
-                    .and_then(|t| t.task_definition_arn().map(str::to_string)),
-                Err(e) => {
-                    all_ok = false;
-                    results.push((
-                        svc.clone(),
-                        false,
-                        format!("register_task_definition failed: {e}"),
-                    ));
-                    continue;
-                }
-            };
-            let Some(new_td_arn) = new_td_arn else {
-                all_ok = false;
-                results.push((svc.clone(), false, "no task def ARN returned".into()));
-                continue;
-            };
-            // Point the service at the new revision (this triggers the rollout).
-            match ecs
-                .update_service()
-                .cluster(&cluster)
-                .service(svc)
-                .task_definition(&new_td_arn)
-                .send()
-                .await
-            {
-                Ok(_) => {
-                    rolled.push(svc.clone());
-                    deployed.push(serde_json::json!({
-                        "service": svc,
-                        "task_def": new_td_arn,
-                        "images": matched,
-                    }));
-                }
-                Err(e) => {
-                    all_ok = false;
-                    results.push((svc.clone(), false, format!("update_service failed: {e}")));
+                    results.push(("release".to_string(), false, detail));
                 }
             }
         }
+
+        // Only roll the services if the release phase (if any) passed.
+        if all_ok {
+            for svc in &ecs_services {
+                // Current task def of the service.
+                let td_arn = match ecs
+                    .describe_services()
+                    .cluster(&cluster)
+                    .services(svc)
+                    .send()
+                    .await
+                {
+                    Ok(r) => r
+                        .services()
+                        .first()
+                        .and_then(|s| s.task_definition().map(str::to_string)),
+                    Err(e) => {
+                        all_ok = false;
+                        results.push((
+                            svc.clone(),
+                            false,
+                            format!("describe_services failed: {e}"),
+                        ));
+                        continue;
+                    }
+                };
+                let Some(td_arn) = td_arn else {
+                    all_ok = false;
+                    results.push((svc.clone(), false, "service has no task definition".into()));
+                    continue;
+                };
+                let base_td = match ecs
+                    .describe_task_definition()
+                    .task_definition(&td_arn)
+                    .send()
+                    .await
+                {
+                    Ok(r) => r.task_definition().cloned(),
+                    Err(e) => {
+                        all_ok = false;
+                        results.push((
+                            svc.clone(),
+                            false,
+                            format!("describe_task_definition failed: {e}"),
+                        ));
+                        continue;
+                    }
+                };
+                let Some(base_td) = base_td else {
+                    all_ok = false;
+                    results.push((svc.clone(), false, "task definition not found".into()));
+                    continue;
+                };
+                // Digest-pin matching containers.
+                let containers =
+                    match crate::provisioning::env_provision::clone_containers_with_image_pins(
+                        base_td.container_definitions(),
+                        &pins,
+                    ) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            all_ok = false;
+                            results.push((svc.clone(), false, format!("pin images failed: {e}")));
+                            continue;
+                        }
+                    };
+                let matched: Vec<String> = base_td
+                    .container_definitions()
+                    .iter()
+                    .filter_map(|c| c.image())
+                    .filter_map(crate::provisioning::env_provision::repo_of)
+                    .filter_map(|repo| pins.get(repo).cloned())
+                    .collect();
+                if matched.is_empty() {
+                    tracing::warn!(service = %svc, "deploy: no container image matched a freshly-built repo — rolling unchanged image (likely a manifest/ecs_services misconfig)");
+                }
+                // Register a new task def revision with the pinned containers.
+                let family = base_td.family().unwrap_or(svc).to_string();
+                let mut reg = ecs
+                    .register_task_definition()
+                    .family(&family)
+                    .set_container_definitions(Some(containers))
+                    .set_cpu(base_td.cpu().map(str::to_string))
+                    .set_memory(base_td.memory().map(str::to_string))
+                    .set_network_mode(base_td.network_mode().cloned())
+                    .set_requires_compatibilities(Some(base_td.requires_compatibilities().to_vec()))
+                    .set_execution_role_arn(base_td.execution_role_arn().map(str::to_string))
+                    .set_task_role_arn(base_td.task_role_arn().map(str::to_string))
+                    .set_runtime_platform(base_td.runtime_platform().cloned());
+                if !base_td.volumes().is_empty() {
+                    reg = reg.set_volumes(Some(base_td.volumes().to_vec()));
+                }
+                let new_td_arn = match reg.send().await {
+                    Ok(r) => r
+                        .task_definition()
+                        .and_then(|t| t.task_definition_arn().map(str::to_string)),
+                    Err(e) => {
+                        all_ok = false;
+                        results.push((
+                            svc.clone(),
+                            false,
+                            format!("register_task_definition failed: {e}"),
+                        ));
+                        continue;
+                    }
+                };
+                let Some(new_td_arn) = new_td_arn else {
+                    all_ok = false;
+                    results.push((svc.clone(), false, "no task def ARN returned".into()));
+                    continue;
+                };
+                // Point the service at the new revision (this triggers the rollout).
+                match ecs
+                    .update_service()
+                    .cluster(&cluster)
+                    .service(svc)
+                    .task_definition(&new_td_arn)
+                    .send()
+                    .await
+                {
+                    Ok(_) => {
+                        rolled.push(svc.clone());
+                        deployed.push(serde_json::json!({
+                            "service": svc,
+                            "task_def": new_td_arn,
+                            "images": matched,
+                        }));
+                    }
+                    Err(e) => {
+                        all_ok = false;
+                        results.push((svc.clone(), false, format!("update_service failed: {e}")));
+                    }
+                }
+            }
+        } // end: roll services (gated on release passing)
     }
 
     // 3. One deploy receipt.
@@ -1171,6 +1194,7 @@ async fn run_deploy_to_receipt(
         .guardrail("build_graph_ordered")
         .guardrail("rolling_health_checked")
         .guardrail("digest_pinned_deploy")
+        .guardrail("release_gated")
         .inputs(serde_json::json!({
             "deploy_id": deploy_id,
             "deployment_id": deployment_id,
@@ -1206,6 +1230,267 @@ async fn run_deploy_to_receipt(
             format!("deploy of {} FAILED — services not rolled", manifest.name)
         });
     let _ = proof::emit(&state.db, &receipt).await;
+}
+
+/// Outcome of the release gate: roll the new version, or abort and keep serving
+/// the old one.
+#[derive(Debug, PartialEq)]
+enum ReleaseDecision {
+    Proceed,
+    Abort(String),
+}
+
+/// Decide whether the rollout may proceed from the release task's exit code.
+/// Exit 0 → proceed; any non-zero, or no exit code at all (the task failed to
+/// start or was killed) → abort. Pure — unit-tested.
+fn release_gate(exit_code: Option<i32>) -> ReleaseDecision {
+    match exit_code {
+        Some(0) => ReleaseDecision::Proceed,
+        Some(code) => ReleaseDecision::Abort(format!("release command exited non-zero ({code})")),
+        None => ReleaseDecision::Abort(
+            "release task produced no exit code (failed to start or was killed)".to_string(),
+        ),
+    }
+}
+
+/// Wrap the release command for a one-shot run. Always via `sh -lc` so any
+/// toolchain's command string works verbatim (rake / alembic / sqlx / npm …)
+/// without the platform parsing or knowing the toolchain.
+fn release_argv(release_cmd: &str) -> Vec<String> {
+    vec!["sh".to_string(), "-lc".to_string(), release_cmd.to_string()]
+}
+
+/// Run the manifest's `release` command as a ONE-SHOT ECS task on the freshly
+/// built (digest-pinned) image, using the primary service's own task role /
+/// secrets / network, and wait for it to finish. Returns `Ok(detail)` on exit 0
+/// (the rollout may proceed) or `Err(detail)` on any failure (abort the deploy —
+/// the running version keeps serving). It never rolls a service itself; it only
+/// decides whether the caller should.
+async fn run_release_phase(
+    ecs: &aws_sdk_ecs::Client,
+    aws_cfg: &aws_config::SdkConfig,
+    cluster: &str,
+    ecs_services: &[String],
+    pins: &std::collections::HashMap<String, String>,
+    release_cmd: &str,
+) -> std::result::Result<String, String> {
+    use aws_sdk_ecs::types::{ContainerOverride, LaunchType, TaskOverride};
+    use std::time::Duration;
+
+    // The release runs on the app's primary (first) service: its task role,
+    // secrets, and network are what a migration needs.
+    let primary = ecs_services
+        .first()
+        .ok_or_else(|| "no ECS service available to run the release on".to_string())?;
+
+    // Describe the primary service → its live task def + network configuration.
+    let svc = ecs
+        .describe_services()
+        .cluster(cluster)
+        .services(primary)
+        .send()
+        .await
+        .map_err(|e| format!("release: describe_services({primary}) failed: {e}"))?
+        .services()
+        .first()
+        .cloned()
+        .ok_or_else(|| format!("release: service '{primary}' not found"))?;
+    let net = svc.network_configuration().cloned();
+    let td_arn = svc
+        .task_definition()
+        .ok_or_else(|| format!("release: service '{primary}' has no task definition"))?
+        .to_string();
+
+    // Clone its task def with the freshly-built images digest-pinned, so the
+    // release runs on EXACTLY the image about to be deployed.
+    let base_td = ecs
+        .describe_task_definition()
+        .task_definition(&td_arn)
+        .send()
+        .await
+        .map_err(|e| format!("release: describe_task_definition failed: {e}"))?
+        .task_definition()
+        .cloned()
+        .ok_or_else(|| "release: task definition not found".to_string())?;
+    let containers = crate::provisioning::env_provision::clone_containers_with_image_pins(
+        base_td.container_definitions(),
+        pins,
+    )
+    .map_err(|e| format!("release: pin images failed: {e}"))?;
+
+    // The container the release runs in: prefer the one whose repo we just built
+    // (the app image carrying the migration), else the first essential, else first.
+    let release_container = base_td
+        .container_definitions()
+        .iter()
+        .find(|c| {
+            c.image()
+                .and_then(crate::provisioning::env_provision::repo_of)
+                .map(|repo| pins.contains_key(repo))
+                .unwrap_or(false)
+        })
+        .or_else(|| {
+            base_td
+                .container_definitions()
+                .iter()
+                .find(|c| c.essential() == Some(true))
+        })
+        .or_else(|| base_td.container_definitions().first())
+        .and_then(|c| c.name())
+        .ok_or_else(|| "release: task def has no container to run in".to_string())?
+        .to_string();
+
+    // Register a one-shot task def revision with the pinned images.
+    let family = base_td.family().unwrap_or(primary).to_string();
+    let mut reg = ecs
+        .register_task_definition()
+        .family(&family)
+        .set_container_definitions(Some(containers))
+        .set_cpu(base_td.cpu().map(str::to_string))
+        .set_memory(base_td.memory().map(str::to_string))
+        .set_network_mode(base_td.network_mode().cloned())
+        .set_requires_compatibilities(Some(base_td.requires_compatibilities().to_vec()))
+        .set_execution_role_arn(base_td.execution_role_arn().map(str::to_string))
+        .set_task_role_arn(base_td.task_role_arn().map(str::to_string))
+        .set_runtime_platform(base_td.runtime_platform().cloned());
+    if !base_td.volumes().is_empty() {
+        reg = reg.set_volumes(Some(base_td.volumes().to_vec()));
+    }
+    let release_td_arn = reg
+        .send()
+        .await
+        .map_err(|e| format!("release: register_task_definition failed: {e}"))?
+        .task_definition()
+        .and_then(|t| t.task_definition_arn().map(str::to_string))
+        .ok_or_else(|| "release: no task def ARN returned".to_string())?;
+
+    // Run the one-shot task with the release command overriding the container's
+    // command, on the service's own network.
+    let overrides = TaskOverride::builder()
+        .container_overrides(
+            ContainerOverride::builder()
+                .name(&release_container)
+                .set_command(Some(release_argv(release_cmd)))
+                .build(),
+        )
+        .build();
+    let mut run = ecs
+        .run_task()
+        .cluster(cluster)
+        .task_definition(&release_td_arn)
+        .launch_type(LaunchType::Fargate)
+        .overrides(overrides)
+        .started_by("amos-deploy-release");
+    if let Some(n) = net.clone() {
+        run = run.network_configuration(n);
+    }
+    let task_arn = run
+        .send()
+        .await
+        .map_err(|e| format!("release: run_task failed: {e}"))?
+        .tasks()
+        .first()
+        .and_then(|t| t.task_arn().map(str::to_string))
+        .ok_or_else(|| "release: run_task returned no task".to_string())?;
+    let task_id = task_arn.rsplit('/').next().unwrap_or(&task_arn).to_string();
+
+    // Wait for the task to STOP (~10 min cap: 60 × 10s).
+    let mut stopped: Option<aws_sdk_ecs::types::Task> = None;
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        if let Ok(r) = ecs
+            .describe_tasks()
+            .cluster(cluster)
+            .tasks(&task_arn)
+            .send()
+            .await
+        {
+            if let Some(t) = r.tasks().first() {
+                if t.last_status() == Some("STOPPED") {
+                    stopped = Some(t.clone());
+                    break;
+                }
+            }
+        }
+    }
+    let Some(task) = stopped else {
+        return Err(format!(
+            "release '{release_cmd}' did not finish within the time limit (task {task_id})"
+        ));
+    };
+
+    // Exit code of the release container → the gate.
+    let exit = task
+        .containers()
+        .iter()
+        .find(|c| c.name() == Some(release_container.as_str()))
+        .and_then(|c| c.exit_code());
+
+    match release_gate(exit) {
+        ReleaseDecision::Proceed => Ok(format!(
+            "release '{release_cmd}' succeeded (exit 0, task {task_id})"
+        )),
+        ReleaseDecision::Abort(why) => {
+            // Best-effort log tail so the failure is actionable from the receipt.
+            let tail = release_log_tail(aws_cfg, &base_td, &release_container, &task_id)
+                .await
+                .unwrap_or_default();
+            let reason = task.stopped_reason().unwrap_or("");
+            Err(format!(
+                "release '{release_cmd}' FAILED — {why}{}{} (task {task_id})",
+                if reason.is_empty() {
+                    String::new()
+                } else {
+                    format!("; stopped_reason: {reason}")
+                },
+                if tail.is_empty() {
+                    String::new()
+                } else {
+                    format!("; logs: {tail}")
+                },
+            ))
+        }
+    }
+}
+
+/// Best-effort tail of a stopped release task's CloudWatch logs (last few lines)
+/// from the container's awslogs config. `None` if not awslogs-configured or
+/// unreadable — diagnostics only, never fatal.
+async fn release_log_tail(
+    aws_cfg: &aws_config::SdkConfig,
+    base_td: &aws_sdk_ecs::types::TaskDefinition,
+    container: &str,
+    task_id: &str,
+) -> Option<String> {
+    let logcfg = base_td
+        .container_definitions()
+        .iter()
+        .find(|c| c.name() == Some(container))?
+        .log_configuration()?;
+    let opts = logcfg.options()?;
+    let group = opts.get("awslogs-group")?.to_string();
+    let prefix = opts
+        .get("awslogs-stream-prefix")
+        .cloned()
+        .unwrap_or_else(|| "ecs".to_string());
+    let stream = format!("{prefix}/{container}/{task_id}");
+    let logs = aws_sdk_cloudwatchlogs::Client::new(aws_cfg);
+    let resp = logs
+        .get_log_events()
+        .log_group_name(group)
+        .log_stream_name(stream)
+        .limit(15)
+        .start_from_head(false)
+        .send()
+        .await
+        .ok()?;
+    let lines: Vec<String> = resp
+        .events()
+        .iter()
+        .filter_map(|e| e.message().map(|m| m.trim().to_string()))
+        .filter(|m| !m.is_empty())
+        .collect();
+    (!lines.is_empty()).then(|| lines.join(" | "))
 }
 
 /// Poll the outcome of a `deploy` by its `deploy_id`. Scope `app:read`. Reads
@@ -3388,5 +3673,34 @@ mod s3_tests {
         assert!(scoped_key(&None, "../etc/passwd").is_err());
         assert!(scoped_key(&Some("p".into()), "a/../../b").is_err());
         assert!(scoped_key(&None, "/abs").is_err());
+    }
+}
+
+#[cfg(test)]
+mod release_phase_tests {
+    use super::{release_argv, release_gate, ReleaseDecision};
+
+    #[test]
+    fn gate_proceeds_only_on_exit_zero() {
+        assert_eq!(release_gate(Some(0)), ReleaseDecision::Proceed);
+        // any non-zero aborts
+        assert!(matches!(release_gate(Some(1)), ReleaseDecision::Abort(_)));
+        assert!(matches!(release_gate(Some(137)), ReleaseDecision::Abort(_)));
+        // no exit code (failed to start / killed) aborts
+        assert!(matches!(release_gate(None), ReleaseDecision::Abort(_)));
+    }
+
+    #[test]
+    fn argv_wraps_any_toolchain_via_sh_lc() {
+        // Toolchain-agnostic: the command is passed verbatim to `sh -lc`.
+        assert_eq!(
+            release_argv("bundle exec rake db:migrate"),
+            vec!["sh", "-lc", "bundle exec rake db:migrate"]
+        );
+        assert_eq!(
+            release_argv("alembic upgrade head"),
+            vec!["sh", "-lc", "alembic upgrade head"]
+        );
+        assert_eq!(release_argv("sqlx migrate run").len(), 3);
     }
 }
