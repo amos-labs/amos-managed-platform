@@ -48,6 +48,12 @@ pub fn routes() -> Router<PlatformState> {
 
 // ── JSON-RPC transport ──────────────────────────────────────────────────
 
+/// `ask_amos` — natural-language manager front door (embedded Bedrock loop).
+mod ask_amos;
+
+/// Finance engine — governed `finance_*` verb surface (reference business engine).
+pub mod finance;
+
 /// Standard JSON-RPC 2.0 error codes we use.
 mod rpc_error {
     pub const INVALID_REQUEST: i64 = -32600;
@@ -254,7 +260,7 @@ fn resolve_tenant(claims: &Claims, args: &Value) -> Result<Uuid, ToolError> {
 
 // ── Tool dispatch ───────────────────────────────────────────────────────
 
-enum ToolError {
+pub(crate) enum ToolError {
     NotFound,
     InvalidParams(String),
     Execution(String),
@@ -295,16 +301,50 @@ async fn dispatch_tool(
         "get_harness_config" => tool_get_harness_config(state, claims, args).await,
         "set_harness_config" => tool_set_harness_config(state, claims, args).await,
         // ── Multi-service app hosting ─────────────────────────────────────
+        "deploy" => tool_deploy(state, claims, args).await,
+        "deploy_status" => tool_deploy_status(state, claims, args).await,
         "deploy_app" => tool_deploy_app(state, claims, args).await,
         "list_apps" => tool_list_apps(state, claims, args).await,
         "app_status" => tool_app_status(state, claims, args).await,
         "app_logs" => tool_app_logs(state, claims, args).await,
         "app_control" => tool_app_control(state, claims, args).await,
+        "app_redeploy" => tool_app_redeploy(state, claims, args).await,
+        // ── Isolated environments (staging / preview) ─────────────────────
+        "provision_env" => tool_provision_env(state, claims, args).await,
+        "teardown_env" => tool_teardown_env(state, claims, args).await,
         // ── Build-as-a-service ────────────────────────────────────────────
         "build_image" => tool_build_image(state, claims, args).await,
         "build_status" => tool_build_status(state, claims, args).await,
+        // ── Governed DB access ────────────────────────────────────────────
+        "db_query" => tool_db_query(state, claims, args).await,
+        "db_write" => tool_db_write(state, claims, args).await,
+        "describe_table" => tool_describe_table(state, claims, args).await,
+
+        // Finance engine (governed reference engine) — finance:* scopes + receipts on writes
+        "finance_board" => finance::tool_finance_board(state, claims, args).await,
+        "finance_history" => finance::tool_finance_history(state, claims, args).await,
+        "finance_truth" => finance::tool_finance_truth(state, claims, args).await,
+        "qbo_accounts" => finance::tool_qbo_accounts(state, claims, args).await,
+        "revenue_summary" => finance::tool_revenue_summary(state, claims, args).await,
+        "org_subscriptions" => finance::tool_org_subscriptions(state, claims, args).await,
+        "churn_snapshot" => finance::tool_churn_snapshot(state, claims, args).await,
+        "create_finance_line" => finance::tool_create_finance_line(state, claims, args).await,
+        "update_finance_line" => finance::tool_update_finance_line(state, claims, args).await,
+        "set_finance_actual" => finance::tool_set_finance_actual(state, claims, args).await,
+        "set_finance_budget" => finance::tool_set_finance_budget(state, claims, args).await,
+        "set_finance_mapping" => finance::tool_set_finance_mapping(state, claims, args).await,
+        "set_billing_key" => finance::tool_set_billing_key(state, claims, args).await,
+        // ── Tenant object storage (S3) ────────────────────────────────────
+        "s3_list" => tool_s3_list(state, claims, args).await,
+        "s3_get" => tool_s3_get(state, claims, args).await,
+        "s3_put" => tool_s3_put(state, claims, args).await,
+        "s3_delete" => tool_s3_delete(state, claims, args).await,
+        // ── Introspection (capability/identity discovery) ─────────────────
+        "whoami" => tool_whoami(state, claims, args).await,
         // ── Proof-carrying operations ─────────────────────────────────────
         "list_receipts" => tool_list_receipts(state, claims, args).await,
+        // ── Natural-language manager front door ───────────────────────────
+        "ask_amos" => ask_amos::run(state, claims, &arg_str(&args, "prompt")?).await,
         _ => Err(ToolError::NotFound),
     }
 }
@@ -473,7 +513,25 @@ async fn tool_build_image(
         .clone()
         .ok_or_else(|| ToolError::Execution("image builder not configured".into()))?;
 
-    let context_dir = arg_str(&args, "context_dir")?;
+    // Source is either a local context_dir (zipped → S3) or a git repo+ref
+    // (CodeBuild clones it — the path CI uses). Exactly one is required.
+    let context_dir = args
+        .get("context_dir")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let git_repo = args
+        .get("git_repo")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let git_ref = args
+        .get("git_ref")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    if context_dir.is_none() && git_repo.is_none() {
+        return Err(ToolError::Execution(
+            "provide either context_dir (local build) or git_repo (git-source build)".into(),
+        ));
+    }
     let image_name = arg_str(&args, "image_name")?;
     let tag = args
         .get("tag")
@@ -498,11 +556,23 @@ async fn tool_build_image(
         .unwrap_or_default();
 
     let req = BuildRequest {
-        context_dir: std::path::PathBuf::from(&context_dir),
+        context_dir: context_dir.as_ref().map(std::path::PathBuf::from),
+        git_repo: git_repo.clone(),
+        git_ref: git_ref.clone(),
         dockerfile: dockerfile.clone(),
         image_name: image_name.clone(),
         tag: tag.clone(),
         build_args,
+    };
+
+    // Human-readable source descriptor for the proof receipt.
+    let source_desc = match (&git_repo, &context_dir) {
+        (Some(repo), _) => match &git_ref {
+            Some(r) => format!("git:{repo}@{r}"),
+            None => format!("git:{repo}"),
+        },
+        (None, Some(dir)) => dir.clone(),
+        (None, None) => String::new(),
     };
 
     let build_id = builder.start_build(&req).await.map_err(map_amos_err)?;
@@ -519,7 +589,7 @@ async fn tool_build_image(
     let bg_image = image_name.clone();
     let bg_tag = tag.clone();
     let bg_df = dockerfile.clone();
-    let bg_ctx = context_dir.clone();
+    let bg_ctx = source_desc.clone();
     tokio::spawn(async move {
         run_build_to_receipt(
             &bg,
@@ -754,6 +824,1451 @@ async fn resolve_harness(
     .await
     .map_err(|e| ToolError::Execution(format!("database error: {e}")))?
     .ok_or_else(|| ToolError::Execution("harness not found for this tenant".into()))
+}
+
+/// The standard one-call deploy: build an app from its `amos.yaml` manifest and
+/// roll it. Scope `app:deploy`. The app author writes the manifest + a one-line
+/// workflow; this verb does everything — clone (via git-source build), build the
+/// service graph in dependency order (injecting BASE_IMAGE from base layers),
+/// then force-new-deployment the app's services. No tags/task-defs/ARNs leak to
+/// the caller. Resolves the app by `manifest.name` + tenant (no UUID needed).
+/// Returns immediately; the build+roll runs in the background and emits a receipt.
+async fn tool_deploy(
+    state: &PlatformState,
+    claims: &Claims,
+    args: Value,
+) -> Result<Value, ToolError> {
+    use crate::provisioning::manifest::AmosManifest;
+
+    let tenant_id = resolve_tenant(claims, &args)?;
+    let actor = claims.sub.clone();
+    let git_repo = arg_str(&args, "git_repo")?;
+    let git_ref = arg_str(&args, "git_ref")?;
+    let manifest = AmosManifest::parse(&arg_str(&args, "manifest")?).map_err(map_amos_err)?;
+    // Validate the build graph up front (cycles/unknown base → clear error now).
+    manifest.build_order().map_err(map_amos_err)?;
+
+    // `env` targets an isolated environment (provisioned by provision_env): the
+    // deployment is resolved as `{manifest.name}-{env}` instead of the base app.
+    let app_name = match args.get("env").and_then(|v| v.as_str()) {
+        Some(env) if !env.is_empty() => format!("{}-{}", manifest.name, env),
+        _ => manifest.name.clone(),
+    };
+
+    let builder = state
+        .image_builder
+        .clone()
+        .ok_or_else(|| ToolError::Execution("image builder not configured".into()))?;
+
+    // Resolve the app by name + tenant (must be onboarded first).
+    let row: Option<(Uuid, Option<Value>)> = sqlx::query_as(
+        "SELECT id, aws_meta FROM app_deployments \
+         WHERE tenant_id = $1 AND name = $2 AND status != 'deprovisioned'",
+    )
+    .bind(tenant_id)
+    .bind(&app_name)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| ToolError::Execution(format!("lookup app: {e}")))?;
+    let (deployment_id, aws_meta) = row.ok_or_else(|| {
+        ToolError::Execution(format!(
+            "no app named '{app_name}' for this tenant — onboard it (or provision_env) before deploying"
+        ))
+    })?;
+    let ecs_services: Vec<String> = aws_meta
+        .as_ref()
+        .and_then(|m| m.get("ecs_services"))
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| vec![app_name.clone()]);
+
+    let n_build = manifest.services.len();
+    let deploy_id = Uuid::new_v4();
+    let bg = state.clone();
+    tokio::spawn(async move {
+        run_deploy_to_receipt(
+            &bg,
+            builder,
+            deploy_id,
+            tenant_id,
+            actor,
+            deployment_id,
+            manifest,
+            ecs_services,
+            git_repo,
+            git_ref,
+        )
+        .await;
+    });
+
+    Ok(serde_json::json!({
+        "deploy_id": deploy_id,
+        "app": deployment_id,
+        "status": "deploying",
+        "services_to_build": n_build,
+        "note": "building + rolling in the background; poll deploy_status with this deploy_id until terminal",
+    }))
+}
+
+/// Background: build every service in the manifest (git-source, dep order) then
+/// force-new-deployment the app's ECS services, emitting one deploy receipt.
+#[allow(clippy::too_many_arguments)]
+async fn run_deploy_to_receipt(
+    state: &PlatformState,
+    builder: std::sync::Arc<crate::provisioning::image_builder::ImageBuilder>,
+    deploy_id: Uuid,
+    tenant_id: Uuid,
+    actor: String,
+    deployment_id: Uuid,
+    manifest: crate::provisioning::manifest::AmosManifest,
+    ecs_services: Vec<String>,
+    git_repo: String,
+    git_ref: String,
+) {
+    use crate::proof::{self, CheckStatus, Intent, OperationReceipt};
+    use crate::provisioning::image_builder::BuildRequest;
+    use std::collections::{BTreeMap, HashMap};
+    use std::time::Duration;
+
+    let registry = std::env::var("AMOS_ECR_REGISTRY").unwrap_or_default();
+    let order = match manifest.build_order() {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::error!("deploy '{}': bad manifest: {e}", manifest.name);
+            return;
+        }
+    };
+
+    let mut built: BTreeMap<String, String> = BTreeMap::new();
+    // repo image-name -> "registry/name@digest" for the freshly-built images, so
+    // we deploy by DIGEST (no moving-tag drift / silent no-op).
+    let mut pins: HashMap<String, String> = HashMap::new();
+    let mut results: Vec<(String, bool, String)> = Vec::new();
+    let mut all_ok = true;
+
+    // 1. Build every service in dependency order (base layers first, injecting
+    //    BASE_IMAGE into dependents).
+    for svc in order {
+        let image_name = svc.image_name(&manifest.name);
+        let tag = svc.tag();
+        let mut build_args: BTreeMap<String, String> = BTreeMap::new();
+        if let Some(base) = &svc.base {
+            if let Some(r) = built.get(base) {
+                build_args.insert("BASE_IMAGE".to_string(), r.clone());
+            }
+        }
+        let req = BuildRequest {
+            context_dir: None,
+            git_repo: Some(git_repo.clone()),
+            git_ref: Some(git_ref.clone()),
+            dockerfile: svc.dockerfile.clone(),
+            image_name: image_name.clone(),
+            tag: tag.clone(),
+            build_args,
+        };
+        let build_id = match builder.start_build(&req).await {
+            Ok(b) => b,
+            Err(e) => {
+                all_ok = false;
+                results.push((svc.name.clone(), false, format!("build start failed: {e}")));
+                break;
+            }
+        };
+        // Poll to terminal (~20 min cap), capturing the pushed digest.
+        let mut succeeded = false;
+        let mut digest: Option<String> = None;
+        for _ in 0..60 {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            if let Ok(s) = builder.build_state(&build_id, &image_name, &tag).await {
+                if s.done {
+                    succeeded = s.succeeded;
+                    digest = s.image_digest.clone();
+                    break;
+                }
+            }
+        }
+        if !succeeded {
+            all_ok = false;
+            results.push((
+                svc.name.clone(),
+                false,
+                format!("{image_name}:{tag} build failed/timeout"),
+            ));
+            break;
+        }
+        built.insert(svc.name.clone(), format!("{registry}/{image_name}:{tag}"));
+        // Pin the deploy to this exact digest (keyed by repo image-name).
+        if let Some(d) = &digest {
+            pins.insert(image_name.clone(), format!("{registry}/{image_name}@{d}"));
+        }
+        results.push((
+            svc.name.clone(),
+            true,
+            match &digest {
+                Some(d) => format!("built {image_name}:{tag} @ {d}"),
+                None => format!("built {image_name}:{tag} (no digest — will roll on tag)"),
+            },
+        ));
+    }
+
+    // 2. Roll the app's ECS services by DIGEST-PINNING — only if every build
+    //    succeeded. For each service we clone its live task def, repoint any
+    //    container whose ECR repo we just built to that exact `name@digest`,
+    //    register a new revision, and point the service at it. A new task def
+    //    triggers the rollout (no force_new_deployment needed), and because the
+    //    image is digest-pinned a moving-tag drift can never ship a stale image.
+    let mut rolled: Vec<String> = Vec::new();
+    let mut deployed: Vec<serde_json::Value> = Vec::new();
+    if all_ok {
+        let cfg = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .load()
+            .await;
+        let ecs = aws_sdk_ecs::Client::new(&cfg);
+        let cluster = std::env::var("ECS_CLUSTER")
+            .unwrap_or_else(|_| "swarm-infrastructure-cluster".to_string());
+        for svc in &ecs_services {
+            // Current task def of the service.
+            let td_arn = match ecs
+                .describe_services()
+                .cluster(&cluster)
+                .services(svc)
+                .send()
+                .await
+            {
+                Ok(r) => r
+                    .services()
+                    .first()
+                    .and_then(|s| s.task_definition().map(str::to_string)),
+                Err(e) => {
+                    all_ok = false;
+                    results.push((svc.clone(), false, format!("describe_services failed: {e}")));
+                    continue;
+                }
+            };
+            let Some(td_arn) = td_arn else {
+                all_ok = false;
+                results.push((svc.clone(), false, "service has no task definition".into()));
+                continue;
+            };
+            let base_td = match ecs
+                .describe_task_definition()
+                .task_definition(&td_arn)
+                .send()
+                .await
+            {
+                Ok(r) => r.task_definition().cloned(),
+                Err(e) => {
+                    all_ok = false;
+                    results.push((
+                        svc.clone(),
+                        false,
+                        format!("describe_task_definition failed: {e}"),
+                    ));
+                    continue;
+                }
+            };
+            let Some(base_td) = base_td else {
+                all_ok = false;
+                results.push((svc.clone(), false, "task definition not found".into()));
+                continue;
+            };
+            // Digest-pin matching containers.
+            let containers =
+                match crate::provisioning::env_provision::clone_containers_with_image_pins(
+                    base_td.container_definitions(),
+                    &pins,
+                ) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        all_ok = false;
+                        results.push((svc.clone(), false, format!("pin images failed: {e}")));
+                        continue;
+                    }
+                };
+            let matched: Vec<String> = base_td
+                .container_definitions()
+                .iter()
+                .filter_map(|c| c.image())
+                .filter_map(crate::provisioning::env_provision::repo_of)
+                .filter_map(|repo| pins.get(repo).cloned())
+                .collect();
+            if matched.is_empty() {
+                tracing::warn!(service = %svc, "deploy: no container image matched a freshly-built repo — rolling unchanged image (likely a manifest/ecs_services misconfig)");
+            }
+            // Register a new task def revision with the pinned containers.
+            let family = base_td.family().unwrap_or(svc).to_string();
+            let mut reg = ecs
+                .register_task_definition()
+                .family(&family)
+                .set_container_definitions(Some(containers))
+                .set_cpu(base_td.cpu().map(str::to_string))
+                .set_memory(base_td.memory().map(str::to_string))
+                .set_network_mode(base_td.network_mode().cloned())
+                .set_requires_compatibilities(Some(base_td.requires_compatibilities().to_vec()))
+                .set_execution_role_arn(base_td.execution_role_arn().map(str::to_string))
+                .set_task_role_arn(base_td.task_role_arn().map(str::to_string))
+                .set_runtime_platform(base_td.runtime_platform().cloned());
+            if !base_td.volumes().is_empty() {
+                reg = reg.set_volumes(Some(base_td.volumes().to_vec()));
+            }
+            let new_td_arn = match reg.send().await {
+                Ok(r) => r
+                    .task_definition()
+                    .and_then(|t| t.task_definition_arn().map(str::to_string)),
+                Err(e) => {
+                    all_ok = false;
+                    results.push((
+                        svc.clone(),
+                        false,
+                        format!("register_task_definition failed: {e}"),
+                    ));
+                    continue;
+                }
+            };
+            let Some(new_td_arn) = new_td_arn else {
+                all_ok = false;
+                results.push((svc.clone(), false, "no task def ARN returned".into()));
+                continue;
+            };
+            // Point the service at the new revision (this triggers the rollout).
+            match ecs
+                .update_service()
+                .cluster(&cluster)
+                .service(svc)
+                .task_definition(&new_td_arn)
+                .send()
+                .await
+            {
+                Ok(_) => {
+                    rolled.push(svc.clone());
+                    deployed.push(serde_json::json!({
+                        "service": svc,
+                        "task_def": new_td_arn,
+                        "images": matched,
+                    }));
+                }
+                Err(e) => {
+                    all_ok = false;
+                    results.push((svc.clone(), false, format!("update_service failed: {e}")));
+                }
+            }
+        }
+    }
+
+    // 3. One deploy receipt.
+    let intent = Intent {
+        summary: format!("deploy '{}' from {git_repo} @ {git_ref}", manifest.name),
+        self_modifying: false,
+        scope_classification: "deploy".to_string(),
+    };
+    let mut receipt = OperationReceipt::new("deploy", tenant_id, actor, intent)
+        .guardrail("manifest_driven")
+        .guardrail("build_graph_ordered")
+        .guardrail("rolling_health_checked")
+        .guardrail("digest_pinned_deploy")
+        .inputs(serde_json::json!({
+            "deploy_id": deploy_id,
+            "deployment_id": deployment_id,
+            "git_repo": git_repo,
+            "git_ref": git_ref,
+            "app": manifest.name,
+        }));
+    for (name, ok, msg) in &results {
+        receipt = receipt.check(
+            name.clone(),
+            if *ok {
+                CheckStatus::Passed
+            } else {
+                CheckStatus::Failed
+            },
+            msg.clone(),
+        );
+    }
+    receipt = receipt
+        .outputs(serde_json::json!({
+            "built": built,
+            "pinned": pins,
+            "rolled": rolled,
+            "deployed": deployed,
+        }))
+        .summary(if all_ok {
+            format!(
+                "deployed {} ({} service(s) rolled, digest-pinned)",
+                manifest.name,
+                rolled.len()
+            )
+        } else {
+            format!("deploy of {} FAILED — services not rolled", manifest.name)
+        });
+    let _ = proof::emit(&state.db, &receipt).await;
+}
+
+/// Poll the outcome of a `deploy` by its `deploy_id`. Scope `app:read`. Reads
+/// the terminal deploy receipt: `succeeded` (verified) / `failed`, or
+/// `deploying` if none exists yet — so CI can block on the real deploy result.
+async fn tool_deploy_status(
+    state: &PlatformState,
+    claims: &Claims,
+    args: Value,
+) -> Result<Value, ToolError> {
+    let tenant_id = resolve_tenant(claims, &args)?;
+    let deploy_id = arg_str(&args, "deploy_id")?;
+    let row: Option<(bool, Value)> = sqlx::query_as(
+        "SELECT verified, receipt FROM operation_receipts \
+         WHERE tenant_id = $1 AND operation = 'deploy' \
+           AND receipt->'inputs'->>'deploy_id' = $2 \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(tenant_id)
+    .bind(&deploy_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| ToolError::Execution(format!("lookup deploy receipt: {e}")))?;
+    match row {
+        None => Ok(serde_json::json!({
+            "deploy_id": deploy_id,
+            "status": "deploying",
+            "note": "no terminal receipt yet — build/roll still running",
+        })),
+        Some((verified, receipt)) => Ok(serde_json::json!({
+            "deploy_id": deploy_id,
+            "status": if verified { "succeeded" } else { "failed" },
+            "verified": verified,
+            "summary": receipt.get("summary").and_then(|v| v.as_str()).unwrap_or(""),
+            "receipt": receipt,
+        })),
+    }
+}
+
+/// Stand up an isolated environment (staging/preview) for an existing app: its
+/// own database + secret + ECS service + ALB host-rule, linked as a deployment.
+/// Scope `env:provision`. Data isolation is tier-based: standard tenants get a
+/// fresh database on the shared envs RDS (`ENVS_DATABASE_ADMIN_URL`); compliance
+/// tenants pass `db_secret_arn` for a dedicated RDS (PHI never shares an
+/// instance). Reproduces the app by cloning its live ECS task definition.
+async fn tool_provision_env(
+    state: &PlatformState,
+    claims: &Claims,
+    args: Value,
+) -> Result<Value, ToolError> {
+    use crate::proof::{self, CheckStatus, Intent, OperationReceipt};
+    use crate::provisioning::{db, env_provision::EnvProvisioner};
+
+    let tenant_id = resolve_tenant(claims, &args)?;
+    let actor = claims.sub.clone();
+    let app_name = arg_str(&args, "app_name")?;
+    let env_name = arg_str(&args, "env_name")?;
+    if env_name.is_empty()
+        || !env_name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err(ToolError::InvalidParams(
+            "env_name must be lowercase letters, digits, or hyphen".into(),
+        ));
+    }
+    let db_secret_arn_arg = args
+        .get("db_secret_arn")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let ttl_hours = args.get("ttl_hours").and_then(|v| v.as_i64());
+    let env_full = format!("{app_name}-{env_name}");
+
+    let provisioner = EnvProvisioner::from_env().await.ok_or_else(|| {
+        ToolError::Execution("env provisioner not configured (AWS_APP_ENABLED)".into())
+    })?;
+    let alb = state
+        .alb_router
+        .clone()
+        .ok_or_else(|| ToolError::Execution("ALB router not configured".into()))?;
+
+    // Resolve the base app + its primary service + secret.
+    let row: Option<(Option<Value>,)> = sqlx::query_as(
+        "SELECT aws_meta FROM app_deployments \
+         WHERE tenant_id = $1 AND name = $2 AND status != 'deprovisioned'",
+    )
+    .bind(tenant_id)
+    .bind(&app_name)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| ToolError::Execution(format!("lookup app: {e}")))?;
+    let aws_meta = row
+        .ok_or_else(|| ToolError::Execution(format!("no app named '{app_name}' for this tenant")))?
+        .0
+        .ok_or_else(|| ToolError::Execution("base app has no aws_meta".into()))?;
+    let base_service = aws_meta
+        .get("ecs_services")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ToolError::Execution("base app aws_meta.ecs_services is empty".into()))?
+        .to_string();
+    let base_secret_arn = aws_meta
+        .get("db_secret_arn")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ToolError::Execution("base app aws_meta.db_secret_arn not set".into()))?
+        .to_string();
+
+    // Tier → data isolation.
+    let plan: String = sqlx::query_scalar("SELECT plan FROM tenants WHERE id = $1")
+        .bind(tenant_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| ToolError::Execution(format!("tenant plan: {e}")))?;
+    let compliance = plan == "app_compliance";
+
+    // Ingress first — the public URL feeds the env overrides.
+    let base = provisioner
+        .describe_base_service(&base_service)
+        .await
+        .map_err(map_amos_err)?;
+    let route = alb
+        .setup_service_routing(&env_full, base.public_port as u16, "/")
+        .await
+        .map_err(map_amos_err)?;
+
+    let (env_secret_arn, db_mode) = if compliance {
+        let arn = db_secret_arn_arg.ok_or_else(|| {
+            ToolError::InvalidParams(
+                "compliance-tier app: pass db_secret_arn for a dedicated RDS (its secret must hold \
+                 DATABASE_URL + the app's other keys; PHI never shares an instance)"
+                    .into(),
+            )
+        })?;
+        (arn, "dedicated")
+    } else {
+        let admin = std::env::var("ENVS_DATABASE_ADMIN_URL").map_err(|_| {
+            ToolError::Execution(
+                "standard-tier env DB host not configured (set ENVS_DATABASE_ADMIN_URL)".into(),
+            )
+        })?;
+        let db_name = format!("{app_name}_{env_name}").replace('-', "_");
+        let env_db_url = db::create_named_database(&admin, &db_name)
+            .await
+            .map_err(map_amos_err)?;
+        let secret_name = format!("{env_full}/app-config");
+        let arn = provisioner
+            .clone_secret(&base_secret_arn, &secret_name, &env_db_url)
+            .await
+            .map_err(map_amos_err)?;
+        (arn, "shared")
+    };
+
+    // Clone the live task def with secrets repointed at the env secret.
+    let base_td = provisioner
+        .load_task_def(&base.task_def_arn)
+        .await
+        .map_err(map_amos_err)?;
+    let overrides = vec![
+        ("DEV_SEED_USERS".to_string(), "true".to_string()),
+        ("CORS_ORIGINS".to_string(), route.public_url.clone()),
+        ("NEXT_PUBLIC_API_URL".to_string(), route.public_url.clone()),
+    ];
+    let td_arn = provisioner
+        .register_cloned_task_def(
+            &env_full,
+            &base_td,
+            &base_secret_arn,
+            &env_secret_arn,
+            &overrides,
+        )
+        .await
+        .map_err(map_amos_err)?;
+    let service_arn = provisioner
+        .create_env_service(
+            &env_full,
+            &td_arn,
+            &route.target_group_arn,
+            &base.public_container,
+            base.public_port,
+        )
+        .await
+        .map_err(map_amos_err)?;
+
+    // Link as a deployment so deploy(env=) / db_query / db_write / app_status see it.
+    let deployment_id = Uuid::new_v4();
+    let expires_at =
+        ttl_hours.map(|h| (chrono::Utc::now() + chrono::Duration::hours(h)).to_rfc3339());
+    let spec = serde_json::json!({"name": env_full, "parent": app_name, "env": env_name});
+    let meta = serde_json::json!({
+        "task_def_arn": td_arn,
+        "service_arn": service_arn,
+        "public_url": route.public_url,
+        "ecs_services": [env_full],
+        "db_secret_arn": env_secret_arn,
+        "db_mode": db_mode,
+        "env": env_name,
+        "parent_app": app_name,
+        "ttl_hours": ttl_hours,
+        "expires_at": expires_at,
+        "target_group_arn": route.target_group_arn,
+        "listener_rule_arn": route.listener_rule_arn,
+    });
+    sqlx::query(
+        "INSERT INTO app_deployments (id, tenant_id, name, spec, provider, status, aws_meta) \
+         VALUES ($1, $2, $3, $4, 'ecs', 'running', $5)",
+    )
+    .bind(deployment_id)
+    .bind(tenant_id)
+    .bind(&env_full)
+    .bind(&spec)
+    .bind(&meta)
+    .execute(&state.db)
+    .await
+    .map_err(|e| ToolError::Execution(format!("insert deployment: {e}")))?;
+    let public_image = base_td
+        .container_definitions()
+        .iter()
+        .find(|c| c.name() == Some(base.public_container.as_str()))
+        .and_then(|c| c.image())
+        .unwrap_or_default()
+        .to_string();
+    sqlx::query(
+        "INSERT INTO app_services (deployment_id, service_name, image, expose_public, status) \
+         VALUES ($1, $2, $3, TRUE, 'running') ON CONFLICT (deployment_id, service_name) DO NOTHING",
+    )
+    .bind(deployment_id)
+    .bind(&env_full)
+    .bind(&public_image)
+    .execute(&state.db)
+    .await
+    .map_err(|e| ToolError::Execution(format!("insert service: {e}")))?;
+
+    let tier = if compliance { "compliance" } else { "standard" };
+    let intent = Intent {
+        summary: format!("provision isolated env '{env_name}' for app '{app_name}'"),
+        self_modifying: false,
+        scope_classification: "env_provision".to_string(),
+    };
+    let receipt = OperationReceipt::new("provision_env", tenant_id, actor, intent)
+        .guardrail("tier_isolation")
+        .guardrail(if compliance {
+            "dedicated_rds"
+        } else {
+            "shared_instance_db"
+        })
+        .inputs(serde_json::json!({
+            "app_name": app_name,
+            "env_name": env_name,
+            "tier": tier,
+            "deployment_id": deployment_id,
+        }))
+        .check(
+            "env_provisioned",
+            CheckStatus::Passed,
+            format!("service {env_full} + ingress {}", route.public_url),
+        )
+        .outputs(serde_json::json!({
+            "deployment_id": deployment_id,
+            "public_url": route.public_url,
+            "db_mode": db_mode,
+        }))
+        .summary(format!(
+            "provisioned env {env_full} at {}",
+            route.public_url
+        ));
+    let _ = proof::emit(&state.db, &receipt).await;
+
+    Ok(serde_json::json!({
+        "deployment_id": deployment_id,
+        "name": env_full,
+        "public_url": route.public_url,
+        "tier": tier,
+        "db_mode": db_mode,
+        "note": "service starting; poll app_status with the deployment_id. Roll code into it with deploy(env=...).",
+    }))
+}
+
+/// Tear down an isolated environment created by `provision_env` (scope
+/// `env:provision`): delete the ECS service + ALB rule/target-group, and — for
+/// shared-tier envs — drop the env database and its secret. Dedicated (PHI)
+/// RDS instances are operator-owned and left untouched. Best-effort on the AWS
+/// deletes; always removes the deployment row.
+async fn tool_teardown_env(
+    state: &PlatformState,
+    claims: &Claims,
+    args: Value,
+) -> Result<Value, ToolError> {
+    use crate::proof::{self, CheckStatus, Intent, OperationReceipt};
+    use crate::provisioning::{db, env_provision::EnvProvisioner};
+
+    let tenant_id = resolve_tenant(claims, &args)?;
+    let actor = claims.sub.clone();
+    let app_name = arg_str(&args, "app_name")?;
+    let env_name = arg_str(&args, "env_name")?;
+    let env_full = format!("{app_name}-{env_name}");
+
+    let row: Option<(Uuid, Option<Value>)> = sqlx::query_as(
+        "SELECT id, aws_meta FROM app_deployments WHERE tenant_id = $1 AND name = $2",
+    )
+    .bind(tenant_id)
+    .bind(&env_full)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| ToolError::Execution(format!("lookup env: {e}")))?;
+    let (deployment_id, aws_meta) = row.ok_or(ToolError::NotFound)?;
+    let aws_meta = aws_meta.unwrap_or_else(|| serde_json::json!({}));
+
+    let provisioner = EnvProvisioner::from_env().await.ok_or_else(|| {
+        ToolError::Execution("env provisioner not configured (AWS_APP_ENABLED)".into())
+    })?;
+
+    // ECS service.
+    provisioner.delete_service(&env_full).await;
+    // ALB rule + target group.
+    if let Some(alb) = state.alb_router.clone() {
+        alb.teardown_routing(
+            aws_meta.get("listener_rule_arn").and_then(|v| v.as_str()),
+            aws_meta.get("target_group_arn").and_then(|v| v.as_str()),
+        )
+        .await;
+    }
+    // Shared-tier data cleanup (dedicated RDS is operator-owned — leave it).
+    let db_mode = aws_meta
+        .get("db_mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if db_mode == "shared" {
+        if let Ok(admin) = std::env::var("ENVS_DATABASE_ADMIN_URL") {
+            let db_name = format!("{app_name}_{env_name}").replace('-', "_");
+            db::drop_harness_database(&admin, &db_name).await;
+        }
+        if let Some(arn) = aws_meta.get("db_secret_arn").and_then(|v| v.as_str()) {
+            provisioner.delete_secret(arn).await;
+        }
+    }
+    // Remove the deployment (app_services cascade via FK).
+    sqlx::query("DELETE FROM app_deployments WHERE id = $1")
+        .bind(deployment_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| ToolError::Execution(format!("delete deployment: {e}")))?;
+
+    let intent = Intent {
+        summary: format!("tear down env '{env_name}' of app '{app_name}'"),
+        self_modifying: false,
+        scope_classification: "env_provision".to_string(),
+    };
+    let receipt = OperationReceipt::new("teardown_env", tenant_id, actor, intent)
+        .guardrail("dedicated_rds_preserved")
+        .inputs(serde_json::json!({ "app_name": app_name, "env_name": env_name, "deployment_id": deployment_id }))
+        .check("env_torn_down", CheckStatus::Passed, format!("removed {env_full}"))
+        .summary(format!("tore down env {env_full}"));
+    let _ = proof::emit(&state.db, &receipt).await;
+
+    Ok(serde_json::json!({ "torn_down": env_full, "deployment_id": deployment_id }))
+}
+
+/// Roll a deployment's ECS service(s) to pick up a freshly-built image. Scope
+/// `app:deploy`. Issues `force-new-deployment` on each service in the
+/// deployment's `aws_meta.ecs_services` (falling back to the deployment name) —
+/// no task-def surgery, so all task settings are preserved. Pairs with CI that
+/// rebuilds the image under the tag the task def already references. Multi-
+/// service safe (Nuvola web+sidekiq) and single-service (Cuspr). Emits a receipt.
+async fn tool_app_redeploy(
+    state: &PlatformState,
+    claims: &Claims,
+    args: Value,
+) -> Result<Value, ToolError> {
+    use crate::proof::{self, CheckStatus, Intent, OperationReceipt};
+
+    let tenant_id = resolve_tenant(claims, &args)?;
+    let actor = claims.sub.clone();
+    let deployment_id = arg_uuid(&args, "deployment_id")?;
+    let image = args
+        .get("image")
+        .and_then(|v| v.as_str())
+        .unwrap_or("(current task-def tag)")
+        .to_string();
+
+    let row: Option<(String, Option<Value>)> = sqlx::query_as(
+        "SELECT name, aws_meta FROM app_deployments WHERE id = $1 AND tenant_id = $2",
+    )
+    .bind(deployment_id)
+    .bind(tenant_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| ToolError::Execution(format!("lookup deployment: {e}")))?;
+    let (name, aws_meta) = row.ok_or(ToolError::NotFound)?;
+    let services: Vec<String> = aws_meta
+        .as_ref()
+        .and_then(|m| m.get("ecs_services"))
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| vec![name.clone()]);
+
+    let cluster =
+        std::env::var("ECS_CLUSTER").unwrap_or_else(|_| "swarm-infrastructure-cluster".to_string());
+    let cfg = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .load()
+        .await;
+    let ecs = aws_sdk_ecs::Client::new(&cfg);
+
+    let mut rolled = Vec::new();
+    for svc in &services {
+        ecs.update_service()
+            .cluster(&cluster)
+            .service(svc)
+            .force_new_deployment(true)
+            .send()
+            .await
+            .map_err(|e| ToolError::Execution(format!("force-new-deployment {svc}: {e}")))?;
+        rolled.push(svc.clone());
+    }
+
+    let intent = Intent {
+        summary: format!("rolling redeploy of '{name}' ({} service(s))", rolled.len()),
+        self_modifying: false,
+        scope_classification: "deploy".to_string(),
+    };
+    let receipt = OperationReceipt::new("app_redeploy", tenant_id, actor, intent)
+        .guardrail("force_new_deployment")
+        .guardrail("rolling_health_checked")
+        .inputs(serde_json::json!({
+            "deployment_id": deployment_id,
+            "image": image,
+            "services": rolled,
+        }))
+        .check(
+            "redeploy_triggered",
+            CheckStatus::Passed,
+            format!("{} service(s) rolling", rolled.len()),
+        )
+        .outputs(serde_json::json!({ "services": rolled }))
+        .summary(format!(
+            "rolling redeploy of {name} ({} service(s))",
+            rolled.len()
+        ));
+    let _ = proof::emit(&state.db, &receipt).await;
+
+    Ok(serde_json::json!({
+        "deployment_id": deployment_id,
+        "redeployed": rolled,
+        "image": image,
+        "note": "force-new-deployment issued; poll app_status for rollout state",
+    }))
+}
+
+/// Governed read-only SQL against the tenant's *app* DB. Scope `db:read`.
+/// Resolves the connection from the deployment's `aws_meta.db_secret_arn`
+/// (read at query time — no creds stored in the control plane), runs inside a
+/// READ ONLY transaction with a row cap + statement timeout, emits a receipt.
+/// Ownership-checked resolution of a deployment's app-DB connection URL. The
+/// `db_secret_arn` in the deployment's `aws_meta` is read from Secrets Manager
+/// at call time and never persisted in the control plane. Shared by the
+/// governed db_query (read) and db_write (write) verbs.
+async fn deployment_db_url(
+    state: &PlatformState,
+    tenant_id: Uuid,
+    deployment_id: Uuid,
+) -> Result<String, ToolError> {
+    use crate::provisioning::db_query;
+
+    let row: Option<(Option<Value>,)> =
+        sqlx::query_as("SELECT aws_meta FROM app_deployments WHERE id = $1 AND tenant_id = $2")
+            .bind(deployment_id)
+            .bind(tenant_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| ToolError::Execution(format!("lookup deployment: {e}")))?;
+    let aws_meta = row.ok_or(ToolError::NotFound)?.0.ok_or_else(|| {
+        ToolError::Execution(
+            "deployment has no DB config (set aws_meta.db_secret_arn to enable DB access)".into(),
+        )
+    })?;
+    let secret_arn = aws_meta
+        .get("db_secret_arn")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ToolError::Execution("deployment aws_meta.db_secret_arn not set".into()))?;
+
+    let cfg = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .load()
+        .await;
+    let sm = aws_sdk_secretsmanager::Client::new(&cfg);
+    let secret = sm
+        .get_secret_value()
+        .secret_id(secret_arn)
+        .send()
+        .await
+        .map_err(|e| ToolError::Execution(format!("read DB secret: {e}")))?;
+    let secret_str = secret.secret_string().unwrap_or_default();
+    db_query::resolve_db_url(&aws_meta, secret_str).ok_or_else(|| {
+        ToolError::Execution(
+            "could not derive a postgres URL (set aws_meta.db_host/db_user/db_name)".into(),
+        )
+    })
+}
+
+/// Ownership-checked lookup of a deployment's `aws_meta` JSON (used by the
+/// storage verbs, mirrors `deployment_db_url`'s lookup).
+async fn deployment_aws_meta(
+    state: &PlatformState,
+    tenant_id: Uuid,
+    deployment_id: Uuid,
+) -> Result<Value, ToolError> {
+    let row: Option<(Option<Value>,)> =
+        sqlx::query_as("SELECT aws_meta FROM app_deployments WHERE id = $1 AND tenant_id = $2")
+            .bind(deployment_id)
+            .bind(tenant_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| ToolError::Execution(format!("lookup deployment: {e}")))?;
+    row.ok_or(ToolError::NotFound)?
+        .0
+        .ok_or_else(|| ToolError::Execution("deployment has no aws_meta".into()))
+}
+
+/// Resolve the tenant app's S3 bucket (and optional confining prefix) from a
+/// deployment's `aws_meta`. Every storage op is confined to this bucket+prefix.
+fn resolve_bucket(aws_meta: &Value) -> Result<(String, Option<String>), ToolError> {
+    let bucket = aws_meta
+        .get("s3_bucket")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ToolError::Execution("deployment aws_meta.s3_bucket not set".into()))?
+        .to_string();
+    let prefix = aws_meta
+        .get("s3_prefix")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim_end_matches('/').to_string());
+    Ok((bucket, prefix))
+}
+
+/// Build the effective object key: reject traversal, then confine under the
+/// deployment's `s3_prefix` (if any). `key` may be empty (used for listing).
+fn scoped_key(prefix: &Option<String>, key: &str) -> Result<String, ToolError> {
+    if key.contains("..") || key.starts_with('/') {
+        return Err(ToolError::InvalidParams(
+            "key must not contain '..' or start with '/'".into(),
+        ));
+    }
+    Ok(match prefix {
+        Some(p) => format!("{}/{}", p, key.trim_start_matches('/')),
+        None => key.to_string(),
+    })
+}
+
+const S3_INLINE_MAX: usize = 5 * 1024 * 1024; // 5 MiB inline get/put cap
+
+async fn s3_client() -> aws_sdk_s3::Client {
+    let cfg = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .load()
+        .await;
+    aws_sdk_s3::Client::new(&cfg)
+}
+
+/// List objects in the app's bucket under the (confining + caller) prefix.
+async fn tool_s3_list(
+    state: &PlatformState,
+    claims: &Claims,
+    args: Value,
+) -> Result<Value, ToolError> {
+    let tenant_id = resolve_tenant(claims, &args)?;
+    let deployment_id = arg_uuid(&args, "deployment_id")?;
+    let user_prefix = args.get("prefix").and_then(|v| v.as_str()).unwrap_or("");
+    let max_keys = args
+        .get("max_keys")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(1000)
+        .clamp(1, 1000) as i32;
+
+    let aws_meta = deployment_aws_meta(state, tenant_id, deployment_id).await?;
+    let (bucket, prefix) = resolve_bucket(&aws_meta)?;
+    let list_prefix = scoped_key(&prefix, user_prefix)?;
+
+    let s3 = s3_client().await;
+    let resp = s3
+        .list_objects_v2()
+        .bucket(&bucket)
+        .prefix(&list_prefix)
+        .max_keys(max_keys)
+        .send()
+        .await
+        .map_err(|e| ToolError::Execution(format!("s3 list failed: {e}")))?;
+
+    // Strip the confining prefix back off for display so callers see app-relative keys.
+    let strip = prefix.as_ref().map(|p| format!("{p}/"));
+    let keys: Vec<Value> = resp
+        .contents()
+        .iter()
+        .map(|o| {
+            let k = o.key().unwrap_or_default();
+            let disp = match &strip {
+                Some(s) => k.strip_prefix(s.as_str()).unwrap_or(k),
+                None => k,
+            };
+            serde_json::json!({
+                "key": disp,
+                "size": o.size().unwrap_or(0),
+                "last_modified_epoch": o.last_modified().map(|t| t.secs()),
+            })
+        })
+        .collect();
+    Ok(serde_json::json!({ "bucket": bucket, "count": keys.len(), "keys": keys }))
+}
+
+/// Read an object (inline, ≤5 MiB) or, with `presign:true`, return a temporary
+/// presigned GET URL (no inline size limit — use for large/binary objects).
+async fn tool_s3_get(
+    state: &PlatformState,
+    claims: &Claims,
+    args: Value,
+) -> Result<Value, ToolError> {
+    use base64::Engine;
+
+    let tenant_id = resolve_tenant(claims, &args)?;
+    let deployment_id = arg_uuid(&args, "deployment_id")?;
+    let key = arg_str(&args, "key")?;
+    let presign = args
+        .get("presign")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let expires_in = args
+        .get("expires_in")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(900)
+        .clamp(1, 604800) as u64;
+
+    let aws_meta = deployment_aws_meta(state, tenant_id, deployment_id).await?;
+    let (bucket, prefix) = resolve_bucket(&aws_meta)?;
+    let full_key = scoped_key(&prefix, &key)?;
+    let s3 = s3_client().await;
+
+    if presign {
+        let pc = aws_sdk_s3::presigning::PresigningConfig::expires_in(
+            std::time::Duration::from_secs(expires_in),
+        )
+        .map_err(|e| ToolError::Execution(format!("presign config: {e}")))?;
+        let req = s3
+            .get_object()
+            .bucket(&bucket)
+            .key(&full_key)
+            .presigned(pc)
+            .await
+            .map_err(|e| ToolError::Execution(format!("presign get failed: {e}")))?;
+        return Ok(serde_json::json!({
+            "key": key, "method": "GET",
+            "presigned_url": req.uri().to_string(), "expires_in": expires_in,
+        }));
+    }
+
+    let resp = s3
+        .get_object()
+        .bucket(&bucket)
+        .key(&full_key)
+        .send()
+        .await
+        .map_err(|e| ToolError::Execution(format!("s3 get failed: {e}")))?;
+    let content_type = resp.content_type().map(|s| s.to_string());
+    let data = resp
+        .body
+        .collect()
+        .await
+        .map_err(|e| ToolError::Execution(format!("read body: {e}")))?
+        .into_bytes();
+    if data.len() > S3_INLINE_MAX {
+        return Err(ToolError::InvalidParams(format!(
+            "object is {} bytes (> {S3_INLINE_MAX} inline cap); use presign:true for a download URL",
+            data.len()
+        )));
+    }
+    let (content, is_b64) = match std::str::from_utf8(&data) {
+        Ok(s) => (s.to_string(), false),
+        Err(_) => (
+            base64::engine::general_purpose::STANDARD.encode(&data),
+            true,
+        ),
+    };
+    Ok(serde_json::json!({
+        "key": key, "content_type": content_type, "size": data.len(),
+        "content": content, "base64": is_b64,
+    }))
+}
+
+/// Write an object (inline body, ≤5 MiB) or, with `presign:true`, return a
+/// presigned PUT URL for a browser/client to upload directly. Emits a receipt.
+async fn tool_s3_put(
+    state: &PlatformState,
+    claims: &Claims,
+    args: Value,
+) -> Result<Value, ToolError> {
+    use crate::proof::{self, CheckStatus, Intent, OperationReceipt};
+    use base64::Engine;
+
+    let tenant_id = resolve_tenant(claims, &args)?;
+    let actor = claims.sub.clone();
+    let deployment_id = arg_uuid(&args, "deployment_id")?;
+    let key = arg_str(&args, "key")?;
+    let presign = args
+        .get("presign")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let content_type = args
+        .get("content_type")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let aws_meta = deployment_aws_meta(state, tenant_id, deployment_id).await?;
+    let (bucket, prefix) = resolve_bucket(&aws_meta)?;
+    let full_key = scoped_key(&prefix, &key)?;
+    let s3 = s3_client().await;
+
+    if presign {
+        let expires_in = args
+            .get("expires_in")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(900)
+            .clamp(1, 604800) as u64;
+        let pc = aws_sdk_s3::presigning::PresigningConfig::expires_in(
+            std::time::Duration::from_secs(expires_in),
+        )
+        .map_err(|e| ToolError::Execution(format!("presign config: {e}")))?;
+        let mut b = s3.put_object().bucket(&bucket).key(&full_key);
+        if let Some(ct) = &content_type {
+            b = b.content_type(ct);
+        }
+        let req = b
+            .presigned(pc)
+            .await
+            .map_err(|e| ToolError::Execution(format!("presign put failed: {e}")))?;
+        return Ok(serde_json::json!({
+            "key": key, "method": "PUT",
+            "presigned_url": req.uri().to_string(), "expires_in": expires_in,
+        }));
+    }
+
+    let body = arg_str(&args, "body")?;
+    let is_b64 = args
+        .get("base64")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let bytes: Vec<u8> = if is_b64 {
+        base64::engine::general_purpose::STANDARD
+            .decode(body.as_bytes())
+            .map_err(|e| ToolError::InvalidParams(format!("invalid base64 body: {e}")))?
+    } else {
+        body.into_bytes()
+    };
+    if bytes.len() > S3_INLINE_MAX {
+        return Err(ToolError::InvalidParams(format!(
+            "body is {} bytes (> {S3_INLINE_MAX} inline cap); use presign:true to upload directly",
+            bytes.len()
+        )));
+    }
+    let size = bytes.len();
+    let mut b = s3
+        .put_object()
+        .bucket(&bucket)
+        .key(&full_key)
+        .body(aws_sdk_s3::primitives::ByteStream::from(bytes));
+    if let Some(ct) = &content_type {
+        b = b.content_type(ct);
+    }
+    let resp = b
+        .send()
+        .await
+        .map_err(|e| ToolError::Execution(format!("s3 put failed: {e}")))?;
+    let etag = resp.e_tag().map(|s| s.to_string());
+
+    let intent = Intent {
+        summary: format!("write object '{key}' to app deployment {deployment_id}"),
+        self_modifying: true,
+        scope_classification: "storage_write".to_string(),
+    };
+    let receipt = OperationReceipt::new("s3_put", tenant_id, actor, intent)
+        .guardrail("bucket_scoped")
+        .guardrail("prefix_confined")
+        .inputs(serde_json::json!({ "deployment_id": deployment_id, "bucket": bucket, "key": key, "size": size }))
+        .check("object_written", CheckStatus::Passed, format!("{size} bytes"))
+        .outputs(serde_json::json!({ "etag": etag }))
+        .summary(format!("s3_put wrote {size} bytes to {key}"));
+    let _ = proof::emit(&state.db, &receipt).await;
+
+    Ok(serde_json::json!({ "key": key, "etag": etag, "size": size }))
+}
+
+/// Delete an object from the app's bucket (prefix-confined). Emits a receipt.
+async fn tool_s3_delete(
+    state: &PlatformState,
+    claims: &Claims,
+    args: Value,
+) -> Result<Value, ToolError> {
+    use crate::proof::{self, CheckStatus, Intent, OperationReceipt};
+
+    let tenant_id = resolve_tenant(claims, &args)?;
+    let actor = claims.sub.clone();
+    let deployment_id = arg_uuid(&args, "deployment_id")?;
+    let key = arg_str(&args, "key")?;
+
+    let aws_meta = deployment_aws_meta(state, tenant_id, deployment_id).await?;
+    let (bucket, prefix) = resolve_bucket(&aws_meta)?;
+    let full_key = scoped_key(&prefix, &key)?;
+    let s3 = s3_client().await;
+    s3.delete_object()
+        .bucket(&bucket)
+        .key(&full_key)
+        .send()
+        .await
+        .map_err(|e| ToolError::Execution(format!("s3 delete failed: {e}")))?;
+
+    let intent = Intent {
+        summary: format!("delete object '{key}' from app deployment {deployment_id}"),
+        self_modifying: true,
+        scope_classification: "storage_write".to_string(),
+    };
+    let receipt = OperationReceipt::new("s3_delete", tenant_id, actor, intent)
+        .guardrail("bucket_scoped")
+        .guardrail("prefix_confined")
+        .inputs(serde_json::json!({ "deployment_id": deployment_id, "bucket": bucket, "key": key }))
+        .check("object_deleted", CheckStatus::Passed, key.clone())
+        .summary(format!("s3_delete removed {key}"));
+    let _ = proof::emit(&state.db, &receipt).await;
+
+    Ok(serde_json::json!({ "deleted": key }))
+}
+
+async fn tool_db_query(
+    state: &PlatformState,
+    claims: &Claims,
+    args: Value,
+) -> Result<Value, ToolError> {
+    use crate::proof::{self, CheckStatus, Intent, OperationReceipt};
+    use crate::provisioning::db_query;
+
+    let tenant_id = resolve_tenant(claims, &args)?;
+    let actor = claims.sub.clone();
+    let deployment_id = arg_uuid(&args, "deployment_id")?;
+    let sql = arg_str(&args, "sql")?;
+    let max_rows = args
+        .get("max_rows")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(1000);
+
+    let db_url = deployment_db_url(state, tenant_id, deployment_id).await?;
+
+    let rows = db_query::run_readonly_query(&db_url, &sql, max_rows)
+        .await
+        .map_err(map_amos_err)?;
+
+    // Proof receipt — every query the AI runs is recorded (intent = the SQL).
+    let intent = Intent {
+        summary: format!("read-only query on app deployment {deployment_id}"),
+        self_modifying: false,
+        scope_classification: "db_read".to_string(),
+    };
+    let receipt = OperationReceipt::new("db_query", tenant_id, actor, intent)
+        .guardrail("read_only_transaction")
+        .guardrail("row_cap")
+        .guardrail("statement_timeout")
+        .inputs(serde_json::json!({
+            "deployment_id": deployment_id,
+            "sql": sql,
+            "max_rows": max_rows,
+        }))
+        .check(
+            "query_executed",
+            CheckStatus::Passed,
+            format!("{} row(s)", rows.len()),
+        )
+        .outputs(serde_json::json!({ "row_count": rows.len() }))
+        .summary(format!("db_query returned {} row(s)", rows.len()));
+    let _ = proof::emit(&state.db, &receipt).await;
+
+    Ok(serde_json::json!({
+        "deployment_id": deployment_id,
+        "row_count": rows.len(),
+        "rows": rows,
+    }))
+}
+
+/// Governed single-statement DML write (scope `db:write`, owner-only). Mirrors
+/// db_query but inverted for danger: INSERT/UPDATE/DELETE only, a WHERE is
+/// required on UPDATE/DELETE (unless `allow_unfiltered`), the affected-row count
+/// is capped, and `dry_run` measures the effect then rolls back. Every call —
+/// including a dry run — emits a `self_modifying` proof receipt with the exact
+/// SQL, params, and affected rows.
+async fn tool_db_write(
+    state: &PlatformState,
+    claims: &Claims,
+    args: Value,
+) -> Result<Value, ToolError> {
+    use crate::proof::{self, CheckStatus, Intent, OperationReceipt};
+    use crate::provisioning::db_query;
+
+    let tenant_id = resolve_tenant(claims, &args)?;
+    let actor = claims.sub.clone();
+    let deployment_id = arg_uuid(&args, "deployment_id")?;
+    let sql = arg_str(&args, "sql")?;
+    let params: Vec<Value> = args
+        .get("params")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let max_rows = args.get("max_rows").and_then(|v| v.as_i64()).unwrap_or(100);
+    let dry_run = args
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let allow_unfiltered = args
+        .get("allow_unfiltered")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let db_url = deployment_db_url(state, tenant_id, deployment_id).await?;
+
+    let outcome =
+        db_query::run_write_dml(&db_url, &sql, &params, max_rows, dry_run, allow_unfiltered)
+            .await
+            .map_err(map_amos_err)?;
+
+    // Proof receipt — a write is self-modifying; record intent + exact effect.
+    let mode = if dry_run { "dry_run" } else { "apply" };
+    let intent = Intent {
+        summary: format!("{mode} DML write on app deployment {deployment_id}"),
+        self_modifying: true,
+        scope_classification: "db_write".to_string(),
+    };
+    let mut receipt = OperationReceipt::new("db_write", tenant_id, actor, intent)
+        .guardrail("single_statement")
+        .guardrail("dml_only")
+        .guardrail("where_required")
+        .guardrail("row_cap")
+        .guardrail("transaction")
+        .inputs(serde_json::json!({
+            "deployment_id": deployment_id,
+            "sql": sql,
+            "params": params,
+            "max_rows": max_rows,
+            "dry_run": dry_run,
+            "allow_unfiltered": allow_unfiltered,
+        }))
+        .outputs(serde_json::json!({
+            "affected_rows": outcome.affected,
+            "committed": outcome.committed,
+        }));
+    receipt = if dry_run {
+        receipt.check(
+            "dry_run",
+            CheckStatus::Passed,
+            format!("would affect {} row(s); rolled back", outcome.affected),
+        )
+    } else {
+        receipt.check(
+            "write_committed",
+            CheckStatus::Passed,
+            format!("committed; {} row(s) affected", outcome.affected),
+        )
+    };
+    let receipt = receipt.summary(format!(
+        "db_write {} — {} row(s) affected{}",
+        mode,
+        outcome.affected,
+        if outcome.committed {
+            ""
+        } else {
+            " (not committed)"
+        }
+    ));
+    let _ = proof::emit(&state.db, &receipt).await;
+
+    Ok(serde_json::json!({
+        "deployment_id": deployment_id,
+        "affected_rows": outcome.affected,
+        "committed": outcome.committed,
+        "dry_run": dry_run,
+        "rows": outcome.rows,
+    }))
+}
+
+/// Read-only schema introspection against an app's database. With no `table`,
+/// lists the public base tables; with a `table`, lists its columns (name, type,
+/// nullability). Removes the "guess the column name → failed query → round-trip"
+/// loop. Scope `db:read`; no receipt (schema metadata, not a data operation).
+async fn tool_describe_table(
+    state: &PlatformState,
+    claims: &Claims,
+    args: Value,
+) -> Result<Value, ToolError> {
+    use crate::provisioning::db_query;
+
+    let tenant_id = resolve_tenant(claims, &args)?;
+    let deployment_id = arg_uuid(&args, "deployment_id")?;
+    let table = args
+        .get("table")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let db_url = deployment_db_url(state, tenant_id, deployment_id).await?;
+    let sql = match &table {
+        Some(t) => {
+            // The table name is used as a string literal below; require a plain
+            // identifier so it can't carry SQL.
+            if t.is_empty() || !t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                return Err(ToolError::InvalidParams(
+                    "table must be a plain identifier (letters, digits, underscore)".into(),
+                ));
+            }
+            format!(
+                "SELECT column_name, data_type, is_nullable, character_maximum_length \
+                 FROM information_schema.columns \
+                 WHERE table_schema = 'public' AND table_name = '{t}' \
+                 ORDER BY ordinal_position"
+            )
+        }
+        None => "SELECT table_name FROM information_schema.tables \
+                 WHERE table_schema = 'public' AND table_type = 'BASE TABLE' \
+                 ORDER BY table_name"
+            .to_string(),
+    };
+
+    let rows = db_query::run_readonly_query(&db_url, &sql, 2000)
+        .await
+        .map_err(map_amos_err)?;
+
+    if table.is_some() && rows.is_empty() {
+        return Err(ToolError::NotFound);
+    }
+    Ok(serde_json::json!({
+        "deployment_id": deployment_id,
+        "table": table,
+        "kind": if table.is_some() { "columns" } else { "tables" },
+        "count": rows.len(),
+        "rows": rows,
+    }))
+}
+
+/// Return the caller's identity and *effective* scopes — so an agent knows what
+/// it can do before it tries, instead of discovering a missing scope at call
+/// time. No scope gate: any authenticated principal may introspect itself.
+async fn tool_whoami(
+    _state: &PlatformState,
+    claims: &Claims,
+    _args: Value,
+) -> Result<Value, ToolError> {
+    let mut scopes: Vec<String> =
+        crate::rbac::effective_scopes(&claims.role, claims.scopes.as_deref())
+            .into_iter()
+            .collect();
+    scopes.sort();
+    Ok(serde_json::json!({
+        "sub": claims.sub,
+        "tenant_id": claims.tenant_id,
+        "tenant_slug": claims.tenant_slug,
+        "role": claims.role,
+        // API-key principals carry an explicit scope list; JWT users don't.
+        "principal_type": if claims.scopes.is_some() { "api_key" } else { "user" },
+        "scopes": scopes,
+    }))
 }
 
 fn arg_str(args: &Value, key: &str) -> Result<String, ToolError> {
@@ -1455,15 +2970,17 @@ fn tool_definitions() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "context_dir": { "type": "string", "description": "Absolute path to the build context directory (on the platform host)." },
+                    "context_dir": { "type": "string", "description": "Absolute path to the build context directory (on the platform host). Use this OR git_repo. For CI/remote callers, use git_repo instead." },
+                    "git_repo": { "type": "string", "description": "Git source URL (e.g. 'https://github.com/org/repo.git'). CodeBuild clones it directly — no local context. Use this from CI. Private repos require GitHub source credentials in CodeBuild." },
+                    "git_ref": { "type": "string", "description": "Git ref to build with git_repo: a commit SHA (recommended for CI), branch, or tag." },
                     "image_name": { "type": "string", "description": "ECR repository name to push to, e.g. 'cuspr-api' (created if absent)." },
-                    "dockerfile": { "type": "string", "description": "Dockerfile path relative to the context (default 'Dockerfile')." },
+                    "dockerfile": { "type": "string", "description": "Dockerfile path relative to the context/repo root (default 'Dockerfile')." },
                     "tag": { "type": "string", "description": "Image tag (default 'latest')." },
                     "build_args": { "type": "object", "description": "Docker --build-arg values, e.g. {\"BASE_IMAGE\":\"…/cuspr-base:latest\"}. Values must not contain spaces." },
                     "callback_url": { "type": "string", "description": "Optional URL the platform POSTs to when the build reaches a terminal state (ping-back), so you don't have to poll build_status." },
                     "tenant_id": { "type": "string", "description": "Tenant UUID (admins only)" }
                 },
-                "required": ["context_dir", "image_name"]
+                "required": ["image_name"]
             }
         },
         {
@@ -1481,6 +2998,342 @@ fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "db_query",
+            "description": "Run a READ-ONLY SQL query against an app's database (for inspecting data, e.g. 'does this query return rows?'). Requires the db:read scope. The query runs inside a read-only transaction with a row cap and statement timeout, and every call emits a proof receipt. Only SELECT-style queries work (it is wrapped as a subquery); writes/DDL are rejected. Use list_apps to get the deployment_id.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "deployment_id": { "type": "string", "description": "The app deployment to query (from list_apps)." },
+                    "sql": { "type": "string", "description": "A read-only SELECT query, e.g. 'SELECT count(*) FROM users'." },
+                    "max_rows": { "type": "integer", "description": "Row cap (default 1000, max 10000)." },
+                    "tenant_id": { "type": "string", "description": "Tenant UUID (admins only)" }
+                },
+                "required": ["deployment_id", "sql"]
+            }
+        },
+        {
+            "name": "db_write",
+            "description": "Run a single-statement WRITE (INSERT/UPDATE/DELETE) against an app's database. Requires the db:write scope (owner-only, granted per key by a human). Guardrails: single statement only; DDL (DROP/ALTER/CREATE/TRUNCATE) and SELECT are rejected (schema changes go through the app's migrations/deploy); UPDATE/DELETE must have a WHERE unless allow_unfiltered=true; the affected-row count is capped by max_rows or the whole write is rolled back. Pass values as bound params ($1,$2,…) in 'params', not string-interpolated. Use dry_run=true first to preview the affected count + rows (it rolls back). Every call emits a proof receipt. Use list_apps to get the deployment_id.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "deployment_id": { "type": "string", "description": "The app deployment to write to (from list_apps)." },
+                    "sql": { "type": "string", "description": "One INSERT/UPDATE/DELETE statement, e.g. 'UPDATE users SET active = $1 WHERE id = $2'. Use $1,$2,… for values." },
+                    "params": { "type": "array", "description": "Values bound to $1,$2,… (typed by JSON: string/number/bool/null/json). Default []." },
+                    "max_rows": { "type": "integer", "description": "Max rows the write may affect before it is rolled back (default 100, max 10000)." },
+                    "dry_run": { "type": "boolean", "description": "If true, run + measure + ROLL BACK (preview only). Default false." },
+                    "allow_unfiltered": { "type": "boolean", "description": "Allow an UPDATE/DELETE with no WHERE clause. Default false." },
+                    "tenant_id": { "type": "string", "description": "Tenant UUID (admins only)" }
+                },
+                "required": ["deployment_id", "sql"]
+            }
+        },
+        {
+            "name": "describe_table",
+            "description": "Inspect an app database's schema (read-only, db:read). With no 'table', returns the list of public tables. With a 'table', returns its columns (name, data_type, is_nullable, max length). Use this before writing db_query/db_write so you don't guess column names. Use list_apps to get the deployment_id.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "deployment_id": { "type": "string", "description": "The app deployment (from list_apps)." },
+                    "table": { "type": "string", "description": "A table name to describe. Omit to list all tables." },
+                    "tenant_id": { "type": "string", "description": "Tenant UUID (admins only)" }
+                },
+                "required": ["deployment_id"]
+            }
+        },
+        {
+            "name": "finance_board",
+            "description": "Read the tenant's finance board — budget vs actuals by category for a period (scope finance:read). The reference finance engine; an app enables it, never rebuilds it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "period": { "type": "string", "description": "Period to view, e.g. '2026-06' or 'Q2-2026'. Omit for current." },
+                    "tenant_id": { "type": "string", "description": "Tenant UUID (admins only)" }
+                }
+            }
+        },
+        {
+            "name": "finance_history",
+            "description": "Read historical finance lines/totals over time (scope finance:read).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "from": { "type": "string", "description": "Start period (e.g. '2026-01')." },
+                    "to": { "type": "string", "description": "End period (e.g. '2026-06')." },
+                    "tenant_id": { "type": "string", "description": "Tenant UUID (admins only)" }
+                }
+            }
+        },
+        {
+            "name": "finance_truth",
+            "description": "Read the reconciled finance 'truth' (actuals reconciled against the source of record / QBO) (scope finance:read).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "period": { "type": "string", "description": "Period to reconcile. Omit for current." },
+                    "tenant_id": { "type": "string", "description": "Tenant UUID (admins only)" }
+                }
+            }
+        },
+        {
+            "name": "qbo_accounts",
+            "description": "List the connected QuickBooks Online chart of accounts available for mapping (scope finance:read).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tenant_id": { "type": "string", "description": "Tenant UUID (admins only)" }
+                }
+            }
+        },
+        {
+            "name": "revenue_summary",
+            "description": "Read a revenue summary (MRR/ARR/new/expansion) for the tenant (scope finance:read).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "period": { "type": "string", "description": "Period to summarize. Omit for current." },
+                    "tenant_id": { "type": "string", "description": "Tenant UUID (admins only)" }
+                }
+            }
+        },
+        {
+            "name": "org_subscriptions",
+            "description": "List the tenant's active subscriptions / plans driving recurring revenue (scope finance:read).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tenant_id": { "type": "string", "description": "Tenant UUID (admins only)" }
+                }
+            }
+        },
+        {
+            "name": "churn_snapshot",
+            "description": "Read a churn snapshot (rate + count for a period) (scope finance:read).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "period": { "type": "string", "description": "Period for the snapshot. Omit for current." },
+                    "tenant_id": { "type": "string", "description": "Tenant UUID (admins only)" }
+                }
+            }
+        },
+        {
+            "name": "create_finance_line",
+            "description": "Create a finance line (a budget/actual row for a category) (scope finance:write; emits a proof receipt).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "category": { "type": "string", "description": "Finance category / line name." },
+                    "period": { "type": "string", "description": "Period the line belongs to, e.g. '2026-06'." },
+                    "amount": { "type": "number", "description": "Amount for the line (currency units)." },
+                    "kind": { "type": "string", "description": "'budget' or 'actual'." },
+                    "tenant_id": { "type": "string", "description": "Tenant UUID (admins only)" }
+                },
+                "required": ["category", "period"]
+            }
+        },
+        {
+            "name": "update_finance_line",
+            "description": "Update an existing finance line by id (scope finance:write; emits a proof receipt).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Finance line id to update." },
+                    "amount": { "type": "number", "description": "New amount." },
+                    "category": { "type": "string", "description": "New category/name (optional)." },
+                    "tenant_id": { "type": "string", "description": "Tenant UUID (admins only)" }
+                },
+                "required": ["id"]
+            }
+        },
+        {
+            "name": "set_finance_actual",
+            "description": "Set the actual value for a category/period (scope finance:write; emits a proof receipt).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "category": { "type": "string" },
+                    "period": { "type": "string", "description": "Period, e.g. '2026-06'." },
+                    "amount": { "type": "number", "description": "Actual amount." },
+                    "tenant_id": { "type": "string", "description": "Tenant UUID (admins only)" }
+                },
+                "required": ["category", "period", "amount"]
+            }
+        },
+        {
+            "name": "set_finance_budget",
+            "description": "Set the budget value for a category/period (scope finance:write; emits a proof receipt).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "category": { "type": "string" },
+                    "period": { "type": "string", "description": "Period, e.g. '2026-06'." },
+                    "amount": { "type": "number", "description": "Budgeted amount." },
+                    "tenant_id": { "type": "string", "description": "Tenant UUID (admins only)" }
+                },
+                "required": ["category", "period", "amount"]
+            }
+        },
+        {
+            "name": "set_finance_mapping",
+            "description": "Map a QBO account (or source category) to a finance board category (scope finance:write; emits a proof receipt).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "qbo_account": { "type": "string", "description": "QBO account id/name (from qbo_accounts)." },
+                    "category": { "type": "string", "description": "Finance board category to map it to." },
+                    "tenant_id": { "type": "string", "description": "Tenant UUID (admins only)" }
+                },
+                "required": ["qbo_account", "category"]
+            }
+        },
+        {
+            "name": "set_billing_key",
+            "description": "Connect a finance integration / set a billing API credential (scope finance:connect, owner-only; emits a proof receipt with the secret REDACTED). The most sensitive finance verb.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "provider": { "type": "string", "description": "Integration provider, e.g. 'stripe' or 'quickbooks'." },
+                    "key": { "type": "string", "description": "The API key / credential. Never logged; redacted in the proof receipt." },
+                    "tenant_id": { "type": "string", "description": "Tenant UUID (admins only)" }
+                },
+                "required": ["provider", "key"]
+            }
+        },
+        {
+            "name": "whoami",
+            "description": "Return your identity (sub, tenant, role) and your EFFECTIVE scopes — what you're allowed to do — so you know your capabilities up front instead of discovering a missing scope at call time. No arguments, no scope required.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "s3_list",
+            "description": "List objects in the app's S3 bucket (scope storage:read). Confined to the deployment's bucket (and prefix, if configured); keys are shown app-relative. Requires aws_meta.s3_bucket on the deployment. Use list_apps for the deployment_id.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "deployment_id": { "type": "string" },
+                    "prefix": { "type": "string", "description": "Optional key prefix to filter by (app-relative)." },
+                    "max_keys": { "type": "integer", "description": "Max keys to return (default 1000, max 1000)." },
+                    "tenant_id": { "type": "string", "description": "Tenant UUID (admins only)" }
+                },
+                "required": ["deployment_id"]
+            }
+        },
+        {
+            "name": "s3_get",
+            "description": "Read an object from the app's bucket (scope storage:read). Inline returns content (utf8, or base64 for binary) for objects ≤5 MiB. For larger/binary objects or browser download, pass presign:true to get a temporary presigned GET URL instead.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "deployment_id": { "type": "string" },
+                    "key": { "type": "string", "description": "Object key (app-relative)." },
+                    "presign": { "type": "boolean", "description": "If true, return a presigned GET URL instead of inline content." },
+                    "expires_in": { "type": "integer", "description": "Presigned URL TTL in seconds (default 900, max 604800)." },
+                    "tenant_id": { "type": "string", "description": "Tenant UUID (admins only)" }
+                },
+                "required": ["deployment_id", "key"]
+            }
+        },
+        {
+            "name": "s3_put",
+            "description": "Write an object to the app's bucket (scope storage:write; emits a proof receipt). Inline body up to 5 MiB (set base64:true for binary). For large/binary uploads or browser-direct upload, pass presign:true to get a temporary presigned PUT URL instead.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "deployment_id": { "type": "string" },
+                    "key": { "type": "string", "description": "Object key (app-relative)." },
+                    "body": { "type": "string", "description": "Object contents (utf8, or base64 if base64=true). Omit when presign=true." },
+                    "base64": { "type": "boolean", "description": "Treat body as base64-encoded bytes." },
+                    "content_type": { "type": "string", "description": "Content-Type to store (e.g. image/png)." },
+                    "presign": { "type": "boolean", "description": "If true, return a presigned PUT URL instead of writing inline." },
+                    "expires_in": { "type": "integer", "description": "Presigned URL TTL in seconds (default 900, max 604800)." },
+                    "tenant_id": { "type": "string", "description": "Tenant UUID (admins only)" }
+                },
+                "required": ["deployment_id", "key"]
+            }
+        },
+        {
+            "name": "s3_delete",
+            "description": "Delete an object from the app's bucket (scope storage:write; emits a proof receipt). Prefix-confined to the deployment's bucket.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "deployment_id": { "type": "string" },
+                    "key": { "type": "string", "description": "Object key (app-relative)." },
+                    "tenant_id": { "type": "string", "description": "Tenant UUID (admins only)" }
+                },
+                "required": ["deployment_id", "key"]
+            }
+        },
+        {
+            "name": "deploy",
+            "description": "Deploy an app from its amos.yaml manifest — the standard one-call CD step. Builds every service in the manifest from source (git_ref), in dependency order (base layers first, injecting BASE_IMAGE), then rolls the app's services. The app is resolved by manifest 'name' + tenant (no deployment_id needed). Returns immediately; the build+roll runs in the background and emits a proof receipt. This is the single verb CI calls.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "git_repo": { "type": "string", "description": "Git URL of the app repo (e.g. https://github.com/org/app.git)." },
+                    "git_ref": { "type": "string", "description": "Commit SHA / branch / tag to build (usually $GITHUB_SHA)." },
+                    "manifest": { "type": "string", "description": "Contents of the repo's amos.yaml." },
+                    "env": { "type": "string", "description": "Optional: target an isolated environment (from provision_env). Rolls the deployment named '{manifest.name}-{env}' instead of the base app." },
+                    "tenant_id": { "type": "string", "description": "Tenant UUID (admins only)" }
+                },
+                "required": ["git_repo", "git_ref", "manifest"]
+            }
+        },
+        {
+            "name": "provision_env",
+            "description": "Stand up an isolated environment (staging/preview) for an existing app — its own database, secret, ECS service, and {app}-{env}.custom.amoslabs.com ingress — by cloning the app's live task definition. Scope env:provision. Data isolation is automatic by plan: standard tenants get a fresh database on the shared envs RDS; compliance (PHI) tenants must pass db_secret_arn for a dedicated RDS. Then roll code into it with deploy(env=...). Optional ttl_hours marks an ephemeral preview for later teardown.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "app_name": { "type": "string", "description": "The base app to clone (its deployment name)." },
+                    "env_name": { "type": "string", "description": "Environment name (lowercase letters/digits/hyphen), e.g. 'staging' or 'pr-42'." },
+                    "db_secret_arn": { "type": "string", "description": "Compliance tier only: Secrets Manager ARN of the dedicated RDS secret (must hold DATABASE_URL + the app's other keys)." },
+                    "ttl_hours": { "type": "integer", "description": "Optional: mark as ephemeral; records an expiry for later teardown." },
+                    "tenant_id": { "type": "string", "description": "Tenant UUID (admins only)" }
+                },
+                "required": ["app_name", "env_name"]
+            }
+        },
+        {
+            "name": "teardown_env",
+            "description": "Tear down an environment created by provision_env: deletes the ECS service, ALB rule + target group, and (for shared-tier envs) the env database and secret. Dedicated (PHI) RDS instances are left untouched. Scope env:provision.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "app_name": { "type": "string", "description": "The base app name." },
+                    "env_name": { "type": "string", "description": "The environment name to tear down." },
+                    "tenant_id": { "type": "string", "description": "Tenant UUID (admins only)" }
+                },
+                "required": ["app_name", "env_name"]
+            }
+        },
+        {
+            "name": "deploy_status",
+            "description": "Poll the outcome of a deploy by the deploy_id returned from `deploy`. Returns status: 'deploying' (still running), 'succeeded', or 'failed' (with the receipt summary). Use this in CI to block on the real deploy result.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "deploy_id": { "type": "string", "description": "The deploy_id returned by the deploy verb." },
+                    "tenant_id": { "type": "string", "description": "Tenant UUID (admins only)" }
+                },
+                "required": ["deploy_id"]
+            }
+        },
+        {
+            "name": "app_redeploy",
+            "description": "Roll a deployed app to pick up a freshly-built image (CD deploy step). Issues a rolling, health-checked force-new-deployment on each ECS service of the deployment — preserves all task settings, works for single- and multi-service apps. Pair it with build_image (build the new image under the tag the app already uses), then call app_redeploy. Poll app_status for the rollout.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "deployment_id": { "type": "string", "description": "The app deployment to roll (from list_apps)." },
+                    "image": { "type": "string", "description": "Optional: the image ref/sha just built, recorded in the proof receipt for audit." },
+                    "tenant_id": { "type": "string", "description": "Tenant UUID (admins only)" }
+                },
+                "required": ["deployment_id"]
+            }
+        },
+        {
             "name": "list_receipts",
             "description": "List proof-carrying operation receipts for your tenant (newest first). Every consequential operation (e.g. deploy_app, build_image) emits a receipt recording intent, the guardrails enforced, the verification checks and their outcomes, and whether it verified. Use this to audit what was done on the tenant's behalf and whether it actually succeeded.",
             "inputSchema": {
@@ -1491,6 +3344,49 @@ fn tool_definitions() -> Value {
                     "tenant_id": { "type": "string", "description": "Tenant UUID (admins only)" }
                 }
             }
+        },
+        {
+            "name": "ask_amos",
+            "description": "Ask the AMOS manager about your environment in plain language. It investigates using the read-only control verbs (apps, deploy/build status, database, schema, storage, receipts, harness) and answers conversationally. Read-only: it will not change anything — if you ask for a change (deploy, scale, write data, provision/teardown an env, upload/delete files) it describes what it would do and says to run it explicitly. Examples: 'why can't this customer log in?', 'what changed last night?', 'is cuspr-staging healthy?'.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "prompt": { "type": "string", "description": "Your question or request, in plain language." },
+                    "tenant_id": { "type": "string", "description": "Tenant UUID (admins only)" }
+                },
+                "required": ["prompt"]
+            }
         }
     ])
+}
+
+#[cfg(test)]
+mod s3_tests {
+    use super::scoped_key;
+
+    #[test]
+    fn scoped_key_applies_prefix() {
+        let p = Some("tenants/abc".to_string());
+        assert_eq!(
+            scoped_key(&p, "meshes/x.stl").ok(),
+            Some("tenants/abc/meshes/x.stl".to_string())
+        );
+        // empty key under a prefix → the prefix itself (with trailing slash), for listing
+        assert_eq!(scoped_key(&p, "").ok(), Some("tenants/abc/".to_string()));
+    }
+
+    #[test]
+    fn scoped_key_no_prefix_passthrough() {
+        assert_eq!(
+            scoped_key(&None, "a/b.txt").ok(),
+            Some("a/b.txt".to_string())
+        );
+    }
+
+    #[test]
+    fn scoped_key_rejects_traversal_and_absolute() {
+        assert!(scoped_key(&None, "../etc/passwd").is_err());
+        assert!(scoped_key(&Some("p".into()), "a/../../b").is_err());
+        assert!(scoped_key(&None, "/abs").is_err());
+    }
 }

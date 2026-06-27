@@ -114,6 +114,11 @@ pub struct PlatformState {
     pub stripe_client: Option<StripeClient>,
     /// Stripe configuration (price IDs, webhook secret).
     pub stripe_config: Option<StripeConfig>,
+    /// Finance engine backend (the reference governed business engine). Defaults
+    /// to a stub; swapped for an HTTP client against the extracted multi-tenant
+    /// finance service. The `finance_*` MCP verbs proxy to this behind `finance:*`
+    /// scopes + proof receipts.
+    pub finance: Arc<dyn crate::mcp::finance::FinanceEngineClient>,
 }
 
 impl PlatformState {
@@ -308,6 +313,8 @@ impl PlatformState {
             usage_meter,
             stripe_client,
             stripe_config,
+            // STUB backend until the extracted multi-tenant finance service lands.
+            finance: Arc::new(crate::mcp::finance::StubFinanceClient),
         })
     }
 
