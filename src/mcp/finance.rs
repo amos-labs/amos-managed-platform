@@ -298,8 +298,12 @@ impl HttpFinanceClient {
     }
 
     /// Invoke one MCP verb and return its unwrapped JSON payload.
-    async fn call(&self, verb: &str, args: &Value) -> anyhow::Result<Value> {
-        let body = rpc_request_body(verb, args);
+    async fn call(&self, verb: &str, tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
+        // Inject the AMOS tenant_id so Nuvola scopes the call to that tenant's
+        // books. (A call with no tenant_id falls back to Nuvola's primary
+        // tenant; AMOS always sends one so routing is explicit + per-tenant.)
+        let scoped = with_tenant_id(args, tenant_id);
+        let body = rpc_request_body(verb, &scoped);
         let resp = self
             .http
             .post(&self.base_url)
@@ -314,6 +318,17 @@ impl HttpFinanceClient {
         })?;
         unwrap_rpc_result(&json)
     }
+}
+
+/// Merge the AMOS `tenant_id` into a verb's arguments so Nuvola scopes the call
+/// to that tenant's books. Non-object args (e.g. null) become a fresh object.
+fn with_tenant_id(args: &Value, tenant_id: Uuid) -> Value {
+    let mut obj = match args {
+        Value::Object(m) => m.clone(),
+        _ => serde_json::Map::new(),
+    };
+    obj.insert("tenant_id".to_string(), json!(tenant_id.to_string()));
+    Value::Object(obj)
 }
 
 /// Build the JSON-RPC 2.0 `tools/call` request body for a verb.
@@ -348,55 +363,66 @@ fn unwrap_rpc_result(resp: &Value) -> anyhow::Result<Value> {
     serde_json::from_str(text).map_err(|e| anyhow::anyhow!("nuvola mcp: result text not JSON: {e}"))
 }
 
-// Each verb proxies straight to the MCP tool of the same name. `tenant_id` is
-// ignored while Nuvola finance is single-org.
-// TODO multi-tenant: pass tenant scoping once Nuvola finance is org-scoped.
+// Each verb proxies to the MCP tool of the same name, injecting the AMOS
+// `tenant_id` (via `call`) so Nuvola scopes the result to that tenant's books.
 #[async_trait]
 impl FinanceEngineClient for HttpFinanceClient {
-    async fn finance_board(&self, _tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
-        self.call("finance_board", args).await
+    async fn finance_board(&self, tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
+        self.call("finance_board", tenant_id, args).await
     }
-    async fn finance_history(&self, _tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
-        self.call("finance_history", args).await
+    async fn finance_history(&self, tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
+        self.call("finance_history", tenant_id, args).await
     }
-    async fn finance_truth(&self, _tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
-        self.call("finance_truth", args).await
+    async fn finance_truth(&self, tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
+        self.call("finance_truth", tenant_id, args).await
     }
-    async fn qbo_accounts(&self, _tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
-        self.call("qbo_accounts", args).await
+    async fn qbo_accounts(&self, tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
+        self.call("qbo_accounts", tenant_id, args).await
     }
-    async fn revenue_summary(&self, _tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
-        self.call("revenue_summary", args).await
+    async fn revenue_summary(&self, tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
+        self.call("revenue_summary", tenant_id, args).await
     }
-    async fn org_subscriptions(&self, _tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
-        self.call("org_subscriptions", args).await
+    async fn org_subscriptions(&self, tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
+        self.call("org_subscriptions", tenant_id, args).await
     }
-    async fn churn_snapshot(&self, _tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
-        self.call("churn_snapshot", args).await
+    async fn churn_snapshot(&self, tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
+        self.call("churn_snapshot", tenant_id, args).await
     }
-    async fn create_finance_line(&self, _tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
-        self.call("create_finance_line", args).await
+    async fn create_finance_line(&self, tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
+        self.call("create_finance_line", tenant_id, args).await
     }
-    async fn update_finance_line(&self, _tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
-        self.call("update_finance_line", args).await
+    async fn update_finance_line(&self, tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
+        self.call("update_finance_line", tenant_id, args).await
     }
-    async fn set_finance_actual(&self, _tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
-        self.call("set_finance_actual", args).await
+    async fn set_finance_actual(&self, tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
+        self.call("set_finance_actual", tenant_id, args).await
     }
-    async fn set_finance_budget(&self, _tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
-        self.call("set_finance_budget", args).await
+    async fn set_finance_budget(&self, tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
+        self.call("set_finance_budget", tenant_id, args).await
     }
-    async fn set_finance_mapping(&self, _tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
-        self.call("set_finance_mapping", args).await
+    async fn set_finance_mapping(&self, tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
+        self.call("set_finance_mapping", tenant_id, args).await
     }
-    async fn set_billing_key(&self, _tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
-        self.call("set_billing_key", args).await
+    async fn set_billing_key(&self, tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
+        self.call("set_billing_key", tenant_id, args).await
     }
 }
 
 #[cfg(test)]
 mod http_tests {
     use super::*;
+
+    #[test]
+    fn with_tenant_id_injects_into_args() {
+        let t = Uuid::nil();
+        // Object args: tenant_id added, existing keys preserved.
+        let merged = with_tenant_id(&json!({ "from": "2026-04-01" }), t);
+        assert_eq!(merged["from"], "2026-04-01");
+        assert_eq!(merged["tenant_id"], t.to_string());
+        // Non-object args: a fresh object with just tenant_id.
+        let from_null = with_tenant_id(&Value::Null, t);
+        assert_eq!(from_null["tenant_id"], t.to_string());
+    }
 
     #[test]
     fn rpc_request_body_is_tools_call() {
