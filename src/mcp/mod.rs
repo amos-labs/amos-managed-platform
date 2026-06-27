@@ -933,7 +933,7 @@ async fn run_deploy_to_receipt(
     use crate::proof::{self, CheckStatus, Intent, OperationReceipt};
     use crate::provisioning::image_builder::BuildRequest;
     use std::collections::{BTreeMap, HashMap};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     let registry = std::env::var("AMOS_ECR_REGISTRY").unwrap_or_default();
     let order = match manifest.build_order() {
@@ -951,9 +951,17 @@ async fn run_deploy_to_receipt(
     let mut results: Vec<(String, bool, String)> = Vec::new();
     let mut all_ok = true;
 
+    // Per-phase timing for the receipt (build-vs-roll + per-image), so a slow
+    // deploy is diagnosable instead of inferred.
+    let t_total = Instant::now();
+    let mut build_secs: BTreeMap<String, u64> = BTreeMap::new();
+    let mut release_secs: u64 = 0;
+    let mut roll_secs: u64 = 0;
+
     // 1. Build every service in dependency order (base layers first, injecting
     //    BASE_IMAGE into dependents).
     for svc in order {
+        let svc_t = Instant::now();
         let image_name = svc.image_name(&manifest.name);
         let tag = svc.tag();
         let mut build_args: BTreeMap<String, String> = BTreeMap::new();
@@ -1006,6 +1014,7 @@ async fn run_deploy_to_receipt(
         if let Some(d) = &digest {
             pins.insert(image_name.clone(), format!("{registry}/{image_name}@{d}"));
         }
+        build_secs.insert(svc.name.clone(), svc_t.elapsed().as_secs());
         results.push((
             svc.name.clone(),
             true,
@@ -1038,6 +1047,7 @@ async fn run_deploy_to_receipt(
         // version keeps serving. No `release` in the manifest → skipped entirely
         // (existing manifests deploy exactly as before).
         if let Some(release_cmd) = manifest.release.as_deref() {
+            let rel_t = Instant::now();
             match run_release_phase(&ecs, &cfg, &cluster, &ecs_services, &pins, release_cmd).await {
                 Ok(detail) => results.push(("release".to_string(), true, detail)),
                 Err(detail) => {
@@ -1045,10 +1055,12 @@ async fn run_deploy_to_receipt(
                     results.push(("release".to_string(), false, detail));
                 }
             }
+            release_secs = rel_t.elapsed().as_secs();
         }
 
         // Only roll the services if the release phase (if any) passed.
         if all_ok {
+            let roll_t = Instant::now();
             for svc in &ecs_services {
                 // Current task def of the service.
                 let td_arn = match ecs
@@ -1180,8 +1192,11 @@ async fn run_deploy_to_receipt(
                     }
                 }
             }
+            roll_secs = roll_t.elapsed().as_secs();
         } // end: roll services (gated on release passing)
     }
+
+    let total_secs = t_total.elapsed().as_secs();
 
     // 3. One deploy receipt.
     let intent = Intent {
@@ -1213,21 +1228,31 @@ async fn run_deploy_to_receipt(
             msg.clone(),
         );
     }
+    let build_total: u64 = build_secs.values().sum();
     receipt = receipt
         .outputs(serde_json::json!({
             "built": built,
             "pinned": pins,
             "rolled": rolled,
             "deployed": deployed,
+            // Per-phase wall-clock (seconds) so a slow deploy is diagnosable:
+            // which image's build dominated, and build-vs-release-vs-roll.
+            "timings": {
+                "build_per_image_s": build_secs,
+                "build_total_s": build_total,
+                "release_s": release_secs,
+                "roll_s": roll_secs,
+                "total_s": total_secs,
+            },
         }))
         .summary(if all_ok {
             format!(
-                "deployed {} ({} service(s) rolled, digest-pinned)",
+                "deployed {} ({} svc rolled, digest-pinned) — build {build_total}s · release {release_secs}s · roll {roll_secs}s · total {total_secs}s",
                 manifest.name,
                 rolled.len()
             )
         } else {
-            format!("deploy of {} FAILED — services not rolled", manifest.name)
+            format!("deploy of {} FAILED — services not rolled (total {total_secs}s)", manifest.name)
         });
     let _ = proof::emit(&state.db, &receipt).await;
 }
