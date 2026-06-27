@@ -262,3 +262,181 @@ pub(crate) async fn tool_set_billing_key(
     .await;
     Ok(out)
 }
+
+// ── HttpFinanceClient — proxy to Nuvola's existing MCP (JSON-RPC) ───────────
+//
+// Step 0 of the finance-engine extraction: AMOS fronts Nuvola's *existing*
+// (single-org) finance MCP, so the governed verbs operate real books today.
+// Nuvola finance is single-org for now, so `tenant_id` is accepted and ignored;
+// it gets threaded through once Nuvola's finance tables are org-scoped.
+
+/// A `FinanceEngineClient` that proxies each verb to Nuvola's MCP endpoint
+/// (`POST {base_url}`, JSON-RPC 2.0 `tools/call`, `Authorization: Bearer`).
+pub struct HttpFinanceClient {
+    base_url: String,
+    token: String,
+    http: reqwest::Client,
+}
+
+impl HttpFinanceClient {
+    pub fn new(base_url: String, token: String) -> Self {
+        Self {
+            base_url,
+            token,
+            http: reqwest::Client::new(),
+        }
+    }
+
+    /// Build from env. Requires `AMOS__NUVOLA__MCP_TOKEN` (an `mcp*` ApiKey);
+    /// `AMOS__NUVOLA__MCP_URL` defaults to the prod endpoint. `None` when no
+    /// token is set, so callers fall back to the stub.
+    pub fn from_env() -> Option<Self> {
+        let token = std::env::var("AMOS__NUVOLA__MCP_TOKEN").ok()?;
+        let base_url = std::env::var("AMOS__NUVOLA__MCP_URL")
+            .unwrap_or_else(|_| "https://app.nuvolaacademy.com/mcp".to_string());
+        Some(Self::new(base_url, token))
+    }
+
+    /// Invoke one MCP verb and return its unwrapped JSON payload.
+    async fn call(&self, verb: &str, args: &Value) -> anyhow::Result<Value> {
+        let body = rpc_request_body(verb, args);
+        let resp = self
+            .http
+            .post(&self.base_url)
+            .bearer_auth(&self.token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("nuvola mcp request failed: {e}"))?;
+        let status = resp.status();
+        let json: Value = resp.json().await.map_err(|e| {
+            anyhow::anyhow!("nuvola mcp: invalid JSON response (status {status}): {e}")
+        })?;
+        unwrap_rpc_result(&json)
+    }
+}
+
+/// Build the JSON-RPC 2.0 `tools/call` request body for a verb.
+fn rpc_request_body(verb: &str, args: &Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": { "name": verb, "arguments": args },
+    })
+}
+
+/// Unwrap a Nuvola MCP JSON-RPC response down to the verb's JSON payload.
+/// Nuvola returns `result.content[0].text` as a JSON *string* (or surfaces a
+/// JSON-RPC `error`); this turns either into a `Result<Value>`.
+fn unwrap_rpc_result(resp: &Value) -> anyhow::Result<Value> {
+    if let Some(err) = resp.get("error") {
+        let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
+        let msg = err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown error");
+        anyhow::bail!("nuvola mcp error {code}: {msg}");
+    }
+    let text = resp
+        .get("result")
+        .and_then(|r| r.get("content"))
+        .and_then(|c| c.get(0))
+        .and_then(|c0| c0.get("text"))
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| anyhow::anyhow!("nuvola mcp: missing result.content[0].text"))?;
+    serde_json::from_str(text).map_err(|e| anyhow::anyhow!("nuvola mcp: result text not JSON: {e}"))
+}
+
+// Each verb proxies straight to the MCP tool of the same name. `tenant_id` is
+// ignored while Nuvola finance is single-org.
+// TODO multi-tenant: pass tenant scoping once Nuvola finance is org-scoped.
+#[async_trait]
+impl FinanceEngineClient for HttpFinanceClient {
+    async fn finance_board(&self, _tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
+        self.call("finance_board", args).await
+    }
+    async fn finance_history(&self, _tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
+        self.call("finance_history", args).await
+    }
+    async fn finance_truth(&self, _tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
+        self.call("finance_truth", args).await
+    }
+    async fn qbo_accounts(&self, _tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
+        self.call("qbo_accounts", args).await
+    }
+    async fn revenue_summary(&self, _tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
+        self.call("revenue_summary", args).await
+    }
+    async fn org_subscriptions(&self, _tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
+        self.call("org_subscriptions", args).await
+    }
+    async fn churn_snapshot(&self, _tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
+        self.call("churn_snapshot", args).await
+    }
+    async fn create_finance_line(&self, _tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
+        self.call("create_finance_line", args).await
+    }
+    async fn update_finance_line(&self, _tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
+        self.call("update_finance_line", args).await
+    }
+    async fn set_finance_actual(&self, _tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
+        self.call("set_finance_actual", args).await
+    }
+    async fn set_finance_budget(&self, _tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
+        self.call("set_finance_budget", args).await
+    }
+    async fn set_finance_mapping(&self, _tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
+        self.call("set_finance_mapping", args).await
+    }
+    async fn set_billing_key(&self, _tenant_id: Uuid, args: &Value) -> anyhow::Result<Value> {
+        self.call("set_billing_key", args).await
+    }
+}
+
+#[cfg(test)]
+mod http_tests {
+    use super::*;
+
+    #[test]
+    fn rpc_request_body_is_tools_call() {
+        let b = rpc_request_body("finance_board", &json!({ "from": "2026-04-01" }));
+        assert_eq!(b["jsonrpc"], "2.0");
+        assert_eq!(b["method"], "tools/call");
+        assert_eq!(b["params"]["name"], "finance_board");
+        assert_eq!(b["params"]["arguments"]["from"], "2026-04-01");
+    }
+
+    #[test]
+    fn unwrap_parses_content_text_json() {
+        // Nuvola wraps the verb payload as result.content[0].text = JSON string.
+        let resp = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "content": [{
+                "type": "text",
+                "text": "{\"months\":[\"2026-06-01\"],\"revenue\":[],\"expense\":[]}"
+            }] }
+        });
+        let out = unwrap_rpc_result(&resp).unwrap();
+        assert_eq!(out["months"][0], "2026-06-01");
+        assert!(out["revenue"].is_array());
+    }
+
+    #[test]
+    fn unwrap_surfaces_jsonrpc_error() {
+        let resp = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "error": { "code": -32_602, "message": "Unknown tool: nope" }
+        });
+        let err = unwrap_rpc_result(&resp).unwrap_err().to_string();
+        assert!(err.contains("-32602"), "got: {err}");
+        assert!(err.contains("Unknown tool"), "got: {err}");
+    }
+
+    #[test]
+    fn unwrap_errors_on_missing_content() {
+        let resp = json!({ "jsonrpc": "2.0", "id": 1, "result": {} });
+        assert!(unwrap_rpc_result(&resp).is_err());
+    }
+}

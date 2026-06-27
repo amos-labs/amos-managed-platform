@@ -299,6 +299,20 @@ impl PlatformState {
             info!("Stripe not configured (AMOS__STRIPE__SECRET_KEY not set)");
         }
 
+        // Finance engine backend: proxy to Nuvola's existing MCP when configured
+        // (AMOS__NUVOLA__MCP_TOKEN), else the stub (dev / unconfigured).
+        let finance: Arc<dyn crate::mcp::finance::FinanceEngineClient> =
+            match crate::mcp::finance::HttpFinanceClient::from_env() {
+                Some(client) => {
+                    info!("Finance engine: proxying to Nuvola MCP");
+                    Arc::new(client)
+                }
+                None => {
+                    info!("Finance engine: using stub backend (AMOS__NUVOLA__MCP_TOKEN not set)");
+                    Arc::new(crate::mcp::finance::StubFinanceClient)
+                }
+            };
+
         Ok(Self {
             db,
             redis,
@@ -313,8 +327,7 @@ impl PlatformState {
             usage_meter,
             stripe_client,
             stripe_config,
-            // STUB backend until the extracted multi-tenant finance service lands.
-            finance: Arc::new(crate::mcp::finance::StubFinanceClient),
+            finance,
         })
     }
 
