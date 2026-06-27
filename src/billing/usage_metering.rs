@@ -26,6 +26,10 @@ pub struct TenantPeriodSummary {
     pub tier: Option<AppHostingTier>,
     pub usage: ServiceUsage,
     pub charge: Option<AppHostingPeriodCharge>,
+    /// Egress soft-cap status vs the tier's included allowance. `alert` flips
+    /// at 80% so the tenant can be warned *before* incurring overage. `None`
+    /// when not on an app-hosting tier (no allowance to measure against).
+    pub egress_cap: Option<crate::billing::guards::CapStatus>,
 }
 
 const INSIGHTS_NAMESPACE: &str = "ECS/ContainerInsights";
@@ -100,11 +104,15 @@ impl UsageMeter {
         let period_hours = (end - start).num_seconds().max(0) as f64 / 3600.0;
         let charge =
             tier.map(|t| compute_period_charge(t, usage.unit_hours, usage.egress_gb, period_hours));
+        let egress_cap = tier.map(|t| {
+            crate::billing::guards::cap_status(usage.egress_gb, t.included_egress_gb() as f64)
+        });
         TenantPeriodSummary {
             plan,
             tier,
             usage,
             charge,
+            egress_cap,
         }
     }
 
