@@ -382,6 +382,11 @@ async fn handle_invoice_paid(state: &PlatformState, event: &stripe::Event) {
         "Invoice paid, clearing past_due and resetting managed-AI credit"
     );
 
+    // Bill the CLOSING period's overage BEFORE resetting credit for the new
+    // period. Order is independent (overage = Σcost − granted credit, not the
+    // running balance), but closing-then-opening keeps the timeline clean.
+    bill_period_close_overage(state, invoice, &sub_id).await;
+
     let _ = sqlx::query(
         "UPDATE tenants
          SET stripe_subscription_status = CASE
@@ -396,6 +401,171 @@ async fn handle_invoice_paid(state: &PlatformState, event: &stripe::Event) {
     .bind(&sub_id)
     .execute(&state.db)
     .await;
+}
+
+/// At invoice.paid (= period close), bill the overage that accrued during the
+/// closing period as one-time invoice items on the *next* invoice:
+///
+/// - **Bedrock**: shared-backend usage beyond the tier's granted monthly credit,
+///   at the ×1.10 uplift ([`guards::with_overage_uplift`]). Only usage on
+///   `shared_bedrock` harnesses counts — BYOK usage never drew down credit.
+/// - **Egress**: data-out beyond the tier's included allowance. The egress rate
+///   already carries margin, so **no uplift** is applied.
+///
+/// Both submissions are **idempotent** on (tenant, invoice, kind): Stripe
+/// redelivers the same invoice id on webhook retry, so the deterministic key
+/// collapses duplicates and a retry can never double-charge. Usage rows are
+/// marked `billed = TRUE` **only after** a successful Bedrock submission (strict
+/// submit→mark ordering); on submit failure the rows are left unbilled and the
+/// idempotent key makes the next retry safe.
+///
+/// Skipped entirely for self-hosted / legacy / non-app-tier tenants (no managed
+/// billing relationship to invoice against).
+async fn bill_period_close_overage(state: &PlatformState, invoice: &stripe::Invoice, sub_id: &str) {
+    use crate::billing::{app_hosting::AppHostingTier, guards};
+
+    // Inside a signature-verified webhook, so Stripe is configured — but guard
+    // anyway: no client => no billing (self-hosted bypass).
+    let client = match &state.stripe_client {
+        Some(c) => c,
+        None => return,
+    };
+
+    // Resolve tenant + Stripe customer + plan. A missing customer id means there
+    // is nothing to invoice against; bail.
+    let row: Option<(Uuid, Option<String>, String)> = sqlx::query_as(
+        "SELECT id, stripe_customer_id, plan FROM tenants WHERE stripe_subscription_id = $1",
+    )
+    .bind(sub_id)
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten();
+    let (tenant_id, customer_id, plan) = match row {
+        Some((t, Some(c), p)) => (t, c, p),
+        _ => return,
+    };
+
+    // Only managed app-hosting tiers get overage billing (legacy/free skip).
+    let tier = match AppHostingTier::parse(&plan) {
+        Some(t) => t,
+        None => return,
+    };
+
+    // Deterministic period anchor = the invoice being paid. Stripe redelivers the
+    // same invoice id on retry, so this is the idempotency boundary.
+    let period = invoice
+        .number
+        .clone()
+        .unwrap_or_else(|| invoice.id.to_string());
+
+    // ── Bedrock overage ──────────────────────────────────────────────────
+    // Closing-period shared usage = unbilled records on shared_bedrock harnesses.
+    // BYOK usage (other provider modes) never drew down credit and is excluded.
+    let rows: Vec<(Uuid, i64)> = sqlx::query_as(
+        "SELECT r.id, r.cost_microcents
+         FROM llm_usage_records r
+         JOIN harness_instances h ON h.id = r.harness_id
+         WHERE r.tenant_id = $1 AND r.billed = FALSE
+           AND h.llm_provider_mode = 'shared_bedrock'",
+    )
+    .bind(tenant_id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    let total_cost: i64 = rows.iter().map(|(_, c)| *c).sum();
+    let credit_granted = tier.monthly_ai_credit_microcents();
+    let overage_micro = guards::bedrock_overage_microcents(total_cost, credit_granted);
+    let overage_cents = guards::microcents_to_cents_ceil(guards::with_overage_uplift(overage_micro));
+
+    if overage_cents > 0 {
+        let desc = format!("Managed AI overage ({} tier)", tier.plan_key());
+        match guards::submit_overage_invoice_item(
+            client,
+            &customer_id,
+            overage_cents,
+            &desc,
+            tenant_id,
+            &period,
+            "bedrock",
+        )
+        .await
+        {
+            Ok(item_id) => {
+                // STRICT ORDER: mark billed ONLY after Stripe accepted the charge.
+                let ids: Vec<Uuid> = rows.iter().map(|(id, _)| *id).collect();
+                let marked = sqlx::query(
+                    "UPDATE llm_usage_records SET billed = TRUE, stripe_usage_record_id = $1
+                     WHERE id = ANY($2)",
+                )
+                .bind(&item_id)
+                .bind(&ids)
+                .execute(&state.db)
+                .await;
+                if let Err(e) = marked {
+                    // Charge submitted but rows not marked: the idempotent key
+                    // makes the next invoice.paid retry safe (no double-charge).
+                    error!(tenant_id = %tenant_id, invoice_item = %item_id, "overage charged but failed to mark rows billed: {e}");
+                } else {
+                    info!(tenant_id = %tenant_id, invoice_item = %item_id, cents = overage_cents, rows = ids.len(), "billed bedrock overage");
+                }
+            }
+            Err(e) => {
+                warn!(tenant_id = %tenant_id, %period, "bedrock overage submit failed; rows left unbilled for idempotent retry: {e}");
+            }
+        }
+    } else if !rows.is_empty() {
+        // Within credit (or zero): no charge, but close out the period so these
+        // rows don't carry into the next period's Σcost.
+        let ids: Vec<Uuid> = rows.iter().map(|(id, _)| *id).collect();
+        let _ = sqlx::query("UPDATE llm_usage_records SET billed = TRUE WHERE id = ANY($1)")
+            .bind(&ids)
+            .execute(&state.db)
+            .await;
+    }
+
+    // ── Egress overage ───────────────────────────────────────────────────
+    // Metered from CloudWatch over the invoice's billing window. No DB rows to
+    // mark — the idempotent (tenant, invoice, "egress") key is the only dedup.
+    if let (Some(meter), Some(start_ts), Some(end_ts)) =
+        (&state.usage_meter, invoice.period_start, invoice.period_end)
+    {
+        if let (Some(start), Some(end)) = (
+            chrono::DateTime::from_timestamp(start_ts, 0),
+            chrono::DateTime::from_timestamp(end_ts, 0),
+        ) {
+            let summary = meter
+                .tenant_period_summary(&state.db, tenant_id, start, end)
+                .await;
+            let egress_cents = summary
+                .charge
+                .map(|c| c.egress_overage_cents as i64)
+                .unwrap_or(0);
+            if egress_cents > 0 {
+                let desc = format!("Egress overage ({} tier)", tier.plan_key());
+                // Egress rate already includes margin — no uplift.
+                match guards::submit_overage_invoice_item(
+                    client,
+                    &customer_id,
+                    egress_cents,
+                    &desc,
+                    tenant_id,
+                    &period,
+                    "egress",
+                )
+                .await
+                {
+                    Ok(item_id) => {
+                        info!(tenant_id = %tenant_id, invoice_item = %item_id, cents = egress_cents, "billed egress overage")
+                    }
+                    Err(e) => {
+                        warn!(tenant_id = %tenant_id, %period, "egress overage submit failed (idempotent retry safe): {e}")
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Handle invoice.payment_failed: mark as past_due.

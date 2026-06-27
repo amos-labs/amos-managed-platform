@@ -128,6 +128,16 @@ pub fn bedrock_overage_microcents(cost_microcents: i64, balance_before: i64) -> 
     (cost_microcents - covered).max(0)
 }
 
+/// Convert microcents to whole cents, **rounding up** so a sub-cent overage is
+/// never silently dropped (we round in our own favor, by at most $0.01). 1¢ =
+/// 100 microcents. Stripe invoice-item amounts are in cents.
+pub fn microcents_to_cents_ceil(microcents: i64) -> i64 {
+    if microcents <= 0 {
+        return 0;
+    }
+    (microcents + 99) / 100
+}
+
 /// Soft-cap status for a metered allowance (egress today; reusable for others).
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct CapStatus {
@@ -311,6 +321,34 @@ mod tests {
         // Zero allowance: any usage is "100%+".
         assert!(cap_status(1.0, 0.0).alert);
         assert!(!cap_status(0.0, 0.0).alert);
+    }
+
+    #[test]
+    fn period_close_overage_is_sum_minus_credit_floored_then_uplifted() {
+        // Period close: overage = max(0, Σ shared cost − credit granted),
+        // then ×1.10, then microcents→cents (ceil).
+        let credit = 100_000; // $10 tier credit (microcents)
+
+        // Under credit: nothing billed.
+        let under = bedrock_overage_microcents(60_000, credit);
+        assert_eq!(under, 0);
+        assert_eq!(microcents_to_cents_ceil(with_overage_uplift(under)), 0);
+
+        // Exactly at credit: nothing billed.
+        assert_eq!(bedrock_overage_microcents(100_000, credit), 0);
+
+        // Over credit by $5 (50_000 microcents): overage ×1.10 = 55_000 micro = 550¢ = $5.50.
+        let over = bedrock_overage_microcents(150_000, credit);
+        assert_eq!(over, 50_000);
+        let uplifted = with_overage_uplift(over);
+        assert_eq!(uplifted, 55_000);
+        assert_eq!(microcents_to_cents_ceil(uplifted), 550);
+
+        // Sub-cent rounds up, never dropped.
+        assert_eq!(microcents_to_cents_ceil(1), 1);
+        assert_eq!(microcents_to_cents_ceil(100), 1);
+        assert_eq!(microcents_to_cents_ceil(101), 2);
+        assert_eq!(microcents_to_cents_ceil(0), 0);
     }
 
     #[test]
