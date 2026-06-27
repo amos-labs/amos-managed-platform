@@ -28,6 +28,28 @@ pub const OVERAGE_UPLIFT_DEN: i64 = 100;
 /// (not a hard stop) so the tenant can be warned before they incur overage.
 pub const SOFT_CAP_ALERT_PCT: f64 = 80.0;
 
+/// Hard ceiling (in cents) on a *single* auto-submitted overage invoice item.
+/// A computed overage above this is NOT auto-charged — it is held and alerted
+/// for human review. This bounds the blast radius of any over-count (e.g. a
+/// charge-succeeded-but-mark-failed row set that bleeds into a later period, or
+/// a future math bug): we always err toward **not** over-charging. Set well
+/// above any plausible single-tenant monthly AI spend at current scale.
+pub const OVERAGE_SANITY_CEILING_CENTS: i64 = 200_000; // $2,000
+
+/// Whether a computed overage is safe to auto-submit, or must be held for human
+/// review because it exceeds [`OVERAGE_SANITY_CEILING_CENTS`].
+pub fn overage_within_sanity_ceiling(cents: i64) -> bool {
+    cents <= OVERAGE_SANITY_CEILING_CENTS
+}
+
+/// Egress overage auto-billing kill-switch. The egress arm of period-close
+/// billing is wired but **held off** until the closing-period window is verified
+/// against a real Stripe renewal invoice (`invoice.period_*` on a renewal
+/// describes the *upcoming* period under advance billing, so it must be
+/// confirmed before it can bill correctly). Egress was never billed before, so
+/// `false` = status quo, no mis-bill risk. Flip to `true` once verified.
+pub const BILL_EGRESS_OVERAGE: bool = false;
+
 /// Subscription statuses that block use of the shared backend even if a credit
 /// balance remains: the account has a billing problem and must be resolved.
 fn status_blocks_shared(status: &str) -> bool {
@@ -222,7 +244,9 @@ pub async fn submit_overage_invoice_item(
 
     let idempotency_key = overage_idempotency_key(tenant_id, period, kind);
     let item = stripe::InvoiceItem::create(
-        &client.clone().with_strategy(stripe::RequestStrategy::Idempotent(idempotency_key)),
+        &client
+            .clone()
+            .with_strategy(stripe::RequestStrategy::Idempotent(idempotency_key)),
         params,
     )
     .await?;
