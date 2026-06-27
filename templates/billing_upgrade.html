@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 
-{% block title %}Deploy Hosted Harness - AMOS Platform{% endblock %}
+{% block title %}Choose your AMOS plan - AMOS Platform{% endblock %}
 
 {% block body %}
 <div class="min-h-full">
@@ -25,68 +25,71 @@
 
   <main class="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
     <div class="text-center mb-10">
-      <h1 class="text-3xl font-bold text-gray-900">Deploy a Hosted Harness</h1>
+      <h1 class="text-3xl font-bold text-gray-900">Choose your AMOS plan</h1>
       <p class="mt-2 text-sm text-gray-500">
-        Choose the right size for your workload. Each harness is billed separately.
-        <br />AI compute is BYOK (Bring Your Own Key) &mdash; you pay your AI provider directly.
+        Host and operate your app on AMOS &mdash; governed, with a proof receipt on every change.
+        <br />AI is included (managed) &mdash; no keys to bring; the heavy work stays in your own Claude&nbsp;Code / Codex.
       </p>
     </div>
 
     <div class="grid gap-6 sm:grid-cols-3 max-w-4xl mx-auto">
-      <!-- Small -->
+      <!-- Starter -->
       <div class="rounded-lg border bg-white p-6 shadow-sm hover:ring-2 hover:ring-indigo-200 transition-all">
-        <h3 class="text-lg font-semibold text-gray-900">Small</h3>
-        <p class="mt-2 text-3xl font-bold text-gray-900">$45<span class="text-sm font-normal text-gray-500">/mo</span></p>
+        <h3 class="text-lg font-semibold text-gray-900">Starter</h3>
+        <p class="mt-2 text-3xl font-bold text-gray-900">$99<span class="text-sm font-normal text-gray-500">/mo</span></p>
         <ul class="mt-4 space-y-2 text-sm text-gray-600">
-          <li>1 vCPU</li>
-          <li>2 GB RAM</li>
-          <li>10 GB storage</li>
-          <li>Email support</li>
+          <li>2 container units included</li>
+          <li>Shared-data isolation</li>
+          <li>50 GB egress / mo</li>
+          <li>AI included (managed) &mdash; $10/mo credit</li>
+          <li>Proof receipt on every change</li>
         </ul>
-        <p class="mt-3 text-xs text-gray-400">Good for personal use, small teams, and getting started.</p>
+        <p class="mt-3 text-xs text-gray-400">For your first app and getting started.</p>
         <form action="/billing/checkout" method="POST" class="mt-6">
-          <input type="hidden" name="size" value="small" />
+          <input type="hidden" name="plan" value="app_starter" />
           <button type="submit" class="w-full rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500">
-            Deploy Small Harness
+            Choose Starter
           </button>
         </form>
       </div>
 
-      <!-- Medium -->
+      <!-- Pro -->
       <div class="rounded-lg border-2 border-indigo-500 bg-white p-6 shadow-md relative">
         <span class="absolute -top-3 left-1/2 -translate-x-1/2 inline-flex items-center rounded-full bg-indigo-600 px-3 py-0.5 text-xs font-semibold text-white">Most Popular</span>
-        <h3 class="text-lg font-semibold text-gray-900">Medium</h3>
-        <p class="mt-2 text-3xl font-bold text-gray-900">$95<span class="text-sm font-normal text-gray-500">/mo</span></p>
+        <h3 class="text-lg font-semibold text-gray-900">Pro</h3>
+        <p class="mt-2 text-3xl font-bold text-gray-900">$349<span class="text-sm font-normal text-gray-500">/mo</span></p>
         <ul class="mt-4 space-y-2 text-sm text-gray-600">
-          <li>2 vCPU</li>
-          <li>4 GB RAM</li>
-          <li>50 GB storage</li>
-          <li>Priority support</li>
+          <li>8 container units included</li>
+          <li>Dedicated data (RDS / cache / S3)</li>
+          <li>250 GB egress / mo</li>
+          <li>AI included (managed) &mdash; $25/mo credit</li>
+          <li>Proof receipts + audit trail</li>
         </ul>
-        <p class="mt-3 text-xs text-gray-400">Best for growing businesses and multi-user workloads.</p>
+        <p class="mt-3 text-xs text-gray-400">For growing businesses running real apps.</p>
         <form action="/billing/checkout" method="POST" class="mt-6">
-          <input type="hidden" name="size" value="medium" />
+          <input type="hidden" name="plan" value="app_pro" />
           <button type="submit" class="w-full rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500">
-            Deploy Medium Harness
+            Choose Pro
           </button>
         </form>
       </div>
 
-      <!-- Large -->
+      <!-- Compliance -->
       <div class="rounded-lg border bg-white p-6 shadow-sm hover:ring-2 hover:ring-indigo-200 transition-all">
-        <h3 class="text-lg font-semibold text-gray-900">Large</h3>
-        <p class="mt-2 text-3xl font-bold text-gray-900">$195<span class="text-sm font-normal text-gray-500">/mo</span></p>
+        <h3 class="text-lg font-semibold text-gray-900">Compliance</h3>
+        <p class="mt-2 text-3xl font-bold text-gray-900">$899<span class="text-sm font-normal text-gray-500">/mo</span></p>
         <ul class="mt-4 space-y-2 text-sm text-gray-600">
-          <li>4 vCPU</li>
-          <li>8 GB RAM</li>
-          <li>200 GB storage</li>
-          <li>Dedicated support</li>
+          <li>16 container units included</li>
+          <li>Dedicated VPC + peering</li>
+          <li>500 GB egress / mo</li>
+          <li>AI included (managed) &mdash; $50/mo credit, or bring your own model account</li>
+          <li>Audit export, retention, SSO</li>
         </ul>
-        <p class="mt-3 text-xs text-gray-400">For demanding workloads, large teams, and enterprise use.</p>
+        <p class="mt-3 text-xs text-gray-400">For regulated / PHI workloads where proof is the product.</p>
         <form action="/billing/checkout" method="POST" class="mt-6">
-          <input type="hidden" name="size" value="large" />
+          <input type="hidden" name="plan" value="app_compliance" />
           <button type="submit" class="w-full rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500">
-            Deploy Large Harness
+            Choose Compliance
           </button>
         </form>
       </div>

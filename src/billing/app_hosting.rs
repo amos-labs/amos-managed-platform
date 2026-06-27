@@ -120,6 +120,19 @@ impl AppHostingTier {
             AppHostingTier::Compliance => "app_compliance",
         }
     }
+
+    /// Managed-AI (Bedrock) credit included in the base price each month, in
+    /// microcents. Operational AI runs through managed Bedrock (no BYOK); the
+    /// heavy token work lives in the customer's own Claude Code/Codex, so this
+    /// covers typical operational use and scales by tier: Starter $10, Pro $25,
+    /// Compliance $50. Overage is purchasable; no rollover.
+    pub fn monthly_ai_credit_microcents(&self) -> i64 {
+        match self {
+            AppHostingTier::Starter => 100_000,   // $10
+            AppHostingTier::Pro => 250_000,       // $25
+            AppHostingTier::Compliance => 500_000, // $50
+        }
+    }
 }
 
 /// Container units for one Fargate task, given its ECS CPU units (1024 = 1

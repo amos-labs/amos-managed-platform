@@ -13,15 +13,24 @@ use uuid::Uuid;
 
 use crate::state::PlatformState;
 
-/// Monthly Bedrock credit grant for the $49.99/mo plan: $5 in microcents.
-/// Microcents = hundredths of a cent (1¢ = 100 microcents, $1 = 10,000
-/// microcents), matching `metered_billing::calculate_cost_microcents`.
-/// So $5.00 = 50,000 microcents.
+/// Legacy / grandfathered monthly managed-AI credit, in microcents, for plans
+/// that aren't app-hosting tiers (the old $49.99 harness plans). $5.00 = 50,000.
+/// Microcents = hundredths of a cent (1¢ = 100 microcents, $1 = 10,000),
+/// matching `metered_billing::calculate_cost_microcents`.
 ///
-/// Granted on checkout, reset on each invoice.paid. Haiku-only — gating
-/// happens in the harness pre-call check. See
-/// docs/SUBSCRIPTION_AND_ONBOARDING.md in amos-automate.
+/// App-hosting tiers use tier-scaled credits — see
+/// [`crate::billing::app_hosting::AppHostingTier::monthly_ai_credit_microcents`]
+/// (Starter $10 / Pro $25 / Compliance $50). Granted on checkout, reset on each
+/// invoice.paid; no rollover. Gating happens in the harness pre-call check.
 const MONTHLY_CREDIT_GRANT_MICROCENTS: i64 = 50_000;
+
+/// Monthly managed-AI credit for a tenant's plan, in microcents: tier-scaled for
+/// app-hosting tiers, legacy $5 for grandfathered/non-app plans.
+fn credit_grant_microcents(plan: Option<&str>) -> i64 {
+    plan.and_then(crate::billing::app_hosting::AppHostingTier::parse)
+        .map(|t| t.monthly_ai_credit_microcents())
+        .unwrap_or(MONTHLY_CREDIT_GRANT_MICROCENTS)
+}
 
 /// Handle incoming Stripe webhook events.
 ///
@@ -187,9 +196,10 @@ async fn handle_checkout_completed(state: &PlatformState, event: &stripe::Event)
     );
 
     // Update tenant with Stripe IDs, activate subscription, record the plan if
-    // one was supplied, and grant the initial $5 of Haiku-only Bedrock credits
-    // so the user can start using shared backend immediately while they set up
-    // BYOK.
+    // one was supplied, and grant the initial managed-AI (Bedrock) credit —
+    // tier-scaled for app-hosting tiers ($10/$25/$50), legacy $5 otherwise — so
+    // the user can start operating immediately.
+    let grant_microcents = credit_grant_microcents(plan.as_deref());
     let _ = sqlx::query(
         "UPDATE tenants
          SET stripe_customer_id = $1,
@@ -203,15 +213,16 @@ async fn handle_checkout_completed(state: &PlatformState, event: &stripe::Event)
     .bind(&customer_id)
     .bind(&subscription_id)
     .bind(tenant_id)
-    .bind(MONTHLY_CREDIT_GRANT_MICROCENTS)
+    .bind(grant_microcents)
     .bind(&plan)
     .execute(&state.db)
     .await;
 
     info!(
         tenant_id = %tenant_id,
-        microcents = MONTHLY_CREDIT_GRANT_MICROCENTS,
-        "Initial Bedrock credit grant"
+        microcents = grant_microcents,
+        plan = ?plan,
+        "Initial managed-AI credit grant"
     );
 
     // App-hosting tenants run a deployed app (via deploy_app), not a harness —
@@ -337,10 +348,10 @@ async fn handle_subscription_deleted(state: &PlatformState, event: &stripe::Even
     }
 }
 
-/// Handle invoice.paid: clear past_due status and reset monthly Bedrock
-/// credits to $5. Fires on every successful payment — initial signup invoice
-/// and every renewal — so this is the recurring refresh point. No rollover
-/// by design.
+/// Handle invoice.paid: clear past_due status and reset the monthly managed-AI
+/// credit (tier-scaled per the tenant's plan; legacy $5 for grandfathered
+/// plans). Fires on every successful payment — initial signup invoice and every
+/// renewal — so this is the recurring refresh point. No rollover by design.
 async fn handle_invoice_paid(state: &PlatformState, event: &stripe::Event) {
     use stripe::EventObject;
 
@@ -354,10 +365,21 @@ async fn handle_invoice_paid(state: &PlatformState, event: &stripe::Event) {
         None => return,
     };
 
+    // Tier-scale the credit by the tenant's recorded plan (legacy $5 fallback).
+    let plan: Option<String> =
+        sqlx::query_scalar("SELECT plan FROM tenants WHERE stripe_subscription_id = $1")
+            .bind(&sub_id)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten();
+    let grant_microcents = credit_grant_microcents(plan.as_deref());
+
     info!(
         subscription_id = %sub_id,
-        microcents = MONTHLY_CREDIT_GRANT_MICROCENTS,
-        "Invoice paid, clearing past_due and resetting Bedrock credits"
+        microcents = grant_microcents,
+        plan = ?plan,
+        "Invoice paid, clearing past_due and resetting managed-AI credit"
     );
 
     let _ = sqlx::query(
@@ -370,7 +392,7 @@ async fn handle_invoice_paid(state: &PlatformState, event: &stripe::Event) {
              credits_granted_at = NOW()
          WHERE stripe_subscription_id = $2",
     )
-    .bind(MONTHLY_CREDIT_GRANT_MICROCENTS)
+    .bind(grant_microcents)
     .bind(&sub_id)
     .execute(&state.db)
     .await;
