@@ -132,9 +132,12 @@ async fn handle_mcp(
                         "name": "amos-platform",
                         "version": crate::VERSION,
                     },
-                    "instructions": "AMOS managed-environment control plane. Use these tools to \
-                provision, inspect, operate, and configure governed AMOS environments without re-discovering \
-                infrastructure. Tools are scoped to your tenant.",
+                    "instructions": "You are operating a business on AMOS, a governed control plane. \
+                FIRST call `get_started` for the full capability manifest — verbs by category (each with its \
+                required scope + whether you're allowed it), the golden paths, and the human-only steps to relay \
+                to the owner — and `whoami` for your tenant + scopes. Ship new code with the `deploy` verb \
+                (builds from amos.yaml, digest-pinned); never use app_redeploy to ship new code. Every write is \
+                proof-carrying (see list_receipts). Tools are scoped to your tenant.",
                 }),
             )
         }
@@ -341,6 +344,7 @@ async fn dispatch_tool(
         "s3_delete" => tool_s3_delete(state, claims, args).await,
         // ── Introspection (capability/identity discovery) ─────────────────
         "whoami" => tool_whoami(state, claims, args).await,
+        "get_started" => tool_get_started(state, claims, args).await,
         // ── Proof-carrying operations ─────────────────────────────────────
         "list_receipts" => tool_list_receipts(state, claims, args).await,
         // ── Natural-language manager front door ───────────────────────────
@@ -2790,6 +2794,126 @@ async fn tool_whoami(
     }))
 }
 
+/// Verb catalog for the `get_started` manifest: `(verb, category, purpose)`.
+/// The required SCOPE is derived from [`crate::rbac::required_scope`] at runtime
+/// (not stored here) so the manifest can never drift from the actual gate.
+const VERB_CATALOG: &[(&str, &str, &str)] = &[
+    ("whoami", "meta", "Your identity, tenant, and effective scopes."),
+    ("get_started", "meta", "This capability manifest + golden paths (start here)."),
+    ("list_apps", "app", "List your deployed apps and their services."),
+    ("app_status", "app", "Live status + last deploy of an app."),
+    ("app_logs", "app", "Recent logs for an app service."),
+    ("deploy", "app", "THE way to ship new code: build from git (amos.yaml) + roll, digest-pinned."),
+    ("deploy_status", "app", "Poll a deploy_id to its terminal result + proof receipt (with timings)."),
+    ("deploy_app", "app", "Lower-level app deploy (prefer `deploy`)."),
+    ("app_redeploy", "app", "Restart the CURRENT image — does NOT ship new code (re-pulls the pinned digest). Use `deploy`."),
+    ("app_control", "app", "Start / stop / restart / deprovision an app."),
+    ("provision_env", "env", "Stand up an isolated preview/staging environment."),
+    ("teardown_env", "env", "Tear down a provisioned environment."),
+    ("build_image", "build", "Build a container image (git or context) via CodeBuild."),
+    ("build_status", "build", "Poll a build to completion."),
+    ("db_query", "db", "Read-only SQL against your app database."),
+    ("db_write", "db", "Single-statement DML write to your app DB (owner-only, proof-carrying)."),
+    ("describe_table", "db", "Inspect a table's schema before querying."),
+    ("s3_list", "storage", "List objects in your app bucket."),
+    ("s3_get", "storage", "Read an object."),
+    ("s3_put", "storage", "Write an object."),
+    ("s3_delete", "storage", "Delete an object."),
+    ("finance_board", "finance", "Budget vs actual vs live, by category and month."),
+    ("finance_truth", "finance", "Ground-truth monthly cash (Stripe net + QBO income + subs)."),
+    ("finance_history", "finance", "Historical revenue snapshots."),
+    ("revenue_summary", "finance", "Latest per-company revenue / MRR."),
+    ("qbo_accounts", "finance", "QuickBooks P&L account names (for mappings)."),
+    ("org_subscriptions", "finance", "Subscriptions grouped by org."),
+    ("churn_snapshot", "finance", "Cancellations + pending cancels."),
+    ("create_finance_line", "finance", "Create a finance category/line (proof-carrying)."),
+    ("update_finance_line", "finance", "Update a finance line (proof-carrying)."),
+    ("set_finance_actual", "finance", "Record a monthly actual (proof-carrying)."),
+    ("set_finance_budget", "finance", "Set a monthly budget (proof-carrying)."),
+    ("set_finance_mapping", "finance", "Map a line to a QBO account / live source (proof-carrying)."),
+    ("set_billing_key", "finance", "Connect a finance integration credential (owner-only, secret redacted in the receipt)."),
+    ("list_harnesses", "harness", "List harness instances."),
+    ("harness_status", "harness", "Harness status."),
+    ("harness_logs", "harness", "Harness logs."),
+    ("get_harness_config", "harness", "Read harness config."),
+    ("set_harness_config", "harness", "Set harness config."),
+    ("provision_harness", "harness", "Provision a harness."),
+    ("harness_control", "harness", "Start / stop a harness."),
+    ("list_releases", "harness", "List available harness releases."),
+    ("list_receipts", "audit", "Proof receipts for every governed operation on your tenant."),
+];
+
+/// `get_started` — the agent-facing capability manifest. Pure metadata (no scope
+/// gate): a freshly-connected AI reads this to know its full verb surface (with
+/// per-verb scope + an `allowed` flag personalized to the caller), the golden
+/// paths, and the human-only steps it should relay to the owner.
+async fn tool_get_started(
+    _state: &PlatformState,
+    claims: &Claims,
+    _args: Value,
+) -> Result<Value, ToolError> {
+    let caps = crate::rbac::effective_scopes(&claims.role, claims.scopes.as_deref());
+    let mut my_scopes: Vec<String> = caps.iter().cloned().collect();
+    my_scopes.sort();
+
+    // Verbs grouped by category; scope derived from rbac (cannot drift) and an
+    // `allowed` flag so the AI sees what IT can do, not just what exists.
+    let mut by_cat: std::collections::BTreeMap<&str, Vec<Value>> =
+        std::collections::BTreeMap::new();
+    for (name, cat, purpose) in VERB_CATALOG {
+        let scope = crate::rbac::required_scope(name);
+        let allowed = scope.map(|s| caps.contains(s)).unwrap_or(true);
+        by_cat.entry(cat).or_default().push(serde_json::json!({
+            "verb": name,
+            "purpose": purpose,
+            "scope": scope,
+            "allowed": allowed,
+        }));
+    }
+
+    Ok(serde_json::json!({
+        "you": {
+            "tenant_id": claims.tenant_id,
+            "role": claims.role,
+            "scopes": my_scopes,
+            "principal_type": if claims.scopes.is_some() { "api_key" } else { "user" },
+        },
+        "verbs_by_category": by_cat,
+        "golden_paths": [
+            { "goal": "Ship new code", "scopes": ["app:deploy"], "steps": [
+                "Write an amos.yaml: name + services (dockerfile per service) + optional `release:` (a migration/command run, gated, before rollout).",
+                "Call deploy(git_repo, git_ref, manifest=<amos.yaml>). It builds from git, runs the gated release step, and rolls services DIGEST-PINNED.",
+                "Poll deploy_status(deploy_id) until succeeded/failed; the receipt shows per-phase timings (build vs release vs roll).",
+                "Do NOT use app_redeploy to ship new code — it re-pulls the pinned digest and changes nothing."
+            ]},
+            { "goal": "Stand up a preview/staging env", "scopes": ["env:provision"], "steps": [
+                "provision_env(...) to create an isolated env, deploy(env=<name>) to load it, teardown_env when done."
+            ]},
+            { "goal": "Operate finances", "scopes": ["finance:read", "finance:write"], "steps": [
+                "finance_board to see budget vs actual vs live.",
+                "set_finance_budget / set_finance_actual to edit (proof-carrying).",
+                "qbo_accounts + set_finance_mapping to wire QuickBooks; set_billing_key (finance:connect, owner) to connect credentials."
+            ]},
+            { "goal": "Query your app data", "scopes": ["db:read"], "steps": [
+                "describe_table to learn the schema, then db_query (read-only SQL). db_write for single-statement DML (owner-only)."
+            ]},
+            { "goal": "Know what you can do", "scopes": [], "steps": [
+                "whoami → your scopes. This manifest marks each verb allowed:true/false for you."
+            ]},
+            { "goal": "Audit what happened", "scopes": ["receipts:read"], "steps": [
+                "list_receipts → every governed operation with its proof receipt."
+            ]}
+        ],
+        "human_steps": [
+            { "when": "Billing / subscription", "tell_the_user": "Open your AMOS billing page and choose a plan (Starter/Pro/Compliance) — provisioning + managed-AI credits activate on checkout." },
+            { "when": "Grant this AI scoped access", "tell_the_user": "In AMOS settings → API keys, create a key scoped to exactly what this AI should touch (e.g. finance:read,finance:write). A key can never exceed your role." },
+            { "when": "Connect QuickBooks / Stripe for finance", "tell_the_user": "Authorize the provider; the credential is stored per-tenant via set_billing_key (finance:connect, owner-only)." },
+            { "when": "Custom domain", "tell_the_user": "Point your domain's DNS at the AMOS ingress target (the team will provide it); TLS is issued automatically." }
+        ],
+        "note": "Every write is proof-carrying — see list_receipts. Tools are tenant-scoped and an API key never exceeds its creator's role. Call whoami for your exact scopes.",
+    }))
+}
+
 fn arg_str(args: &Value, key: &str) -> Result<String, ToolError> {
     args.get(key)
         .and_then(|v| v.as_str())
@@ -3725,6 +3849,11 @@ fn tool_definitions() -> Value {
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
+            "name": "get_started",
+            "description": "START HERE. The capability manifest for operating this tenant: every verb grouped by category (each with its required scope and whether YOU're allowed it), the golden paths (ship code, preview env, operate finances, query data, audit), and the human-only steps to relay to the owner. No arguments, no scope required.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
             "name": "s3_list",
             "description": "List objects in the app's S3 bucket (scope storage:read). Confined to the deployment's bucket (and prefix, if configured); keys are shown app-relative. Requires aws_meta.s3_bucket on the deployment. Use list_apps for the deployment_id.",
             "inputSchema": {
@@ -3878,6 +4007,38 @@ fn tool_definitions() -> Value {
             }
         }
     ])
+}
+
+#[cfg(test)]
+mod manifest_tests {
+    use super::VERB_CATALOG;
+
+    // The get_started manifest must not drift from the real RBAC gate: every
+    // non-meta verb has a required_scope, and the two meta verbs have none.
+    #[test]
+    fn catalog_scopes_match_rbac() {
+        for (verb, cat, _purpose) in VERB_CATALOG {
+            let scope = crate::rbac::required_scope(verb);
+            if *cat == "meta" {
+                assert!(scope.is_none(), "meta verb {verb} should be unscoped");
+            } else {
+                assert!(
+                    scope.is_some(),
+                    "verb {verb} (cat {cat}) is in the manifest but has no required_scope — drift",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_has_no_duplicate_verbs() {
+        let mut seen = std::collections::HashSet::new();
+        for (verb, _, _) in VERB_CATALOG {
+            assert!(seen.insert(*verb), "duplicate verb in catalog: {verb}");
+        }
+        // get_started lists itself + whoami so an agent discovers the entry points.
+        assert!(seen.contains("get_started") && seen.contains("whoami"));
+    }
 }
 
 #[cfg(test)]
