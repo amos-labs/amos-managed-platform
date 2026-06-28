@@ -46,7 +46,7 @@ phases:
       - "if [ -n \"$CACHE_FROM_BASE\" ]; then docker pull \"$CACHE_FROM_BASE\" 2>/dev/null || true; fi"
   build:
     commands:
-      - "echo Building $ECR_REGISTRY/$IMAGE_NAME:$IMAGE_TAG arm64 from $DOCKERFILE (buildkit cache-from)"
+      - "echo Building $ECR_REGISTRY/$IMAGE_NAME:$IMAGE_TAG arm64 from $DOCKERFILE with buildkit cache-from"
       - "CACHE=\"--cache-from $ECR_REGISTRY/$IMAGE_NAME:$IMAGE_TAG\"; if [ -n \"$CACHE_FROM_BASE\" ]; then CACHE=\"$CACHE --cache-from $CACHE_FROM_BASE\"; fi; DOCKER_BUILDKIT=1 docker build --platform linux/arm64 $CACHE --build-arg BUILDKIT_INLINE_CACHE=1 $BUILD_ARGS -f \"$DOCKERFILE\" -t \"$ECR_REGISTRY/$IMAGE_NAME:$IMAGE_TAG\" \"$BUILD_CONTEXT\""
   post_build:
     commands:
