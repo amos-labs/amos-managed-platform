@@ -893,6 +893,26 @@ async fn tool_deploy(
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| vec![app_name.clone()]);
 
+    // Pre-flight: validate everything and return the PLAN without building or
+    // rolling. All the up-front validation above (manifest parse + build_order,
+    // app resolution, ecs_services) has already run, so dry_run surfaces the same
+    // errors the real deploy would — just no infra touched, no background job.
+    if args
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return deploy_dry_run_plan(
+            &manifest,
+            deployment_id,
+            &app_name,
+            &ecs_services,
+            &git_repo,
+            &git_ref,
+        )
+        .map_err(map_amos_err);
+    }
+
     let n_build = manifest.services.len();
     let deploy_id = Uuid::new_v4();
 
@@ -942,6 +962,36 @@ async fn tool_deploy(
         "status": "deploying",
         "services_to_build": n_build,
         "note": "building + rolling in the background; poll deploy_status with this deploy_id until terminal",
+    }))
+}
+
+/// Shape the `deploy(dry_run=true)` plan: report what WOULD be built (in
+/// dependency order) and rolled, without touching any infra. Returns an error if
+/// the build graph is invalid (cyclic/unknown `base`) — the same error the real
+/// deploy would surface. Pure — unit-tested.
+fn deploy_dry_run_plan(
+    manifest: &crate::provisioning::manifest::AmosManifest,
+    deployment_id: Uuid,
+    app_name: &str,
+    ecs_services: &[String],
+    git_repo: &str,
+    git_ref: &str,
+) -> Result<Value, amos_core::AmosError> {
+    let would_build: Vec<String> = manifest
+        .build_order()?
+        .iter()
+        .map(|s| s.name.clone())
+        .collect();
+    Ok(serde_json::json!({
+        "dry_run": true,
+        "app": deployment_id,
+        "app_name": app_name,
+        "would_build": would_build,
+        "would_roll": ecs_services,
+        "release": manifest.release,
+        "git_repo": git_repo,
+        "git_ref": git_ref,
+        "note": "validated — nothing built or rolled; call deploy without dry_run to ship",
     }))
 }
 
@@ -2885,7 +2935,8 @@ async fn tool_get_started(
         "golden_paths": [
             { "goal": "Ship new code", "scopes": ["app:deploy"], "steps": [
                 "Write an amos.yaml: name + services (dockerfile per service) + optional `release:` (a migration/command run, gated, before rollout).",
-                "Call deploy(git_repo, git_ref, manifest=<amos.yaml>). It builds from git, runs the gated release step, and rolls services DIGEST-PINNED.",
+                "Call deploy(git_repo, git_ref, manifest=<amos.yaml>, dry_run=true) FIRST to validate the manifest + app and see the plan (would_build / would_roll) without building anything.",
+                "Then deploy(...) for real. It builds from git, runs the gated release step, and rolls services DIGEST-PINNED.",
                 "Poll deploy_status(deploy_id) until succeeded/failed; the receipt shows per-phase timings (build vs release vs roll).",
                 "Do NOT use app_redeploy to ship new code — it re-pulls the pinned digest and changes nothing."
             ]},
@@ -4118,7 +4169,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "deploy",
-            "description": "Deploy an app from its amos.yaml manifest — the standard one-call CD step. Builds every service in the manifest from source (git_ref), in dependency order (base layers first, injecting BASE_IMAGE), then rolls the app's services. The app is resolved by manifest 'name' + tenant (no deployment_id needed). Returns immediately; the build+roll runs in the background and emits a proof receipt. This is the single verb CI calls.",
+            "description": "Deploy an app from its amos.yaml manifest — the standard one-call CD step. Builds every service in the manifest from source (git_ref), in dependency order (base layers first, injecting BASE_IMAGE), then rolls the app's services. The app is resolved by manifest 'name' + tenant (no deployment_id needed). Returns immediately; the build+roll runs in the background and emits a proof receipt. This is the single verb CI calls. Pass dry_run=true to validate the manifest + app and return the plan WITHOUT building or rolling.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -4126,6 +4177,7 @@ fn tool_definitions() -> Value {
                     "git_ref": { "type": "string", "description": "Commit SHA / branch / tag to build (usually $GITHUB_SHA)." },
                     "manifest": { "type": "string", "description": "Contents of the repo's amos.yaml." },
                     "env": { "type": "string", "description": "Optional: target an isolated environment (from provision_env). Rolls the deployment named '{manifest.name}-{env}' instead of the base app." },
+                    "dry_run": { "type": "boolean", "description": "Optional: validate the manifest + resolve the app and return the PLAN (would_build / would_roll / release) without building or rolling anything. Call with dry_run=true first to catch errors before a real build." },
                     "tenant_id": { "type": "string", "description": "Tenant UUID (admins only)" }
                 },
                 "required": ["git_repo", "git_ref", "manifest"]
@@ -4397,5 +4449,42 @@ mod onboard_tests {
             "services": [{ "name": "web", "base": "nope" }]
         }));
         assert!(r.is_err());
+    }
+}
+
+#[cfg(test)]
+mod deploy_dryrun_tests {
+    use super::deploy_dry_run_plan;
+    use crate::provisioning::manifest::AmosManifest;
+    use serde_json::json;
+
+    #[test]
+    fn plan_reports_build_order_and_rolls_without_infra() {
+        let yaml = "name: acme\nrelease: bundle exec rake db:migrate\nservices:\n  - name: base\n    dockerfile: docker/base.Dockerfile\n    build_only: true\n  - name: web\n    dockerfile: Dockerfile\n    base: base\n";
+        let m = AmosManifest::parse(yaml).expect("parses");
+        let plan = deploy_dry_run_plan(
+            &m,
+            uuid::Uuid::nil(),
+            "acme",
+            &["acme-web".to_string(), "acme-worker".to_string()],
+            "https://github.com/acme/app.git",
+            "main",
+        )
+        .expect("plan");
+        assert_eq!(plan["dry_run"], json!(true));
+        // base builds before web (dependency order).
+        assert_eq!(plan["would_build"], json!(["base", "web"]));
+        assert_eq!(plan["would_roll"], json!(["acme-web", "acme-worker"]));
+        assert_eq!(plan["release"], json!("bundle exec rake db:migrate"));
+        assert_eq!(plan["git_ref"], json!("main"));
+    }
+
+    #[test]
+    fn invalid_build_graph_errors() {
+        // Mutual base references parse (both names exist) but cycle in build_order
+        // → the dry-run reports the same error the real deploy would, no plan.
+        let yaml = "name: x\nservices:\n  - name: a\n    base: b\n  - name: b\n    base: a\n";
+        let m = AmosManifest::parse(yaml).expect("parses (cycle only caught at build_order)");
+        assert!(deploy_dry_run_plan(&m, uuid::Uuid::nil(), "x", &[], "g", "r").is_err());
     }
 }
