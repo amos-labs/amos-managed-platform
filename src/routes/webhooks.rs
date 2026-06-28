@@ -433,16 +433,20 @@ async fn bill_period_close_overage(state: &PlatformState, invoice: &stripe::Invo
 
     // Resolve tenant + Stripe customer + plan. A missing customer id means there
     // is nothing to invoice against; bail.
-    let row: Option<(Uuid, Option<String>, String)> = sqlx::query_as(
-        "SELECT id, stripe_customer_id, plan FROM tenants WHERE stripe_subscription_id = $1",
-    )
-    .bind(sub_id)
-    .fetch_optional(&state.db)
-    .await
-    .ok()
-    .flatten();
-    let (tenant_id, customer_id, plan) = match row {
-        Some((t, Some(c), p)) => (t, c, p),
+    // credits_granted_at = when the monthly credit was last reset = the start of
+    // the period now closing (this runs BEFORE handle_invoice_paid resets it), so
+    // it's the egress window's lower bound.
+    let row: Option<(Uuid, Option<String>, String, Option<chrono::DateTime<chrono::Utc>>)> =
+        sqlx::query_as(
+            "SELECT id, stripe_customer_id, plan, credits_granted_at FROM tenants WHERE stripe_subscription_id = $1",
+        )
+        .bind(sub_id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten();
+    let (tenant_id, customer_id, plan, period_start_at) = match row {
+        Some((t, Some(c), p, ts)) => (t, c, p, ts),
         _ => return,
     };
 
@@ -538,45 +542,40 @@ async fn bill_period_close_overage(state: &PlatformState, invoice: &stripe::Invo
     }
 
     // ── Egress overage ───────────────────────────────────────────────────
-    // Metered from CloudWatch over the invoice's billing window. No DB rows to
-    // mark — the idempotent (tenant, invoice, "egress") key is the only dedup.
-    // HELD OFF (guards::BILL_EGRESS_OVERAGE) until the closing-period window is
-    // verified against a real renewal invoice — see the const's doc comment.
+    // Metered from CloudWatch over the CLOSING period [credits_granted_at, now].
+    // We deliberately do NOT use invoice.period_*, which on a renewal invoice
+    // describes the UPCOMING period (advance billing) and would measure an empty
+    // window. No DB rows to mark — the idempotent (tenant, invoice, "egress") key
+    // is the only dedup.
     if guards::BILL_EGRESS_OVERAGE {
-        if let (Some(meter), Some(start_ts), Some(end_ts)) =
-            (&state.usage_meter, invoice.period_start, invoice.period_end)
-        {
-            if let (Some(start), Some(end)) = (
-                chrono::DateTime::from_timestamp(start_ts, 0),
-                chrono::DateTime::from_timestamp(end_ts, 0),
-            ) {
-                let summary = meter
-                    .tenant_period_summary(&state.db, tenant_id, start, end)
-                    .await;
-                let egress_cents = summary
-                    .charge
-                    .map(|c| c.egress_overage_cents as i64)
-                    .unwrap_or(0);
-                if egress_cents > 0 {
-                    let desc = format!("Egress overage ({} tier)", tier.plan_key());
-                    // Egress rate already includes margin — no uplift.
-                    match guards::submit_overage_invoice_item(
-                        client,
-                        &customer_id,
-                        egress_cents,
-                        &desc,
-                        tenant_id,
-                        &period,
-                        "egress",
-                    )
-                    .await
-                    {
-                        Ok(item_id) => {
-                            info!(tenant_id = %tenant_id, invoice_item = %item_id, cents = egress_cents, "billed egress overage")
-                        }
-                        Err(e) => {
-                            warn!(tenant_id = %tenant_id, %period, "egress overage submit failed (idempotent retry safe): {e}")
-                        }
+        if let (Some(meter), Some(start)) = (&state.usage_meter, period_start_at) {
+            let end = chrono::Utc::now();
+            let summary = meter
+                .tenant_period_summary(&state.db, tenant_id, start, end)
+                .await;
+            let egress_cents = summary
+                .charge
+                .map(|c| c.egress_overage_cents as i64)
+                .unwrap_or(0);
+            if egress_cents > 0 {
+                let desc = format!("Egress overage ({} tier)", tier.plan_key());
+                // Egress rate already includes margin — no uplift.
+                match guards::submit_overage_invoice_item(
+                    client,
+                    &customer_id,
+                    egress_cents,
+                    &desc,
+                    tenant_id,
+                    &period,
+                    "egress",
+                )
+                .await
+                {
+                    Ok(item_id) => {
+                        info!(tenant_id = %tenant_id, invoice_item = %item_id, cents = egress_cents, "billed egress overage")
+                    }
+                    Err(e) => {
+                        warn!(tenant_id = %tenant_id, %period, "egress overage submit failed (idempotent retry safe): {e}")
                     }
                 }
             }

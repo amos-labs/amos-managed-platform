@@ -42,13 +42,12 @@ pub fn overage_within_sanity_ceiling(cents: i64) -> bool {
     cents <= OVERAGE_SANITY_CEILING_CENTS
 }
 
-/// Egress overage auto-billing kill-switch. The egress arm of period-close
-/// billing is wired but **held off** until the closing-period window is verified
-/// against a real Stripe renewal invoice (`invoice.period_*` on a renewal
-/// describes the *upcoming* period under advance billing, so it must be
-/// confirmed before it can bill correctly). Egress was never billed before, so
-/// `false` = status quo, no mis-bill risk. Flip to `true` once verified.
-pub const BILL_EGRESS_OVERAGE: bool = false;
+/// Egress overage auto-billing switch. **ON.** The period-close egress arm now
+/// meters CloudWatch over the CLOSING window `[credits_granted_at, now]` (not
+/// `invoice.period_*`, which on a renewal describes the *upcoming* period under
+/// advance billing). Kill-switch retained: set `false` to disable egress billing
+/// without a code change to the billing path.
+pub const BILL_EGRESS_OVERAGE: bool = true;
 
 /// Subscription statuses that block use of the shared backend even if a credit
 /// balance remains: the account has a billing problem and must be resolved.
