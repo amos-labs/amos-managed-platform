@@ -889,6 +889,30 @@ async fn tool_deploy(
 
     let n_build = manifest.services.len();
     let deploy_id = Uuid::new_v4();
+
+    // Serialize per app: if a deploy is already in flight for this deployment,
+    // do NOT spawn a colliding job (the collision previously no-op'd into a
+    // confusing built:{} rolled:[] verified=false). Return the in-flight
+    // deploy_id so the caller polls that one. The check-and-insert is atomic
+    // under the mutex; run_deploy_to_receipt clears the entry on every exit
+    // path via InFlightGuard.
+    {
+        let mut inflight = state
+            .in_flight_deploys
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let existing = inflight.get(&deployment_id).copied();
+        if !may_start_deploy(existing.is_some()) {
+            return Ok(serde_json::json!({
+                "app": deployment_id,
+                "status": "already_deploying",
+                "deploy_id": existing,
+                "note": "a deploy is already in flight for this app; poll that deploy_id. This deploy was not started (superseded to avoid a colliding no-op).",
+            }));
+        }
+        inflight.insert(deployment_id, deploy_id);
+    }
+
     let bg = state.clone();
     tokio::spawn(async move {
         run_deploy_to_receipt(
@@ -934,6 +958,24 @@ async fn run_deploy_to_receipt(
     use crate::provisioning::image_builder::BuildRequest;
     use std::collections::{BTreeMap, HashMap};
     use std::time::{Duration, Instant};
+
+    // Clear the per-app in-flight marker on EVERY exit (success, failure, early
+    // return, panic) so the next deploy for this app isn't wrongly rejected.
+    struct InFlightGuard {
+        map: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<Uuid, Uuid>>>,
+        deployment_id: Uuid,
+    }
+    impl Drop for InFlightGuard {
+        fn drop(&mut self) {
+            if let Ok(mut m) = self.map.lock() {
+                m.remove(&self.deployment_id);
+            }
+        }
+    }
+    let _inflight_guard = InFlightGuard {
+        map: state.in_flight_deploys.clone(),
+        deployment_id,
+    };
 
     let registry = std::env::var("AMOS_ECR_REGISTRY").unwrap_or_default();
     let order = match manifest.build_order() {
@@ -1032,6 +1074,7 @@ async fn run_deploy_to_receipt(
     //    triggers the rollout (no force_new_deployment needed), and because the
     //    image is digest-pinned a moving-tag drift can never ship a stale image.
     let mut rolled: Vec<String> = Vec::new();
+    let mut unchanged: Vec<String> = Vec::new();
     let mut deployed: Vec<serde_json::Value> = Vec::new();
     if all_ok {
         let cfg = aws_config::defaults(aws_config::BehaviorVersion::latest())
@@ -1124,6 +1167,30 @@ async fn run_deploy_to_receipt(
                             continue;
                         }
                     };
+                // No-change short-circuit: if pinning produced an identical set
+                // of container images (cache-hit → same digest, or the service
+                // is already on the target digest), skip the pointless rollout
+                // and record it as unchanged. This is a clean "already
+                // up-to-date" — NOT a failure (the old behavior rolled an
+                // identical image and a colliding/no-op deploy looked failed).
+                let current_images: Vec<Option<String>> = base_td
+                    .container_definitions()
+                    .iter()
+                    .map(|c| c.image().map(str::to_string))
+                    .collect();
+                let new_images: Vec<Option<String>> = containers
+                    .iter()
+                    .map(|c| c.image().map(str::to_string))
+                    .collect();
+                if current_images == new_images {
+                    unchanged.push(svc.clone());
+                    results.push((
+                        svc.clone(),
+                        true,
+                        format!("{svc}: already on target image — no roll needed"),
+                    ));
+                    continue;
+                }
                 let matched: Vec<String> = base_td
                     .container_definitions()
                     .iter()
@@ -1229,11 +1296,17 @@ async fn run_deploy_to_receipt(
         );
     }
     let build_total: u64 = build_secs.values().sum();
+    let outcome = deploy_outcome(all_ok, rolled.len(), unchanged.len());
+    let no_changes = matches!(outcome, DeployOutcome::NoChanges);
     receipt = receipt
         .outputs(serde_json::json!({
             "built": built,
             "pinned": pins,
             "rolled": rolled,
+            // Services already on the target image (cache-hit / same digest):
+            // a clean no-op, not a failure.
+            "unchanged": unchanged,
+            "no_changes": no_changes,
             "deployed": deployed,
             // Per-phase wall-clock (seconds) so a slow deploy is diagnosable:
             // which image's build dominated, and build-vs-release-vs-roll.
@@ -1245,16 +1318,54 @@ async fn run_deploy_to_receipt(
                 "total_s": total_secs,
             },
         }))
-        .summary(if all_ok {
-            format!(
+        .summary(match outcome {
+            DeployOutcome::Rolled => format!(
                 "deployed {} ({} svc rolled, digest-pinned) — build {build_total}s · release {release_secs}s · roll {roll_secs}s · total {total_secs}s",
                 manifest.name,
                 rolled.len()
-            )
-        } else {
-            format!("deploy of {} FAILED — services not rolled (total {total_secs}s)", manifest.name)
+            ),
+            DeployOutcome::NoChanges => format!(
+                "{} already up-to-date — {} service(s) already on the target image, nothing to roll (build {build_total}s · total {total_secs}s)",
+                manifest.name,
+                unchanged.len()
+            ),
+            DeployOutcome::Failed => format!(
+                "deploy of {} FAILED — services not rolled (total {total_secs}s)",
+                manifest.name
+            ),
         });
     let _ = proof::emit(&state.db, &receipt).await;
+}
+
+/// How a manifest `deploy` ended — drives the receipt summary + `verified`.
+/// `NoChanges` is a clean SUCCESS (every built digest already matches what's
+/// running, so nothing needed rolling — e.g. a cache-hit re-deploy), distinct
+/// from `Failed` (a real build/release/roll error). Previously a no-op deploy
+/// looked like `Failed` (built:{} rolled:[] verified=false), confusing CI.
+#[derive(Debug, PartialEq, Eq)]
+enum DeployOutcome {
+    Rolled,
+    NoChanges,
+    Failed,
+}
+
+/// Classify a deploy from whether it stayed healthy + how many services rolled
+/// vs were already on the target image. Pure — unit-tested.
+fn deploy_outcome(all_ok: bool, rolled: usize, unchanged: usize) -> DeployOutcome {
+    if !all_ok {
+        DeployOutcome::Failed
+    } else if rolled == 0 && unchanged > 0 {
+        DeployOutcome::NoChanges
+    } else {
+        DeployOutcome::Rolled
+    }
+}
+
+/// Whether a new deploy may start, given whether one is already in flight for
+/// the same app. `false` ⇒ the caller returns `already_deploying` instead of
+/// spawning a colliding job. Pure — unit-tested.
+fn may_start_deploy(already_in_flight: bool) -> bool {
+    !already_in_flight
 }
 
 /// Outcome of the release gate: roll the new version, or abort and keep serving
@@ -3727,5 +3838,30 @@ mod release_phase_tests {
             vec!["sh", "-lc", "alembic upgrade head"]
         );
         assert_eq!(release_argv("sqlx migrate run").len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod deploy_concurrency_tests {
+    use super::{deploy_outcome, may_start_deploy, DeployOutcome};
+
+    #[test]
+    fn no_change_is_success_not_failure() {
+        // Every service already on the target image → clean NoChanges, NOT Failed.
+        assert_eq!(deploy_outcome(true, 0, 3), DeployOutcome::NoChanges);
+        // Some rolled → Rolled (a real change shipped).
+        assert_eq!(deploy_outcome(true, 2, 1), DeployOutcome::Rolled);
+        assert_eq!(deploy_outcome(true, 2, 0), DeployOutcome::Rolled);
+        // A build/release/roll error → Failed regardless of counts.
+        assert_eq!(deploy_outcome(false, 0, 0), DeployOutcome::Failed);
+        assert_eq!(deploy_outcome(false, 0, 3), DeployOutcome::Failed);
+        // Degenerate (no services): healthy but nothing rolled or unchanged.
+        assert_eq!(deploy_outcome(true, 0, 0), DeployOutcome::Rolled);
+    }
+
+    #[test]
+    fn second_concurrent_deploy_is_rejected_not_spawned() {
+        assert!(may_start_deploy(false)); // none in flight → proceed
+        assert!(!may_start_deploy(true)); // already deploying → return already_deploying
     }
 }

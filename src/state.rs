@@ -119,6 +119,13 @@ pub struct PlatformState {
     /// finance service. The `finance_*` MCP verbs proxy to this behind `finance:*`
     /// scopes + proof receipts.
     pub finance: Arc<dyn crate::mcp::finance::FinanceEngineClient>,
+    /// In-flight manifest `deploy`s, keyed `deployment_id → deploy_id`, so a
+    /// second deploy for the same app returns `already_deploying` cleanly
+    /// instead of spawning a colliding job (which previously no-op'd into a
+    /// confusing `verified=false`). In-memory: correct at the current
+    /// single-instance scale; a Postgres advisory lock is the multi-instance
+    /// upgrade.
+    pub in_flight_deploys: Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, uuid::Uuid>>>,
 }
 
 impl PlatformState {
@@ -328,6 +335,7 @@ impl PlatformState {
             stripe_client,
             stripe_config,
             finance,
+            in_flight_deploys: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         })
     }
 
