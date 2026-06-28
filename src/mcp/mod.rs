@@ -263,6 +263,7 @@ fn resolve_tenant(claims: &Claims, args: &Value) -> Result<Uuid, ToolError> {
 
 // ── Tool dispatch ───────────────────────────────────────────────────────
 
+#[derive(Debug)]
 pub(crate) enum ToolError {
     NotFound,
     InvalidParams(String),
@@ -345,6 +346,7 @@ async fn dispatch_tool(
         // ── Introspection (capability/identity discovery) ─────────────────
         "whoami" => tool_whoami(state, claims, args).await,
         "get_started" => tool_get_started(state, claims, args).await,
+        "onboard_app" => tool_onboard_app(state, claims, args).await,
         // ── Proof-carrying operations ─────────────────────────────────────
         "list_receipts" => tool_list_receipts(state, claims, args).await,
         // ── Natural-language manager front door ───────────────────────────
@@ -2800,6 +2802,7 @@ async fn tool_whoami(
 const VERB_CATALOG: &[(&str, &str, &str)] = &[
     ("whoami", "meta", "Your identity, tenant, and effective scopes."),
     ("get_started", "meta", "This capability manifest + golden paths (start here)."),
+    ("onboard_app", "meta", "Scaffold a NEW app: generates a validated amos.yaml + the exact deploy playbook + human checklist."),
     ("list_apps", "app", "List your deployed apps and their services."),
     ("app_status", "app", "Live status + last deploy of an app."),
     ("app_logs", "app", "Recent logs for an app service."),
@@ -2904,13 +2907,183 @@ async fn tool_get_started(
                 "list_receipts → every governed operation with its proof receipt."
             ]}
         ],
-        "human_steps": [
-            { "when": "Billing / subscription", "tell_the_user": "Open your AMOS billing page and choose a plan (Starter/Pro/Compliance) — provisioning + managed-AI credits activate on checkout." },
-            { "when": "Grant this AI scoped access", "tell_the_user": "In AMOS settings → API keys, create a key scoped to exactly what this AI should touch (e.g. finance:read,finance:write). A key can never exceed your role." },
-            { "when": "Connect QuickBooks / Stripe for finance", "tell_the_user": "Authorize the provider; the credential is stored per-tenant via set_billing_key (finance:connect, owner-only)." },
-            { "when": "Custom domain", "tell_the_user": "Point your domain's DNS at the AMOS ingress target (the team will provide it); TLS is issued automatically." }
-        ],
+        "human_steps": onboarding_human_steps(),
         "note": "Every write is proof-carrying — see list_receipts. Tools are tenant-scoped and an API key never exceeds its creator's role. Call whoami for your exact scopes.",
+    }))
+}
+
+/// Human-only onboarding steps the AI relays to the owner. Shared by
+/// `get_started` and `onboard_app` so the guidance can't drift.
+fn onboarding_human_steps() -> Vec<Value> {
+    vec![
+        serde_json::json!({ "when": "Billing / subscription", "tell_the_user": "Open your AMOS billing page and choose a plan (Starter/Pro/Compliance) — provisioning + managed-AI credits activate on checkout." }),
+        serde_json::json!({ "when": "Grant this AI scoped access", "tell_the_user": "In AMOS settings → API keys, create a key scoped to exactly what this AI should touch (e.g. finance:read,finance:write). A key can never exceed your role." }),
+        serde_json::json!({ "when": "Connect QuickBooks / Stripe for finance", "tell_the_user": "Authorize the provider; the credential is stored per-tenant via set_billing_key (finance:connect, owner-only)." }),
+        serde_json::json!({ "when": "Custom domain", "tell_the_user": "Point your domain's DNS at the AMOS ingress target (the team will provide it); TLS is issued automatically." }),
+    ]
+}
+
+/// Always double-quote + escape a scalar so values containing `:` (e.g. a
+/// release command) or spaces are valid YAML.
+fn yaml_scalar(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Enable-guidance for a requested engine (data for `onboard_app`).
+fn engine_enable_step(engine: &str) -> Value {
+    match engine {
+        "finance" => serde_json::json!({
+            "engine": "finance",
+            "available": true,
+            "scopes": ["finance:read", "finance:write", "finance:connect"],
+            "enable": "Owner grants a key the finance:* scopes (see human_steps). Then: finance_board (view budget vs actual vs live), set_finance_budget / set_finance_actual (edit, proof-carrying), qbo_accounts + set_finance_mapping + set_billing_key to wire QuickBooks/Stripe.",
+        }),
+        other => serde_json::json!({
+            "engine": other,
+            "available": false,
+            "note": format!("No '{other}' engine yet — available engines: finance. (marketing / CRM are on the roadmap.)"),
+        }),
+    }
+}
+
+/// `onboard_app` — advisory onboarding helper (no scope gate, no state change).
+/// Given an app description it returns a GUARANTEED-VALID amos.yaml (round-tripped
+/// through `AmosManifest::parse` + `build_order`) plus the exact deploy playbook
+/// and the human checklist — so a new customer's AI is ready to deploy in one
+/// call. It never writes the DB: the app record + infra are created by the
+/// `deploy`/`deploy_app`/`provision_env` verbs the plan points to.
+async fn tool_onboard_app(
+    _state: &PlatformState,
+    _claims: &Claims,
+    args: Value,
+) -> Result<Value, ToolError> {
+    build_onboarding_plan(&args)
+}
+
+/// Pure core of `onboard_app`: validate inputs → emit a valid amos.yaml → plan.
+fn build_onboarding_plan(args: &Value) -> Result<Value, ToolError> {
+    use crate::provisioning::manifest::AmosManifest;
+
+    let name = args
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            ToolError::InvalidParams(
+                "onboard_app: 'name' (string) is required — your app's name".into(),
+            )
+        })?;
+    let services = args
+        .get("services")
+        .and_then(|v| v.as_array())
+        .filter(|a| !a.is_empty())
+        .ok_or_else(|| {
+            ToolError::InvalidParams(
+                "onboard_app: 'services' is required — a non-empty array of { name, dockerfile?, public?, base?, image_name? }".into(),
+            )
+        })?;
+    let release = args
+        .get("release")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let git_repo = args
+        .get("git_repo")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("<your https git repo url>");
+    let engines: Vec<String> = args
+        .get("engines")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| e.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Build the amos.yaml from the inputs.
+    let mut yaml = String::new();
+    yaml.push_str(&format!("name: {}\n", yaml_scalar(name)));
+    if let Some(r) = release {
+        yaml.push_str(&format!("release: {}\n", yaml_scalar(r)));
+    }
+    yaml.push_str("services:\n");
+    for (i, svc) in services.iter().enumerate() {
+        let sname = svc
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                ToolError::InvalidParams(format!("onboard_app: services[{i}].name is required"))
+            })?;
+        let dockerfile = svc
+            .get("dockerfile")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Dockerfile");
+        yaml.push_str(&format!("  - name: {}\n", yaml_scalar(sname)));
+        yaml.push_str(&format!("    dockerfile: {}\n", yaml_scalar(dockerfile)));
+        if let Some(b) = svc
+            .get("base")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            yaml.push_str(&format!("    base: {}\n", yaml_scalar(b)));
+        }
+        if let Some(im) = svc
+            .get("image_name")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            yaml.push_str(&format!("    image_name: {}\n", yaml_scalar(im)));
+        }
+        if svc.get("public").and_then(|v| v.as_bool()).unwrap_or(false) {
+            yaml.push_str("    public: true\n");
+        }
+        if svc
+            .get("build_only")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            yaml.push_str("    build_only: true\n");
+        }
+    }
+
+    // Validate by parsing through the real schema + build graph — so what we hand
+    // back is guaranteed to deploy.
+    let manifest = AmosManifest::parse(&yaml)
+        .map_err(|e| ToolError::InvalidParams(format!("generated amos.yaml is invalid: {e}")))?;
+    manifest.build_order().map_err(|e| {
+        ToolError::InvalidParams(format!(
+            "generated amos.yaml has an unresolvable service graph: {e}"
+        ))
+    })?;
+
+    let engines_plan: Vec<Value> = engines.iter().map(|e| engine_enable_step(e)).collect();
+
+    let mut human = onboarding_human_steps();
+    human.insert(
+        0,
+        serde_json::json!({
+            "when": "First-time hosting setup (net-new app)",
+            "tell_the_user": "A brand-new app needs its initial ECS services + ingress/domain provisioned once. Ask the AMOS team to provision the substrate (or use provision_env for a preview). After that, deploys are fully self-serve via the deploy verb.",
+        }),
+    );
+
+    Ok(serde_json::json!({
+        "app": name,
+        "amos_yaml": yaml,
+        "next_steps": [
+            "1. Commit the amos.yaml above to your repo root.",
+            format!("2. Ship it: deploy(git_repo='{git_repo}', git_ref='<branch>', manifest=<the amos.yaml above>). It builds from git, runs the gated `release` step (if set), and rolls digest-pinned."),
+            "3. Poll deploy_status(deploy_id) until succeeded — the receipt shows per-phase timings (build vs release vs roll).",
+            "Note: do NOT use app_redeploy to ship new code — it re-pulls the pinned digest and changes nothing.",
+        ],
+        "engines": engines_plan,
+        "human_steps": human,
+        "note": "Advisory: a VALIDATED amos.yaml + plan, nothing was created. The deploy/provision verbs create the app record + infra. Call get_started for the full capability map.",
     }))
 }
 
@@ -3854,6 +4027,36 @@ fn tool_definitions() -> Value {
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
+            "name": "onboard_app",
+            "description": "Onboard a NEW app in one call: returns a guaranteed-valid amos.yaml (round-tripped through the real schema) built from your inputs, the exact deploy playbook, requested-engine enable steps, and the human-only checklist. Advisory — generates the manifest + plan, creates nothing (the deploy/provision verbs do that). No scope required.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "The app's name (= amos.yaml name)." },
+                    "services": {
+                        "type": "array",
+                        "description": "One per buildable image: { name, dockerfile? (default Dockerfile), public? (internet-facing), base? (another service to FROM), image_name?, build_only? }.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string" },
+                                "dockerfile": { "type": "string" },
+                                "public": { "type": "boolean" },
+                                "base": { "type": "string" },
+                                "image_name": { "type": "string" },
+                                "build_only": { "type": "boolean" }
+                            },
+                            "required": ["name"]
+                        }
+                    },
+                    "release": { "type": "string", "description": "Optional gated pre-rollout command, e.g. 'bundle exec rake db:migrate' or 'alembic upgrade head'." },
+                    "git_repo": { "type": "string", "description": "Optional https git URL (used to fill the deploy call in the plan)." },
+                    "engines": { "type": "array", "items": { "type": "string" }, "description": "Optional engines to enable, e.g. [\"finance\"]." }
+                },
+                "required": ["name", "services"]
+            }
+        },
+        {
             "name": "s3_list",
             "description": "List objects in the app's S3 bucket (scope storage:read). Confined to the deployment's bucket (and prefix, if configured); keys are shown app-relative. Requires aws_meta.s3_bucket on the deployment. Use list_apps for the deployment_id.",
             "inputSchema": {
@@ -4137,5 +4340,62 @@ mod deploy_concurrency_tests {
             "637.dkr.ecr.us-east-1.amazonaws.com/nuvola:prod"
         ));
         assert!(!redeploy_would_noop("nuvola:latest"));
+    }
+}
+
+#[cfg(test)]
+mod onboard_tests {
+    use super::build_onboarding_plan;
+    use crate::provisioning::manifest::AmosManifest;
+    use serde_json::json;
+
+    #[test]
+    fn generates_a_valid_manifest_and_plan() {
+        let out = build_onboarding_plan(&json!({
+            "name": "acme",
+            "git_repo": "https://github.com/acme/app.git",
+            "release": "bundle exec rake db:migrate",
+            "services": [
+                { "name": "base", "dockerfile": "docker/base.Dockerfile", "build_only": true },
+                { "name": "web", "dockerfile": "Dockerfile", "base": "base", "public": true }
+            ],
+            "engines": ["finance", "marketing"]
+        }))
+        .expect("plan");
+        // The returned amos.yaml must itself parse + build-order cleanly.
+        let yaml = out["amos_yaml"].as_str().unwrap();
+        let m = AmosManifest::parse(yaml).expect("yaml parses");
+        assert_eq!(m.name, "acme");
+        assert_eq!(m.release.as_deref(), Some("bundle exec rake db:migrate"));
+        m.build_order().expect("graph resolves (base before web)");
+        // Plan surfaces the deploy call + engines (finance available, marketing not).
+        assert!(out["next_steps"].as_array().unwrap().iter().any(|s| s
+            .as_str()
+            .unwrap()
+            .contains("deploy(git_repo='https://github.com/acme/app.git'")));
+        let engines = out["engines"].as_array().unwrap();
+        assert_eq!(engines[0]["available"], json!(true)); // finance
+        assert_eq!(engines[1]["available"], json!(false)); // marketing (roadmap)
+        assert!(!out["human_steps"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn missing_name_or_services_errors_clearly() {
+        assert!(build_onboarding_plan(&json!({ "services": [{ "name": "web" }] })).is_err());
+        assert!(build_onboarding_plan(&json!({ "name": "x" })).is_err());
+        assert!(build_onboarding_plan(&json!({ "name": "x", "services": [] })).is_err());
+        // A service missing its name is rejected.
+        assert!(build_onboarding_plan(&json!({ "name": "x", "services": [{}] })).is_err());
+    }
+
+    #[test]
+    fn unknown_base_reference_is_caught_by_build_order() {
+        // web references a base service that doesn't exist → build_order errors,
+        // so onboard_app never hands back an undeployable manifest.
+        let r = build_onboarding_plan(&json!({
+            "name": "x",
+            "services": [{ "name": "web", "base": "nope" }]
+        }));
+        assert!(r.is_err());
     }
 }
