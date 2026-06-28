@@ -1991,6 +1991,55 @@ async fn tool_teardown_env(
 /// no task-def surgery, so all task settings are preserved. Pairs with CI that
 /// rebuilds the image under the tag the task def already references. Multi-
 /// service safe (Nuvola web+sidekiq) and single-service (Cuspr). Emits a receipt.
+/// Whether a force-new-deployment would be a no-op for shipping new code: a
+/// digest-pinned image (`repo@sha256:…`) is immutable, so re-pulling it can
+/// never pick up a freshly-built image. Pure — unit-tested.
+fn redeploy_would_noop(image: &str) -> bool {
+    image.contains("@sha256:")
+}
+
+/// The container images referenced by a service's current task definition
+/// (best-effort; empty on any lookup error).
+async fn service_container_images(
+    ecs: &aws_sdk_ecs::Client,
+    cluster: &str,
+    svc: &str,
+) -> Vec<String> {
+    let td_arn = match ecs
+        .describe_services()
+        .cluster(cluster)
+        .services(svc)
+        .send()
+        .await
+    {
+        Ok(r) => r
+            .services()
+            .first()
+            .and_then(|s| s.task_definition().map(str::to_string)),
+        Err(_) => None,
+    };
+    let Some(td_arn) = td_arn else {
+        return Vec::new();
+    };
+    match ecs
+        .describe_task_definition()
+        .task_definition(&td_arn)
+        .send()
+        .await
+    {
+        Ok(r) => r
+            .task_definition()
+            .map(|t| {
+                t.container_definitions()
+                    .iter()
+                    .filter_map(|c| c.image().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
 async fn tool_app_redeploy(
     state: &PlatformState,
     claims: &Claims,
@@ -2034,6 +2083,55 @@ async fn tool_app_redeploy(
         .load()
         .await;
     let ecs = aws_sdk_ecs::Client::new(&cfg);
+
+    // Guard: force-new-deployment re-pulls the image the task def already
+    // references. If that image is digest-pinned (`@sha256:`), the roll can NOT
+    // pick up newly-built code — it just restarts the frozen digest (this
+    // silently no-op'd a tenant's CD for a full day, reporting success the whole
+    // time). Refuse with a clear steer to `deploy` (which builds + re-pins a
+    // fresh digest), unless force=true (an intentional restart of the same image).
+    let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+    if !force {
+        let mut pinned: Vec<Value> = Vec::new();
+        for svc in &services {
+            for img in service_container_images(&ecs, &cluster, svc).await {
+                if redeploy_would_noop(&img) {
+                    pinned.push(serde_json::json!({ "service": svc, "image": img }));
+                }
+            }
+        }
+        if !pinned.is_empty() {
+            let intent = Intent {
+                summary: format!("app_redeploy no-op guard tripped for '{name}'"),
+                self_modifying: false,
+                scope_classification: "deploy".to_string(),
+            };
+            let receipt = OperationReceipt::new("app_redeploy", tenant_id, actor.clone(), intent)
+                .guardrail("pinned_noop_guard")
+                .inputs(serde_json::json!({
+                    "deployment_id": deployment_id,
+                    "image": image,
+                    "services": services,
+                }))
+                .check(
+                    "would_ship_new_code",
+                    CheckStatus::Failed,
+                    "task def image is digest-pinned; force-new-deployment re-pulls the same digest and ships no new code",
+                )
+                .outputs(serde_json::json!({ "pinned_services": pinned.clone() }))
+                .summary(format!(
+                    "app_redeploy is a no-op for '{name}' (digest-pinned) — use `deploy`"
+                ));
+            let _ = proof::emit(&state.db, &receipt).await;
+            return Ok(serde_json::json!({
+                "deployment_id": deployment_id,
+                "no_op": true,
+                "status": "blocked",
+                "pinned_services": pinned,
+                "message": "app_redeploy re-pulls the pinned digest(s) and will NOT pick up new code — use the `deploy` verb (it builds and re-pins a fresh digest into a new task-def revision). Pass force=true to restart the current image anyway.",
+            }));
+        }
+    }
 
     let mut rolled = Vec::new();
     for svc in &services {
@@ -3743,12 +3841,13 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "app_redeploy",
-            "description": "Roll a deployed app to pick up a freshly-built image (CD deploy step). Issues a rolling, health-checked force-new-deployment on each ECS service of the deployment — preserves all task settings, works for single- and multi-service apps. Pair it with build_image (build the new image under the tag the app already uses), then call app_redeploy. Poll app_status for the rollout.",
+            "description": "Roll a deployed app to pick up a freshly-built image, ONLY when the task def references a MUTABLE tag (force-new-deployment re-pulls that tag). If the task def is digest-pinned (image is repo@sha256:…), force-new-deployment re-pulls the SAME frozen digest and ships NO new code — so this verb refuses with no_op:true and steers you to `deploy` (which builds + re-pins a fresh digest). To ship new code, prefer `deploy`. Use app_redeploy only to restart a mutable-tag service (or with force=true to restart the current pinned image deliberately). Poll app_status for the rollout.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "deployment_id": { "type": "string", "description": "The app deployment to roll (from list_apps)." },
                     "image": { "type": "string", "description": "Optional: the image ref/sha just built, recorded in the proof receipt for audit." },
+                    "force": { "type": "boolean", "description": "Restart even if the task def is digest-pinned (intentional restart of the current image; bypasses the no-op guard). Default false." },
                     "tenant_id": { "type": "string", "description": "Tenant UUID (admins only)" }
                 },
                 "required": ["deployment_id"]
@@ -3843,7 +3942,7 @@ mod release_phase_tests {
 
 #[cfg(test)]
 mod deploy_concurrency_tests {
-    use super::{deploy_outcome, may_start_deploy, DeployOutcome};
+    use super::{deploy_outcome, may_start_deploy, redeploy_would_noop, DeployOutcome};
 
     #[test]
     fn no_change_is_success_not_failure() {
@@ -3863,5 +3962,19 @@ mod deploy_concurrency_tests {
     fn second_concurrent_deploy_is_rejected_not_spawned() {
         assert!(may_start_deploy(false)); // none in flight → proceed
         assert!(!may_start_deploy(true)); // already deploying → return already_deploying
+    }
+
+    #[test]
+    fn redeploy_noop_detects_digest_pinned_images() {
+        // Digest-pinned → force-new-deployment re-pulls the same frozen image →
+        // app_redeploy can't ship new code → guard must trip.
+        assert!(redeploy_would_noop(
+            "637.dkr.ecr.us-east-1.amazonaws.com/nuvola@sha256:abc123"
+        ));
+        // Mutable tags → force-new-deployment legitimately re-pulls the tag.
+        assert!(!redeploy_would_noop(
+            "637.dkr.ecr.us-east-1.amazonaws.com/nuvola:prod"
+        ));
+        assert!(!redeploy_would_noop("nuvola:latest"));
     }
 }
