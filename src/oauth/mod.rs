@@ -353,7 +353,11 @@ async fn authorize_consent(
     }
 
     // Redirect back to the client with code + state.
-    let sep = if f.redirect_uri.contains('?') { '&' } else { '?' };
+    let sep = if f.redirect_uri.contains('?') {
+        '&'
+    } else {
+        '?'
+    };
     let loc = format!(
         "{}{}code={}&state={}",
         f.redirect_uri,
@@ -392,7 +396,18 @@ async fn token(State(state): State<PlatformState>, Form(f): Form<TokenForm>) -> 
 async fn token_from_code(state: &PlatformState, f: &TokenForm) -> Response {
     let code_hash = auth::hash_token(&f.code);
     // Fetch + validate the code (unconsumed, unexpired).
-    let row = sqlx::query_as::<_, (String, String, Vec<String>, Uuid, Uuid, bool, chrono::DateTime<Utc>)>(
+    let row = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            Vec<String>,
+            Uuid,
+            Uuid,
+            bool,
+            chrono::DateTime<Utc>,
+        ),
+    >(
         "SELECT redirect_uri, code_challenge, scopes, user_id, tenant_id, consumed, expires_at
          FROM oauth_auth_codes WHERE code_hash = $1",
     )
@@ -494,10 +509,7 @@ async fn issue_tokens(
 
 /// Resolve an OAuth access token to Claims (tenant + role-capped scopes), or
 /// None. Mirrors the api_key path. Updates last_used_at on success.
-pub(crate) async fn claims_for_access_token(
-    state: &PlatformState,
-    token: &str,
-) -> Option<Claims> {
+pub(crate) async fn claims_for_access_token(state: &PlatformState, token: &str) -> Option<Claims> {
     let hash = auth::hash_token(token);
     let (user_id, tenant_id, scopes) = sqlx::query_as::<_, (Uuid, Uuid, Vec<String>)>(
         "SELECT user_id, tenant_id, scopes FROM oauth_tokens
@@ -519,10 +531,12 @@ pub(crate) async fn claims_for_access_token(
     let db = state.db.clone();
     let h = hash.clone();
     tokio::spawn(async move {
-        let _ = sqlx::query("UPDATE oauth_tokens SET last_used_at = NOW() WHERE access_token_hash = $1")
-            .bind(&h)
-            .execute(&db)
-            .await;
+        let _ = sqlx::query(
+            "UPDATE oauth_tokens SET last_used_at = NOW() WHERE access_token_hash = $1",
+        )
+        .bind(&h)
+        .execute(&db)
+        .await;
     });
 
     Some(Claims {
@@ -543,17 +557,21 @@ struct ClientRow {
 }
 
 async fn load_client(state: &PlatformState, client_id: &str) -> Option<ClientRow> {
-    let (redirect_uris,) =
-        sqlx::query_as::<_, (Vec<String>,)>("SELECT redirect_uris FROM oauth_clients WHERE client_id = $1")
-            .bind(client_id)
-            .fetch_optional(&state.db)
-            .await
-            .ok()??;
+    let (redirect_uris,) = sqlx::query_as::<_, (Vec<String>,)>(
+        "SELECT redirect_uris FROM oauth_clients WHERE client_id = $1",
+    )
+    .bind(client_id)
+    .fetch_optional(&state.db)
+    .await
+    .ok()??;
     Some(ClientRow { redirect_uris })
 }
 
 fn bad_request(msg: &str) -> Response {
-    (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid_request", "error_description": msg})))
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": "invalid_request", "error_description": msg})),
+    )
         .into_response()
 }
 
@@ -578,7 +596,11 @@ fn consent_html(q: &AuthorizeQuery, claims: &Claims) -> String {
     scopes.sort();
     let mut boxes = String::new();
     for s in &scopes {
-        let checked = if DEFAULT_SCOPES.contains(s) { "checked" } else { "" };
+        let checked = if DEFAULT_SCOPES.contains(s) {
+            "checked"
+        } else {
+            ""
+        };
         let _ = write!(
             boxes,
             r#"<label style="display:flex;gap:8px;align-items:center;padding:6px 0"><input type="checkbox" class="sc" value="{s}" {checked}><code style="font-size:13px;color:#3f6fe6">{s}</code></label>"#,

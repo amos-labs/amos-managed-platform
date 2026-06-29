@@ -436,7 +436,13 @@ async fn bill_period_close_overage(state: &PlatformState, invoice: &stripe::Invo
     // credits_granted_at = when the monthly credit was last reset = the start of
     // the period now closing (this runs BEFORE handle_invoice_paid resets it), so
     // it's the egress window's lower bound.
-    let row: Option<(Uuid, Option<String>, String, Option<chrono::DateTime<chrono::Utc>>)> =
+    type TenantBillingRow = (
+        Uuid,
+        Option<String>,
+        String,
+        Option<chrono::DateTime<chrono::Utc>>,
+    );
+    let row: Option<TenantBillingRow> =
         sqlx::query_as(
             "SELECT id, stripe_customer_id, plan, credits_granted_at FROM tenants WHERE stripe_subscription_id = $1",
         )
