@@ -100,12 +100,21 @@ async fn handle_mcp(
     let claims = match authenticate(&state, &headers).await {
         Some(c) => c,
         None => {
+            // RFC 9728: advertise where to discover the authorization server so
+            // MCP clients (Claude web/mobile/Desktop) launch the OAuth flow
+            // instead of failing on a missing pasted bearer.
+            let www_auth = format!(
+                "Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource\"",
+                crate::oauth::base_url()
+            );
+            let challenge = [(axum::http::header::WWW_AUTHENTICATE, www_auth)];
             // Notifications get no body; requests get a 401-shaped JSON-RPC error.
             if req.get("id").is_none() {
-                return StatusCode::UNAUTHORIZED.into_response();
+                return (StatusCode::UNAUTHORIZED, challenge).into_response();
             }
             return (
                 StatusCode::UNAUTHORIZED,
+                challenge,
                 rpc_err(
                     id,
                     rpc_error::INVALID_REQUEST,
@@ -207,7 +216,7 @@ pub(crate) async fn authenticate(state: &PlatformState, headers: &HeaderMap) -> 
     // 2. API key (hashed lookup). Its `scopes` constrain the AI/machine
     //    principal (the AI axis) to a subset of the creating user's role.
     let key_hash = auth::hash_token(token);
-    let row = sqlx::query_as::<_, (Uuid, Uuid, Vec<String>)>(
+    let api_row = sqlx::query_as::<_, (Uuid, Uuid, Vec<String>)>(
         "SELECT tenant_id, created_by, scopes FROM api_keys
          WHERE key_hash = $1 AND is_active = TRUE
          AND (expires_at IS NULL OR expires_at > NOW())",
@@ -215,28 +224,36 @@ pub(crate) async fn authenticate(state: &PlatformState, headers: &HeaderMap) -> 
     .bind(&key_hash)
     .fetch_optional(&state.db)
     .await
-    .ok()??;
-    let (tenant_id, created_by, key_scopes) = row;
+    .ok()
+    .flatten();
 
-    let (role, tenant_slug) = sqlx::query_as::<_, (String, String)>(
-        "SELECT u.role, t.slug FROM users u
-         JOIN tenants t ON u.tenant_id = t.id
-         WHERE u.id = $1",
-    )
-    .bind(created_by)
-    .fetch_optional(&state.db)
-    .await
-    .ok()??;
+    if let Some((tenant_id, created_by, key_scopes)) = api_row {
+        if let Some((role, tenant_slug)) = sqlx::query_as::<_, (String, String)>(
+            "SELECT u.role, t.slug FROM users u
+             JOIN tenants t ON u.tenant_id = t.id
+             WHERE u.id = $1",
+        )
+        .bind(created_by)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten()
+        {
+            return Some(Claims {
+                sub: created_by.to_string(),
+                tenant_id: tenant_id.to_string(),
+                role,
+                tenant_slug,
+                iat: chrono::Utc::now().timestamp(),
+                exp: chrono::Utc::now().timestamp() + 3600,
+                scopes: Some(key_scopes),
+            });
+        }
+    }
 
-    Some(Claims {
-        sub: created_by.to_string(),
-        tenant_id: tenant_id.to_string(),
-        role,
-        tenant_slug,
-        iat: chrono::Utc::now().timestamp(),
-        exp: chrono::Utc::now().timestamp() + 3600,
-        scopes: Some(key_scopes),
-    })
+    // 3. OAuth 2.1 access token (Connectors flow: Claude web/mobile/Desktop).
+    //    Resolves to Claims with role-capped scopes, exactly like an api_key.
+    crate::oauth::claims_for_access_token(state, token).await
 }
 
 /// Resolve the tenant a tool call operates on. Non-admins are pinned to their
