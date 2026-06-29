@@ -191,6 +191,7 @@ pub fn routes() -> Router<PlatformState> {
         .route("/admin/tenants", get(list_tenants))
         .route("/admin/tenants/{id}", get(get_tenant))
         .route("/admin/tenants/{id}/upgrade", post(upgrade_plan))
+        .route("/admin/users/reset-link", post(generate_reset_link))
         .route("/admin/tenants/{id}/provision", post(provision_harness))
         .route("/admin/harnesses/{id}/restart", post(restart_harness))
         .route("/admin/harnesses/{id}/redeploy", post(redeploy_harness))
@@ -581,6 +582,83 @@ async fn upgrade_plan(
         plan: plan.clone(),
         max_harnesses: req.max_harnesses,
         updated_at: Utc::now(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct ResetLinkRequest {
+    email: String,
+}
+
+#[derive(Serialize)]
+struct ResetLinkResponse {
+    reset_url: String,
+    expires_at: DateTime<Utc>,
+}
+
+/// POST /api/v1/admin/users/reset-link
+///
+/// Admin-only: mint a single-use password-reset link for a user, identified by
+/// email. The link is returned here so an admin can deliver it out of band
+/// (there is no mailer yet). Only the token hash is stored; the raw token lives
+/// only in the returned URL.
+async fn generate_reset_link(
+    _auth: AdminAuth,
+    State(state): State<PlatformState>,
+    Json(req): Json<ResetLinkRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let email = req.email.trim();
+    let user_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM users
+         WHERE email = $1 AND is_active = TRUE AND password_hash NOT LIKE '!%'
+         ORDER BY is_active DESC LIMIT 1",
+    )
+    .bind(email)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Lookup failed: {e}"),
+            }),
+        )
+    })?;
+
+    let user_id = user_id.ok_or((
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "user not found".into(),
+        }),
+    ))?;
+
+    let (raw, hash) = crate::auth::generate_reset_token();
+    let (expires_at,): (DateTime<Utc>,) = sqlx::query_as(
+        "INSERT INTO password_reset_tokens (user_id, token_hash, expires_at)
+         VALUES ($1, $2, NOW() + INTERVAL '24 hours')
+         RETURNING expires_at",
+    )
+    .bind(user_id)
+    .bind(&hash)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to create token: {e}"),
+            }),
+        )
+    })?;
+
+    let reset_url = format!(
+        "{}/reset-password?token={}",
+        crate::routes::ui::public_app_url(),
+        raw
+    );
+    Ok(Json(ResetLinkResponse {
+        reset_url,
+        expires_at,
     }))
 }
 

@@ -152,6 +152,46 @@ pub fn validate_api_key_hash(provided_key: &str, stored_hash: &str) -> bool {
     hash_token(provided_key) == stored_hash
 }
 
+// ── Password Reset Tokens ─────────────────────────────────────────────────
+
+/// How long a password-reset token stays valid. Tokens are delivered out of
+/// band (an admin hands the user the link), so the window is generous: 24h.
+pub const RESET_TOKEN_TTL_SECS: i64 = 24 * 60 * 60;
+
+/// Generate a password-reset token. Returns `(raw, hash)`: the raw token goes
+/// in the reset URL (shown once), only the hash is stored in the database — so
+/// a leaked database row can't be turned back into a working link.
+pub fn generate_reset_token() -> (String, String) {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let bytes: Vec<u8> = (0..32).map(|_| rng.gen::<u8>()).collect();
+    let raw = base64_url_encode(&bytes);
+    let hash = hash_token(&raw);
+    (raw, hash)
+}
+
+/// Whether a reset-token row is currently usable: not yet consumed and not
+/// expired. (DB queries enforce this too; this keeps the rule unit-testable.)
+pub fn reset_token_is_usable(
+    used_at: Option<chrono::DateTime<Utc>>,
+    expires_at: chrono::DateTime<Utc>,
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    used_at.is_none() && expires_at > now
+}
+
+/// Validate a chosen new password: minimum length and confirmation match.
+/// Returns the reason on failure so callers can surface it directly.
+pub fn validate_new_password(new_password: &str, confirm: &str) -> Result<(), &'static str> {
+    if new_password.len() < 8 {
+        return Err("Password must be at least 8 characters.");
+    }
+    if new_password != confirm {
+        return Err("Passwords do not match.");
+    }
+    Ok(())
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 fn base64_url_encode(bytes: &[u8]) -> String {
@@ -182,6 +222,39 @@ mod tests {
         let hash = hash_password(password).unwrap();
         assert!(verify_password(password, &hash).unwrap());
         assert!(!verify_password("wrong-password", &hash).unwrap());
+    }
+
+    #[test]
+    fn reset_token_raw_hashes_to_stored() {
+        let (raw, hash) = generate_reset_token();
+        // The lookup recomputes the hash from the raw token in the URL.
+        assert_eq!(hash_token(&raw), hash);
+        // Two tokens never collide.
+        let (raw2, hash2) = generate_reset_token();
+        assert_ne!(raw, raw2);
+        assert_ne!(hash, hash2);
+    }
+
+    #[test]
+    fn reset_token_usability_respects_expiry_and_use() {
+        let now = Utc::now();
+        let future = now + Duration::seconds(60);
+        let past = now - Duration::seconds(60);
+        // Fresh, unexpired, unused → usable.
+        assert!(reset_token_is_usable(None, future, now));
+        // Expired → not usable.
+        assert!(!reset_token_is_usable(None, past, now));
+        // Already used → not usable (single-use).
+        assert!(!reset_token_is_usable(Some(now), future, now));
+    }
+
+    #[test]
+    fn new_password_validation() {
+        assert!(validate_new_password("longenough", "longenough").is_ok());
+        // Too short.
+        assert!(validate_new_password("short", "short").is_err());
+        // Mismatch.
+        assert!(validate_new_password("longenough", "different1").is_err());
     }
 
     #[test]

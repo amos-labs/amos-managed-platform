@@ -5,7 +5,7 @@
 
 use askama::Template;
 use axum::{
-    extract::{Form, Path, State},
+    extract::{Form, Path, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -300,12 +300,34 @@ async fn resolve_harness_database(
 struct LoginTemplate {
     error: Option<String>,
     redirect: Option<String>,
+    /// Neutral notice from a `?msg=` query (e.g. after a password reset).
+    notice: Option<String>,
 }
 
 #[derive(Template)]
 #[template(path = "register.html")]
 struct RegisterTemplate {
     error: Option<String>,
+}
+
+#[derive(Template)]
+#[template(path = "forgot_password.html")]
+struct ForgotPasswordTemplate {
+    error: Option<String>,
+    /// Neutral confirmation shown after submit (no account enumeration).
+    message: Option<String>,
+}
+
+#[derive(Template)]
+#[template(path = "reset_password.html")]
+struct ResetPasswordTemplate {
+    /// The raw token, echoed into the form's hidden field. `None` when the link
+    /// is missing/invalid/expired (the page then renders an error state).
+    token: Option<String>,
+    error: Option<String>,
+    /// Whether to render the new-password form (a usable token) vs. the
+    /// invalid-link state.
+    valid: bool,
 }
 
 #[derive(Template)]
@@ -611,6 +633,31 @@ struct CreateApiKeyForm {
     scopes: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct ForgotPasswordForm {
+    email: String,
+}
+
+/// `?token=` on the reset-password page.
+#[derive(Deserialize)]
+struct ResetTokenQuery {
+    token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ResetPasswordForm {
+    token: String,
+    new_password: String,
+    confirm_password: String,
+}
+
+#[derive(Deserialize)]
+struct ChangePasswordForm {
+    current_password: String,
+    new_password: String,
+    confirm_password: String,
+}
+
 // ── Routes ──────────────────────────────────────────────────────────────
 
 /// Fetch a tenant's display name + slug, falling back to the claims slug.
@@ -849,6 +896,15 @@ pub fn routes() -> Router<PlatformState> {
         .route("/apps", get(apps_page))
         .route("/receipts", get(receipts_page))
         .route("/register", get(register_page).post(register_submit))
+        .route(
+            "/forgot-password",
+            get(forgot_password_page).post(forgot_password_submit),
+        )
+        .route(
+            "/reset-password",
+            get(reset_password_page).post(reset_password_submit),
+        )
+        .route("/settings/password", post(change_password_submit))
         .route("/dashboard", get(dashboard_page))
         .route("/dashboard/ask", post(dashboard_ask))
         .route("/settings", get(settings_page))
@@ -873,13 +929,17 @@ pub fn routes() -> Router<PlatformState> {
 // ── Login ───────────────────────────────────────────────────────────────
 
 async fn login_page(uri: axum::http::Uri) -> impl IntoResponse {
-    let redirect = uri
-        .query()
-        .and_then(|q| q.split('&').find_map(|p| p.strip_prefix("redirect=")))
-        .map(|v| urlencoding::decode(v).unwrap_or_default().into_owned());
+    let query = uri.query().unwrap_or_default();
+    let param = |key: &str| {
+        query
+            .split('&')
+            .find_map(|p| p.strip_prefix(&format!("{key}=")))
+            .map(|v| urlencoding::decode(v).unwrap_or_default().into_owned())
+    };
     HtmlTemplate(LoginTemplate {
         error: None,
-        redirect,
+        redirect: param("redirect"),
+        notice: param("msg"),
     })
 }
 
@@ -895,6 +955,7 @@ async fn login_submit(
         return HtmlTemplate(LoginTemplate {
             error: Some("Too many login attempts. Please wait a minute and try again.".into()),
             redirect: form.redirect.clone(),
+            notice: None,
         })
         .into_response();
     }
@@ -921,6 +982,7 @@ async fn login_submit(
             return HtmlTemplate(LoginTemplate {
                 error: Some("Invalid email or password.".into()),
                 redirect: form.redirect.clone(),
+                notice: None,
             })
             .into_response();
         }
@@ -929,6 +991,7 @@ async fn login_submit(
             return HtmlTemplate(LoginTemplate {
                 error: Some("An internal error occurred.".into()),
                 redirect: form.redirect.clone(),
+                notice: None,
             })
             .into_response();
         }
@@ -940,6 +1003,7 @@ async fn login_submit(
         return HtmlTemplate(LoginTemplate {
             error: Some("Account is deactivated.".into()),
             redirect: form.redirect.clone(),
+            notice: None,
         })
         .into_response();
     }
@@ -952,6 +1016,7 @@ async fn login_submit(
             return HtmlTemplate(LoginTemplate {
                 error: Some("An internal error occurred.".into()),
                 redirect: form.redirect.clone(),
+                notice: None,
             })
             .into_response();
         }
@@ -961,6 +1026,7 @@ async fn login_submit(
         return HtmlTemplate(LoginTemplate {
             error: Some("Invalid email or password.".into()),
             redirect: form.redirect.clone(),
+            notice: None,
         })
         .into_response();
     }
@@ -983,6 +1049,7 @@ async fn login_submit(
             return HtmlTemplate(LoginTemplate {
                 error: Some("An internal error occurred.".into()),
                 redirect: form.redirect.clone(),
+                notice: None,
             })
             .into_response();
         }
@@ -2627,6 +2694,20 @@ struct CheckoutForm {
     plan: Option<String>,
 }
 
+/// Public, browser-reachable base URL of the dashboard (no trailing slash),
+/// used to build Stripe redirect (success/cancel) URLs. Prefers
+/// `AMOS__PUBLIC__APP_URL`, then the provisioning `ECS_PLATFORM_URL`, and falls
+/// back to the prod host. Never derive this from `server.host:port` — in prod
+/// that is the bind address `0.0.0.0:4000`, unreachable from a browser.
+pub(crate) fn public_app_url() -> String {
+    std::env::var("AMOS__PUBLIC__APP_URL")
+        .or_else(|_| std::env::var("ECS_PLATFORM_URL"))
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim_end_matches('/').to_string())
+        .unwrap_or_else(|| "https://app.amoslabs.com".to_string())
+}
+
 /// `POST /billing/checkout` — create Stripe Checkout session for plan upgrade.
 async fn billing_checkout(
     State(state): State<PlatformState>,
@@ -2716,16 +2797,11 @@ async fn billing_checkout(
         }
     };
 
-    let base_url = format!(
-        "{}://{}:{}",
-        if state.config.server.port == 443 {
-            "https"
-        } else {
-            "http"
-        },
-        state.config.server.host,
-        state.config.server.port
-    );
+    // Stripe redirect URLs must be reachable from the customer's browser, so
+    // use the public dashboard URL — never `server.host:port`, which in prod is
+    // the bind address `0.0.0.0:4000` and would strand a paying customer on a
+    // dead page after checkout.
+    let base_url = public_app_url();
     // App-tier checkouts begin + cancel from the Apps page; harness-size
     // checkouts use the upgrade page.
     let is_app_tier = plan.starts_with("app_");
@@ -2828,6 +2904,273 @@ async fn logout_submit() -> Response {
     );
 
     ([(header::SET_COOKIE, cookie)], Redirect::to("/login")).into_response()
+}
+
+// ── Password reset (forgot) ───────────────────────────────────────────────
+
+async fn forgot_password_page() -> impl IntoResponse {
+    HtmlTemplate(ForgotPasswordTemplate {
+        error: None,
+        message: None,
+    })
+}
+
+/// Accept a forgot-password request. Responds with the SAME neutral message
+/// whether or not the email exists (no account enumeration) and never reveals
+/// the reset link here — the link is delivered out of band by an admin (see
+/// `admin::generate_reset_link`). If the email matches an active account we
+/// record a token so the request is auditable.
+async fn forgot_password_submit(
+    State(state): State<PlatformState>,
+    headers: axum::http::HeaderMap,
+    Form(form): Form<ForgotPasswordForm>,
+) -> Response {
+    let ip = extract_client_ip(&headers);
+    if is_rate_limited(&ip, 5, 300) {
+        warn!(ip = %ip, "Forgot-password rate limited");
+        return HtmlTemplate(ForgotPasswordTemplate {
+            error: Some("Too many requests. Please wait a few minutes.".into()),
+            message: None,
+        })
+        .into_response();
+    }
+
+    let email = form.email.trim();
+    if !email.is_empty() {
+        let user_id: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM users
+             WHERE email = $1 AND is_active = TRUE AND password_hash NOT LIKE '!%'
+             ORDER BY is_active DESC LIMIT 1",
+        )
+        .bind(email)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten();
+
+        if let Some(uid) = user_id {
+            let (_raw, hash) = auth::generate_reset_token();
+            let _ = sqlx::query(
+                "INSERT INTO password_reset_tokens (user_id, token_hash, expires_at)
+                 VALUES ($1, $2, NOW() + INTERVAL '24 hours')",
+            )
+            .bind(uid)
+            .bind(&hash)
+            .execute(&state.db)
+            .await;
+            info!(user_id = %uid, "Password reset requested");
+        }
+    }
+
+    HtmlTemplate(ForgotPasswordTemplate {
+        error: None,
+        message: Some(
+            "If an account exists for that email, your administrator will provide a reset link."
+                .into(),
+        ),
+    })
+    .into_response()
+}
+
+/// Render the reset form for a token in the URL. Shows an error state when the
+/// token is missing, unknown, expired, or already used.
+async fn reset_password_page(
+    State(state): State<PlatformState>,
+    Query(q): Query<ResetTokenQuery>,
+) -> Response {
+    let token = q.token.unwrap_or_default();
+    if token.is_empty() {
+        return invalid_reset_link();
+    }
+    let hash = auth::hash_token(&token);
+    let exists: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM password_reset_tokens
+         WHERE token_hash = $1 AND used_at IS NULL AND expires_at > NOW() LIMIT 1",
+    )
+    .bind(&hash)
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten();
+
+    if exists.is_some() {
+        HtmlTemplate(ResetPasswordTemplate {
+            token: Some(token),
+            error: None,
+            valid: true,
+        })
+        .into_response()
+    } else {
+        invalid_reset_link()
+    }
+}
+
+fn invalid_reset_link() -> Response {
+    HtmlTemplate(ResetPasswordTemplate {
+        token: None,
+        error: Some("This reset link is invalid or has expired.".into()),
+        valid: false,
+    })
+    .into_response()
+}
+
+/// Consume a reset token and set a new password. Validates the token (unused +
+/// unexpired), sets the new hash, then marks every outstanding token for that
+/// user as used — so the link is single-use and siblings are invalidated.
+async fn reset_password_submit(
+    State(state): State<PlatformState>,
+    headers: axum::http::HeaderMap,
+    Form(form): Form<ResetPasswordForm>,
+) -> Response {
+    let ip = extract_client_ip(&headers);
+    if is_rate_limited(&ip, 5, 300) {
+        warn!(ip = %ip, "Reset-password rate limited");
+        return invalid_reset_link();
+    }
+
+    let render_err = |msg: &str| {
+        HtmlTemplate(ResetPasswordTemplate {
+            token: Some(form.token.clone()),
+            error: Some(msg.to_string()),
+            valid: true,
+        })
+        .into_response()
+    };
+
+    if let Err(reason) = auth::validate_new_password(&form.new_password, &form.confirm_password) {
+        return render_err(reason);
+    }
+
+    let hash = auth::hash_token(&form.token);
+    let user_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT user_id FROM password_reset_tokens
+         WHERE token_hash = $1 AND used_at IS NULL AND expires_at > NOW() LIMIT 1",
+    )
+    .bind(&hash)
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten();
+
+    let user_id = match user_id {
+        Some(id) => id,
+        None => return invalid_reset_link(),
+    };
+
+    let new_hash = match auth::hash_password(&form.new_password) {
+        Ok(h) => h,
+        Err(e) => {
+            error!("Password hashing failed: {}", e);
+            return render_err("An internal error occurred.");
+        }
+    };
+
+    let updated = sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
+        .bind(&new_hash)
+        .bind(user_id)
+        .execute(&state.db)
+        .await;
+    if let Err(e) = updated {
+        error!("Failed to update password on reset: {}", e);
+        return render_err("An internal error occurred.");
+    }
+
+    // Single-use + invalidate any other outstanding tokens for this user.
+    let _ = sqlx::query(
+        "UPDATE password_reset_tokens SET used_at = NOW()
+         WHERE user_id = $1 AND used_at IS NULL",
+    )
+    .bind(user_id)
+    .execute(&state.db)
+    .await;
+
+    info!(user_id = %user_id, "Password reset completed");
+    Redirect::to("/login?msg=Password+reset.+Please+sign+in.").into_response()
+}
+
+/// Change the signed-in user's password (requires the current password).
+async fn change_password_submit(
+    State(state): State<PlatformState>,
+    headers: axum::http::HeaderMap,
+    Form(form): Form<ChangePasswordForm>,
+) -> Response {
+    let claims = match extract_session_claims(&state, &headers) {
+        Some(c) => c,
+        None => return Redirect::to("/login").into_response(),
+    };
+    let user_id: Uuid = match claims.sub.parse() {
+        Ok(id) => id,
+        Err(_) => return Redirect::to("/login").into_response(),
+    };
+
+    let current_hash: Option<String> =
+        sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten();
+
+    let current_hash = match current_hash {
+        Some(h) => h,
+        None => return Redirect::to("/login").into_response(),
+    };
+
+    match auth::verify_password(&form.current_password, &current_hash) {
+        Ok(true) => {}
+        Ok(false) => {
+            return settings_page_inner(
+                &state,
+                &headers,
+                None,
+                Some("Current password is incorrect.".into()),
+            )
+            .await;
+        }
+        Err(e) => {
+            error!("Password verification error: {}", e);
+            return settings_page_inner(
+                &state,
+                &headers,
+                None,
+                Some("An internal error occurred.".into()),
+            )
+            .await;
+        }
+    }
+
+    if let Err(reason) = auth::validate_new_password(&form.new_password, &form.confirm_password) {
+        return settings_page_inner(&state, &headers, None, Some(reason.into())).await;
+    }
+
+    let new_hash = match auth::hash_password(&form.new_password) {
+        Ok(h) => h,
+        Err(e) => {
+            error!("Password hashing failed: {}", e);
+            return settings_page_inner(
+                &state,
+                &headers,
+                None,
+                Some("An internal error occurred.".into()),
+            )
+            .await;
+        }
+    };
+
+    let updated = sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
+        .bind(&new_hash)
+        .bind(user_id)
+        .execute(&state.db)
+        .await;
+
+    let flash = match updated {
+        Ok(_) => "Password updated.",
+        Err(e) => {
+            error!("Failed to update password: {}", e);
+            "An internal error occurred."
+        }
+    };
+    settings_page_inner(&state, &headers, None, Some(flash.into())).await
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
