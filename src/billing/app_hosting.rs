@@ -128,8 +128,8 @@ impl AppHostingTier {
     /// Compliance $50. Overage is purchasable; no rollover.
     pub fn monthly_ai_credit_microcents(&self) -> i64 {
         match self {
-            AppHostingTier::Starter => 100_000,   // $10
-            AppHostingTier::Pro => 250_000,       // $25
+            AppHostingTier::Starter => 100_000,    // $10
+            AppHostingTier::Pro => 250_000,        // $25
             AppHostingTier::Compliance => 500_000, // $50
         }
     }

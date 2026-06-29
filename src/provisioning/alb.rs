@@ -248,6 +248,115 @@ impl AlbRouter {
         }
     }
 
+    /// Create a target group + host-header listener rule for an ECS **service**
+    /// (no static IP registration — the service registers/deregisters its own
+    /// task IPs as it rolls). Used by `provision_env` to give an isolated env
+    /// its own `{subdomain}.{domain}` ingress on the shared HTTPS listener.
+    pub async fn setup_service_routing(
+        &self,
+        subdomain: &str,
+        port: u16,
+        health_check_path: &str,
+    ) -> Result<AlbRoutingResult> {
+        let tg_name = format!("env-{}", truncate_for_tg_name(subdomain));
+
+        // 1. IP-type target group (the ECS service binds to it and manages targets).
+        let create_tg_result = self
+            .client
+            .create_target_group()
+            .name(&tg_name)
+            .protocol(aws_sdk_elasticloadbalancingv2::types::ProtocolEnum::Http)
+            .port(port as i32)
+            .vpc_id(&self.vpc_id)
+            .target_type(TargetTypeEnum::Ip)
+            .health_check_enabled(true)
+            .health_check_path(health_check_path)
+            .matcher(
+                aws_sdk_elasticloadbalancingv2::types::Matcher::builder()
+                    .http_code("200-399")
+                    .build(),
+            )
+            .health_check_interval_seconds(30)
+            .healthy_threshold_count(2)
+            .unhealthy_threshold_count(3)
+            .send()
+            .await
+            .map_err(|e| AmosError::Internal(format!("Failed to create target group: {}", e)))?;
+
+        let target_group_arn = create_tg_result
+            .target_groups()
+            .first()
+            .and_then(|tg| tg.target_group_arn())
+            .ok_or_else(|| AmosError::Internal("Target group ARN missing from response".into()))?
+            .to_string();
+        info!(tg_arn = %target_group_arn, name = %tg_name, "Env target group created");
+
+        // 2. Host-based listener rule → target group.
+        let priority = self.next_available_priority().await?;
+        let host_header = format!("{}.{}", subdomain, self.domain_suffix);
+        let create_rule_result = self
+            .client
+            .create_rule()
+            .listener_arn(&self.listener_arn)
+            .priority(priority)
+            .conditions(
+                RuleCondition::builder()
+                    .field("host-header")
+                    .values(&host_header)
+                    .build(),
+            )
+            .actions(
+                Action::builder()
+                    .r#type(ActionTypeEnum::Forward)
+                    .forward_config(
+                        ForwardActionConfig::builder()
+                            .target_groups(
+                                TargetGroupTuple::builder()
+                                    .target_group_arn(&target_group_arn)
+                                    .weight(1)
+                                    .build(),
+                            )
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await;
+
+        match create_rule_result {
+            Ok(result) => {
+                let listener_rule_arn = result
+                    .rules()
+                    .first()
+                    .and_then(|r| r.rule_arn())
+                    .ok_or_else(|| {
+                        AmosError::Internal("Listener rule ARN missing from response".into())
+                    })?
+                    .to_string();
+                let public_url = self.public_url(subdomain);
+                info!(rule_arn = %listener_rule_arn, host = %host_header, priority, url = %public_url, "Env listener rule created");
+                Ok(AlbRoutingResult {
+                    target_group_arn,
+                    listener_rule_arn,
+                    public_url,
+                })
+            }
+            Err(e) => {
+                warn!("Failed to create env listener rule, cleaning up target group");
+                let _ = self
+                    .client
+                    .delete_target_group()
+                    .target_group_arn(&target_group_arn)
+                    .send()
+                    .await;
+                Err(AmosError::Internal(format!(
+                    "Failed to create listener rule: {}",
+                    e
+                )))
+            }
+        }
+    }
+
     /// Remove the listener rule and delete the target group.
     pub async fn teardown_routing(
         &self,

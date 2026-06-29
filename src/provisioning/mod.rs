@@ -6,8 +6,11 @@ pub mod app_spec;
 pub mod aws_app;
 pub mod compose_intake;
 pub mod db;
+pub mod db_query;
 pub mod ecs;
+pub mod env_provision;
 pub mod image_builder;
+pub mod manifest;
 
 use bollard::{
     container::{

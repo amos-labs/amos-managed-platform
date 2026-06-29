@@ -157,6 +157,43 @@ pub async fn drop_harness_database(base_url: &str, db_name: &str) {
     }
 }
 
+/// Create a database by explicit name on the RDS at `base_url` (admin creds).
+/// Idempotent. Validates the name is a plain identifier. Returns the connection
+/// URL for the new database. Unlike `create_harness_database` it does NOT install
+/// pgvector — app environments run their own migrations. Used by `provision_env`
+/// for the shared-instance (standard-tier) data-isolation path.
+pub async fn create_named_database(base_url: &str, db_name: &str) -> Result<String> {
+    if db_name.is_empty()
+        || !db_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(AmosError::Validation(format!(
+            "invalid database name '{db_name}' (letters, digits, underscore only)"
+        )));
+    }
+    let opts = admin_connect_options(base_url)?;
+    let mut conn = PgConnection::connect_with(&opts.disable_statement_logging())
+        .await
+        .map_err(|e| AmosError::Internal(format!("connect to postgres DB: {e}")))?;
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)")
+            .bind(db_name)
+            .fetch_one(&mut conn)
+            .await
+            .map_err(|e| AmosError::Internal(format!("check db existence: {e}")))?;
+    if exists {
+        info!(db_name = %db_name, "env database already exists, reusing");
+    } else {
+        sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
+            .execute(&mut conn)
+            .await
+            .map_err(|e| AmosError::Internal(format!("create database '{db_name}': {e}")))?;
+        info!(db_name = %db_name, "created env database");
+    }
+    Ok(database_url_for_harness(base_url, db_name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -515,22 +515,46 @@ pub async fn app_status(
                 .unwrap_or_else(|e| json!({ "error": format!("ECS status unavailable: {e}") })),
             None => json!({ "error": "AWS app provisioner not available" }),
         };
-        let svc_rows = sqlx::query_as::<_, (String, bool, String)>(
-            "SELECT service_name, expose_public, status FROM app_services
+        let svc_rows = sqlx::query_as::<_, (String, bool, String, Option<String>)>(
+            "SELECT service_name, expose_public, status, image FROM app_services
              WHERE deployment_id = $1 ORDER BY service_name",
         )
         .bind(deployment_id)
         .fetch_all(&state.db)
         .await
         .map_err(AmosError::Database)?;
+        // Success signal: the most recent deploy receipt for THIS deployment.
+        // Under the moving-tag model the ECS task-def revision doesn't change on
+        // redeploy, so the *verified deploy receipt* — not the revision — is the
+        // real "did it work" signal callers should key on.
+        let last_deploy: Option<(String, bool, Value, String)> = sqlx::query_as(
+            "SELECT operation, verified, receipt, created_at::text FROM operation_receipts
+             WHERE tenant_id = $1 AND operation IN ('deploy','deploy_app','app_redeploy')
+               AND receipt->'inputs'->>'deployment_id' = $2
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(tenant_id)
+        .bind(deployment_id.to_string())
+        .fetch_optional(&state.db)
+        .await
+        .map_err(AmosError::Database)?;
+        let last_deploy_json = last_deploy.map(|(op, verified, receipt, at)| {
+            json!({
+                "operation": op,
+                "verified": verified,
+                "summary": receipt.get("summary").cloned().unwrap_or(Value::Null),
+                "at": at,
+            })
+        });
         return Ok(json!({
             "deployment_id": deployment_id,
             "name": name,
             "provider": "aws",
             "status": db_status,
             "aws": aws,
-            "services": svc_rows.iter().map(|(n, pub_, st)| json!({
-                "service_name": n, "expose_public": pub_, "db_status": st,
+            "last_deploy": last_deploy_json,
+            "services": svc_rows.iter().map(|(n, pub_, st, img)| json!({
+                "service_name": n, "expose_public": pub_, "db_status": st, "image": img,
             })).collect::<Vec<_>>(),
         }));
     }
