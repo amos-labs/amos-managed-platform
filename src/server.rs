@@ -54,6 +54,9 @@ pub fn build_http_router(state: PlatformState) -> Router {
         )
         // MCP control plane: Claude Code operates AMOS envs via JSON-RPC over HTTP at /mcp
         .merge(crate::mcp::routes())
+        // OAuth 2.1 + PKCE connector: discovery, DCR, authorize/consent, token —
+        // lets Claude web/mobile/Desktop connect via the Connectors flow.
+        .merge(crate::oauth::routes())
         // Root path: redirect browsers to login, serve API catalog for agents
         .route("/", axum::routing::get(routes::discovery::root_handler))
         .nest("/api/v1", api_routes)

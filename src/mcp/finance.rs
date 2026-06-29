@@ -106,6 +106,7 @@ fn exec_err(e: anyhow::Error) -> ToolError {
 /// Emit a proof receipt for a finance **write**. Reads never call this — only
 /// the six mutating verbs do, so every change to a tenant's finances is
 /// accountable (operation = the verb, scope = the finance scope it required).
+#[allow(clippy::too_many_arguments)]
 async fn emit_write_receipt(
     state: &PlatformState,
     tenant_id: Uuid,

@@ -1000,6 +1000,15 @@ async fn login_submit(
         SESSION_COOKIE, token, access_expiry
     );
 
+    // Same-origin relative return path (e.g. the OAuth authorize round-trip):
+    // the session cookie is now set, so just bounce back to it. Restricted to
+    // a leading "/oauth/" to avoid open-redirect / off-site targets.
+    if let Some(ref redirect_url) = form.redirect {
+        if redirect_url.starts_with("/oauth/") {
+            return ([(header::SET_COOKIE, cookie)], Redirect::to(redirect_url)).into_response();
+        }
+    }
+
     // If a redirect URL was provided (e.g., from a harness), redirect there
     // with the token so the harness can set its own session cookie.
     if let Some(ref redirect_url) = form.redirect {

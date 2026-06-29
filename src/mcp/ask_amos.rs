@@ -217,49 +217,6 @@ pub async fn run(state: &PlatformState, claims: &Claims, prompt: &str) -> Result
     }))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{document_to_json, json_to_document, READ_ONLY_TOOLS};
-    use serde_json::json;
-
-    #[test]
-    fn json_document_round_trips() {
-        let v = json!({
-            "deployment_id": "abc",
-            "max_rows": 100,
-            "dry_run": false,
-            "nested": {"keys": ["a", "b"], "n": -3, "f": 1.5, "nil": null},
-        });
-        let back = document_to_json(&json_to_document(&v));
-        assert_eq!(v, back);
-    }
-
-    #[test]
-    fn allowlist_is_read_only() {
-        // None of the mutating verbs may be in the autonomous toolset.
-        for forbidden in [
-            "deploy",
-            "deploy_app",
-            "app_redeploy",
-            "app_control",
-            "provision_env",
-            "teardown_env",
-            "db_write",
-            "s3_put",
-            "s3_delete",
-            "build_image",
-            "provision_harness",
-            "harness_control",
-            "set_harness_config",
-        ] {
-            assert!(
-                !READ_ONLY_TOOLS.contains(&forbidden),
-                "{forbidden} must not be exposed"
-            );
-        }
-    }
-}
-
 fn json_to_document(v: &Value) -> Document {
     match v {
         Value::Null => Document::Null,
@@ -300,6 +257,49 @@ fn document_to_json(d: &Document) -> Value {
                 m.insert(k.clone(), document_to_json(v));
             }
             Value::Object(m)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{document_to_json, json_to_document, READ_ONLY_TOOLS};
+    use serde_json::json;
+
+    #[test]
+    fn json_document_round_trips() {
+        let v = json!({
+            "deployment_id": "abc",
+            "max_rows": 100,
+            "dry_run": false,
+            "nested": {"keys": ["a", "b"], "n": -3, "f": 1.5, "nil": null},
+        });
+        let back = document_to_json(&json_to_document(&v));
+        assert_eq!(v, back);
+    }
+
+    #[test]
+    fn allowlist_is_read_only() {
+        // None of the mutating verbs may be in the autonomous toolset.
+        for forbidden in [
+            "deploy",
+            "deploy_app",
+            "app_redeploy",
+            "app_control",
+            "provision_env",
+            "teardown_env",
+            "db_write",
+            "s3_put",
+            "s3_delete",
+            "build_image",
+            "provision_harness",
+            "harness_control",
+            "set_harness_config",
+        ] {
+            assert!(
+                !READ_ONLY_TOOLS.contains(&forbidden),
+                "{forbidden} must not be exposed"
+            );
         }
     }
 }

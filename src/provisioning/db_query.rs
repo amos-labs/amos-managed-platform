@@ -85,6 +85,7 @@ pub struct WriteOutcome {
 ///   - INSERT / UPDATE / DELETE only — DDL (DROP/ALTER/CREATE/TRUNCATE) and
 ///     SELECT are rejected; schema changes belong in the app's migrations
 ///   - UPDATE/DELETE must carry a WHERE unless `allow_unfiltered`
+///
 /// We append `RETURNING *` when absent and wrap as a data-modifying CTE
 /// (`WITH _w AS (<dml> RETURNING *) SELECT to_jsonb(_w) ...`) so we capture the
 /// exact rows changed and their count. Values should be passed as bound params
@@ -239,6 +240,7 @@ pub async fn run_write_dml(
 ///      (`db_host`/`db_user`/`db_name`/`db_port`), falling back to the secret's
 ///      `PGHOST`/`PGUSER`/`PGDATABASE`/`PGPORT`; the password is read from the
 ///      secret at `aws_meta.db_password_key` (default `PGPASSWORD`).
+///
 /// Returns `None` if no connection can be derived. Never logs the URL.
 pub fn resolve_db_url(aws_meta: &serde_json::Value, secret_json: &str) -> Option<String> {
     let meta = |k: &str| {
