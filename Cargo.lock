@@ -145,6 +145,7 @@ dependencies = [
  "aws-sdk-elasticloadbalancingv2",
  "aws-sdk-s3",
  "aws-sdk-secretsmanager",
+ "aws-sdk-sesv2",
  "aws-smithy-types",
  "axum",
  "axum-extra",
@@ -898,6 +899,30 @@ name = "aws-sdk-secretsmanager"
 version = "1.102.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c9e9668477f18fd7ef9c606a3be827051f0c14030ccb5e6d3958f66c7956cd20"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http 0.63.6",
+ "aws-smithy-json 0.62.5",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand 2.3.0",
+ "http 0.2.12",
+ "http 1.4.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sdk-sesv2"
+version = "1.116.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f14902ebaf4f7eb18fd279f9622302e41240f290d808ea0eb3a759e984251d67"
 dependencies = [
  "aws-credential-types",
  "aws-runtime",

@@ -30,6 +30,7 @@
 
 pub mod auth;
 pub mod billing;
+pub mod email;
 pub mod governance;
 pub mod mcp;
 pub mod middleware;

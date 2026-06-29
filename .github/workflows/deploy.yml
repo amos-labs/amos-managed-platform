@@ -24,20 +24,6 @@ env:
 
 jobs:
   # ============================================================================
-  # PROBE: confirm GitHub-hosted arm64 runners are available to this repo.
-  # The deploy job builds on arm64 (Fargate runs arm64); this proves the runner
-  # exists before a merge relies on it. Safe to remove once deploys are proven.
-  # ============================================================================
-  arm-runner-check:
-    name: arm64 runner probe
-    runs-on: ubuntu-24.04-arm
-    steps:
-      - name: Report architecture
-        run: |
-          echo "arch=$(uname -m)"   # expect aarch64
-          test "$(uname -m)" = "aarch64"
-
-  # ============================================================================
   # GATE 1: Lint + Unit Tests + Security Audit
   # ============================================================================
   check:
