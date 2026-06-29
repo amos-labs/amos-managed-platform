@@ -2,7 +2,10 @@
 # Central managed hosting, governance, billing
 
 # Stage 1: Builder
-FROM rust:bookworm AS builder
+# Pull official base images from the ECR Public mirror (public.ecr.aws/docker/library/*)
+# rather than Docker Hub — avoids anonymous-pull 429 rate limits in CodeBuild and
+# removes the Docker Hub dependency entirely.
+FROM public.ecr.aws/docker/library/rust:bookworm AS builder
 
 WORKDIR /app
 
@@ -18,7 +21,7 @@ RUN CARGO_PROFILE_RELEASE_LTO=thin \
     cargo build --release --bin amos-platform
 
 # Stage 2: Runtime
-FROM debian:bookworm-slim
+FROM public.ecr.aws/docker/library/debian:bookworm-slim
 
 # Install runtime dependencies
 RUN apt-get update && \

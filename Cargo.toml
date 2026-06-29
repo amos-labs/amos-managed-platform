@@ -58,6 +58,9 @@ uuid = { version = "1.11", features = ["v4", "serde"] }
 thiserror = "2.0"
 anyhow = "1.0"
 
+# Async traits (dyn-dispatchable engine client boundaries)
+async-trait = "0.1"
+
 # Observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
@@ -79,6 +82,11 @@ aws-sdk-codebuild = "1"
 aws-sdk-s3 = "1"
 aws-sdk-ecr = "1"
 aws-sdk-cloudwatchlogs = "1"
+# Governed db_query: read the tenant app DB connection secret at query time.
+aws-sdk-secretsmanager = "1"
+# ask_amos: embedded Bedrock (Claude) manager loop over the read-only control verbs.
+aws-sdk-bedrockruntime = "1"
+aws-smithy-types = "1"
 # Usage metering: per-service CpuReserved/MemoryReserved/NetworkTxBytes from
 # Container Insights -> exact unit-hours + egress for app-hosting billing.
 aws-sdk-cloudwatch = "1"

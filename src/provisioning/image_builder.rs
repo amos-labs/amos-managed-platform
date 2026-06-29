@@ -28,16 +28,26 @@ use amos_core::{AmosError, Result};
 /// regardless of any `buildspec.yml` in the source context. Each command is a
 /// double-quoted YAML scalar — colons inside (e.g. `name:tag`, `args:`) are
 /// then safe (an unquoted scalar with `: ` is parsed as a map key).
+///
+/// **Layer caching:** builds run with BuildKit and `--cache-from` the image's
+/// own previous tag (pulled best-effort first; `BUILDKIT_INLINE_CACHE=1` on
+/// every push embeds the cache metadata so the *next* build can reuse it). When
+/// a `BASE_IMAGE` build-arg is present, that base is also a cache source via
+/// `$CACHE_FROM_BASE`. Net: an unchanged ML base is a near-instant cache hit
+/// instead of a from-scratch rebuild — the long pole that timed out cold Cuspr
+/// deploys. First build of a tag is a cache miss (pulls fail → `|| true`).
 const BUILDSPEC: &str = r#"version: 0.2
 phases:
   pre_build:
     commands:
       - "aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY"
       - "aws ecr describe-repositories --repository-names \"$IMAGE_NAME\" >/dev/null 2>&1 || aws ecr create-repository --repository-name \"$IMAGE_NAME\" >/dev/null"
+      - "docker pull \"$ECR_REGISTRY/$IMAGE_NAME:$IMAGE_TAG\" 2>/dev/null || true"
+      - "if [ -n \"$CACHE_FROM_BASE\" ]; then docker pull \"$CACHE_FROM_BASE\" 2>/dev/null || true; fi"
   build:
     commands:
-      - "echo Building $ECR_REGISTRY/$IMAGE_NAME:$IMAGE_TAG arm64 from $DOCKERFILE"
-      - "docker build --platform linux/arm64 $BUILD_ARGS -f \"$DOCKERFILE\" -t \"$ECR_REGISTRY/$IMAGE_NAME:$IMAGE_TAG\" \"$BUILD_CONTEXT\""
+      - "echo Building $ECR_REGISTRY/$IMAGE_NAME:$IMAGE_TAG arm64 from $DOCKERFILE with buildkit cache-from"
+      - "CACHE=\"--cache-from $ECR_REGISTRY/$IMAGE_NAME:$IMAGE_TAG\"; if [ -n \"$CACHE_FROM_BASE\" ]; then CACHE=\"$CACHE --cache-from $CACHE_FROM_BASE\"; fi; DOCKER_BUILDKIT=1 docker build --platform linux/arm64 $CACHE --build-arg BUILDKIT_INLINE_CACHE=1 $BUILD_ARGS -f \"$DOCKERFILE\" -t \"$ECR_REGISTRY/$IMAGE_NAME:$IMAGE_TAG\" \"$BUILD_CONTEXT\""
   post_build:
     commands:
       - "docker push \"$ECR_REGISTRY/$IMAGE_NAME:$IMAGE_TAG\""
@@ -83,11 +93,20 @@ impl ImageBuilderConfig {
     }
 }
 
-/// What to build: a context directory + the Dockerfile within it.
+/// What to build. Source is either a **local context dir** (zipped → S3, the
+/// original path) or a **git repo + ref** (CodeBuild clones it directly — the
+/// path CI uses, since a remote caller has no path on the platform host).
 #[derive(Debug, Clone)]
 pub struct BuildRequest {
     /// Absolute path to the build context directory (on the platform host).
-    pub context_dir: PathBuf,
+    /// `None` when building from a git source (`git_repo`).
+    pub context_dir: Option<PathBuf>,
+    /// Git source URL (e.g. `https://github.com/org/repo.git`). When set, the
+    /// build clones the repo at `git_ref` instead of zipping `context_dir`.
+    /// Private repos require GitHub source credentials imported into CodeBuild.
+    pub git_repo: Option<String>,
+    /// Git ref to build (commit SHA, branch, or tag). Used with `git_repo`.
+    pub git_ref: Option<String>,
     /// Dockerfile path, relative to the context (e.g. `containers/app/Dockerfile`).
     pub dockerfile: String,
     /// ECR repository name to push to (e.g. `cuspr-api`). Created if absent.
@@ -164,41 +183,8 @@ impl ImageBuilder {
     /// Start a build: zip the context, upload to S3, and trigger CodeBuild.
     /// Returns the CodeBuild build id (poll it with [`Self::build_state`]).
     pub async fn start_build(&self, req: &BuildRequest) -> Result<String> {
-        if !req.context_dir.is_dir() {
-            return Err(AmosError::Validation(format!(
-                "build context dir does not exist: {}",
-                req.context_dir.display()
-            )));
-        }
-        if !req.context_dir.join(&req.dockerfile).is_file() {
-            return Err(AmosError::Validation(format!(
-                "dockerfile '{}' not found in context",
-                req.dockerfile
-            )));
-        }
-
-        // 1. Zip the context (honoring .gitignore/.dockerignore via `ignore`).
-        let key = format!("contexts/{}-{}.zip", req.image_name, Uuid::new_v4());
-        let zip_bytes = zip_context(&req.context_dir)?;
-        let zipped_len = zip_bytes.len();
-
-        // 2. Upload to the build-source bucket.
-        self.s3
-            .put_object()
-            .bucket(&self.source_bucket)
-            .key(&key)
-            .body(ByteStream::from(zip_bytes))
-            .send()
-            .await
-            .map_err(|e| AmosError::Internal(format!("failed to upload build context: {e}")))?;
-        info!(
-            key = %key,
-            bytes = zipped_len,
-            "build context uploaded"
-        );
-
-        // 3. Trigger CodeBuild with per-build env overrides.
-        // Render build args to space-separated `--build-arg K=V` tokens.
+        // Render build args to space-separated `--build-arg K=V` tokens (common
+        // to both source modes).
         let build_args = req
             .build_args
             .iter()
@@ -206,18 +192,79 @@ impl ImageBuilder {
             .collect::<Vec<_>>()
             .join(" ");
 
-        let build = self
+        // The base image (if any) is also a layer-cache source, so the buildspec
+        // can `--cache-from` it. Empty when this image has no base.
+        let cache_from_base = req
+            .build_args
+            .get("BASE_IMAGE")
+            .cloned()
+            .unwrap_or_default();
+
+        let mut sb = self
             .codebuild
             .start_build()
-            .project_name(&self.project_name)
-            .source_type_override(aws_sdk_codebuild::types::SourceType::S3)
-            .source_location_override(format!("{}/{}", self.source_bucket, key))
+            .project_name(&self.project_name);
+
+        match &req.git_repo {
+            // Git source: CodeBuild clones the repo at `git_ref` directly — no
+            // local context, no zip/upload. This is the path CI uses (a remote
+            // runner has no path on the platform host). Private repos require
+            // GitHub source credentials imported into CodeBuild
+            // (`aws codebuild import-source-credentials`).
+            Some(repo) => {
+                sb = sb
+                    .source_type_override(aws_sdk_codebuild::types::SourceType::Github)
+                    .source_location_override(repo);
+                if let Some(git_ref) = &req.git_ref {
+                    sb = sb.source_version(git_ref);
+                }
+                info!(repo = %repo, git_ref = ?req.git_ref, image = %req.image_name, "git-source build");
+            }
+            // Local context: zip → S3 → CodeBuild (the original path).
+            None => {
+                let context_dir = req.context_dir.as_ref().ok_or_else(|| {
+                    AmosError::Validation("context_dir is required when git_repo is not set".into())
+                })?;
+                if !context_dir.is_dir() {
+                    return Err(AmosError::Validation(format!(
+                        "build context dir does not exist: {}",
+                        context_dir.display()
+                    )));
+                }
+                if !context_dir.join(&req.dockerfile).is_file() {
+                    return Err(AmosError::Validation(format!(
+                        "dockerfile '{}' not found in context",
+                        req.dockerfile
+                    )));
+                }
+                let key = format!("contexts/{}-{}.zip", req.image_name, Uuid::new_v4());
+                let zip_bytes = zip_context(context_dir)?;
+                let zipped_len = zip_bytes.len();
+                self.s3
+                    .put_object()
+                    .bucket(&self.source_bucket)
+                    .key(&key)
+                    .body(ByteStream::from(zip_bytes))
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        AmosError::Internal(format!("failed to upload build context: {e}"))
+                    })?;
+                info!(key = %key, bytes = zipped_len, "build context uploaded");
+                sb = sb
+                    .source_type_override(aws_sdk_codebuild::types::SourceType::S3)
+                    .source_location_override(format!("{}/{}", self.source_bucket, key));
+            }
+        }
+
+        let build = sb
             .buildspec_override(BUILDSPEC)
             .environment_variables_override(env_override("IMAGE_NAME", &req.image_name))
             .environment_variables_override(env_override("IMAGE_TAG", &req.tag))
             .environment_variables_override(env_override("DOCKERFILE", &req.dockerfile))
             .environment_variables_override(env_override("BUILD_CONTEXT", "."))
             .environment_variables_override(env_override("BUILD_ARGS", &build_args))
+            .environment_variables_override(env_override("CACHE_FROM_BASE", &cache_from_base))
             .send()
             .await
             .map_err(|e| AmosError::Internal(format!("failed to start CodeBuild: {e}")))?;

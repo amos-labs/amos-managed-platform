@@ -114,6 +114,18 @@ pub struct PlatformState {
     pub stripe_client: Option<StripeClient>,
     /// Stripe configuration (price IDs, webhook secret).
     pub stripe_config: Option<StripeConfig>,
+    /// Finance engine backend (the reference governed business engine). Defaults
+    /// to a stub; swapped for an HTTP client against the extracted multi-tenant
+    /// finance service. The `finance_*` MCP verbs proxy to this behind `finance:*`
+    /// scopes + proof receipts.
+    pub finance: Arc<dyn crate::mcp::finance::FinanceEngineClient>,
+    /// In-flight manifest `deploy`s, keyed `deployment_id → deploy_id`, so a
+    /// second deploy for the same app returns `already_deploying` cleanly
+    /// instead of spawning a colliding job (which previously no-op'd into a
+    /// confusing `verified=false`). In-memory: correct at the current
+    /// single-instance scale; a Postgres advisory lock is the multi-instance
+    /// upgrade.
+    pub in_flight_deploys: Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, uuid::Uuid>>>,
 }
 
 impl PlatformState {
@@ -294,6 +306,20 @@ impl PlatformState {
             info!("Stripe not configured (AMOS__STRIPE__SECRET_KEY not set)");
         }
 
+        // Finance engine backend: proxy to Nuvola's existing MCP when configured
+        // (AMOS__NUVOLA__MCP_TOKEN), else the stub (dev / unconfigured).
+        let finance: Arc<dyn crate::mcp::finance::FinanceEngineClient> =
+            match crate::mcp::finance::HttpFinanceClient::from_env() {
+                Some(client) => {
+                    info!("Finance engine: proxying to Nuvola MCP");
+                    Arc::new(client)
+                }
+                None => {
+                    info!("Finance engine: using stub backend (AMOS__NUVOLA__MCP_TOKEN not set)");
+                    Arc::new(crate::mcp::finance::StubFinanceClient)
+                }
+            };
+
         Ok(Self {
             db,
             redis,
@@ -308,6 +334,8 @@ impl PlatformState {
             usage_meter,
             stripe_client,
             stripe_config,
+            finance,
+            in_flight_deploys: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         })
     }
 

@@ -24,6 +24,10 @@
 //! - Harness provisioning via Docker
 //! - Solana on-chain integration
 
+// Large `serde_json::json!` literals (e.g. env/deploy metadata objects) expand
+// past the default macro recursion limit of 128.
+#![recursion_limit = "256"]
+
 pub mod auth;
 pub mod billing;
 pub mod governance;

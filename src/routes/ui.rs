@@ -54,6 +54,8 @@ fn extract_client_ip(headers: &axum::http::HeaderMap) -> String {
 }
 
 /// Truncate a version/image tag for display (e.g., "sha-f73ede4..." → "sha-f73ed...").
+// Retained for the upcoming Apps/Receipts page redesign (version display).
+#[allow(dead_code)]
 fn truncate_version(v: &str) -> String {
     if v.len() > 16 {
         format!("{}...", &v[..13])
@@ -312,14 +314,20 @@ struct DashboardTemplate {
     tenant_name: String,
     tenant_slug: String,
     plan: String,
-    plan_price: String,
     stripe_subscription_status: String,
-    instances: Vec<HarnessInfo>,
+    /// Hosted apps + their services (the env at a glance).
+    apps: Vec<AppRow>,
+    /// Recent proof receipts (what the AI did) — newest first, capped.
+    receipts: Vec<ReceiptRow>,
+    /// Public MCP endpoint the operator points their AI at.
+    mcp_url: String,
+    /// Masked prefix of an existing API key (the full value is shown only once
+    /// at creation); `None` when the tenant has no key yet.
+    key_prefix: Option<String>,
     user_count: i64,
     api_key_count: i64,
     flash_message: Option<String>,
     flash_error: Option<String>,
-    billing_enabled: bool,
 }
 
 #[derive(Template)]
@@ -332,8 +340,10 @@ struct SettingsTemplate {
     stripe_subscription_status: String,
     has_stripe_customer: bool,
     api_keys: Vec<ApiKeyInfo>,
+    scope_groups: Vec<ScopeGroup>,
     users: Vec<UserInfo>,
     new_api_key: Option<String>,
+    mcp_url: String,
     flash_message: Option<String>,
 }
 
@@ -434,10 +444,13 @@ struct HarnessInfo {
 }
 
 struct ApiKeyInfo {
+    id: String,
     name: String,
     key_prefix: String,
+    scopes: Vec<String>,
     is_active: bool,
     created_at: String,
+    last_used_at: Option<String>,
 }
 
 struct UserInfo {
@@ -445,6 +458,131 @@ struct UserInfo {
     name: Option<String>,
     role: String,
     is_active: bool,
+}
+
+/// One grantable scope in the key-create permission picker.
+struct ScopeOption {
+    scope: String,
+    label: String,
+    checked: bool,
+}
+
+/// Grantable scopes grouped by category.
+struct ScopeGroup {
+    category: String,
+    options: Vec<ScopeOption>,
+}
+
+/// The scope catalog (category → scope + plain-English label), filtered to what
+/// the creator's role can actually grant. A key can never exceed its creator's
+/// role, so we only ever show scopes the role already has. `default_checked`
+/// pre-ticks a safe read-only baseline.
+fn grantable_scope_groups(role: &str) -> Vec<ScopeGroup> {
+    use crate::rbac::scope as s;
+    let allowed: std::collections::HashSet<String> = crate::rbac::scopes_for_role(role)
+        .into_iter()
+        .map(String::from)
+        .collect();
+    let default_checked = default_readonly_scopes(role);
+    let catalog: &[(&str, &[(&str, &str)])] = &[
+        (
+            "App &amp; deploy",
+            &[
+                (s::APP_READ, "View apps, status &amp; logs"),
+                (s::APP_DEPLOY, "Build &amp; ship new code (deploy)"),
+                (s::APP_CONTROL, "Start / stop / restart apps"),
+            ],
+        ),
+        (
+            "Environments",
+            &[(
+                s::ENV_PROVISION,
+                "Create &amp; tear down preview / staging envs",
+            )],
+        ),
+        ("Build", &[(s::BUILD_RUN, "Build container images")]),
+        (
+            "Data",
+            &[
+                (s::DB_READ, "Read-only SQL on the app database"),
+                (s::DB_WRITE, "Write to the app database (sensitive)"),
+            ],
+        ),
+        (
+            "Storage",
+            &[
+                (s::STORAGE_READ, "Read files in the app's bucket"),
+                (s::STORAGE_WRITE, "Write &amp; delete files in the bucket"),
+            ],
+        ),
+        (
+            "Finance",
+            &[
+                (s::FINANCE_READ, "View budget vs actual vs live"),
+                (s::FINANCE_WRITE, "Edit budgets, actuals &amp; categories"),
+                (
+                    s::FINANCE_CONNECT,
+                    "Connect QuickBooks / Stripe credentials",
+                ),
+            ],
+        ),
+        (
+            "Harness",
+            &[
+                (s::HARNESS_READ, "View harness status &amp; logs"),
+                (s::HARNESS_PROVISION, "Provision harnesses"),
+                (s::HARNESS_CONTROL, "Start / stop / configure harnesses"),
+            ],
+        ),
+        (
+            "Audit &amp; billing",
+            &[
+                (s::RECEIPTS_READ, "View proof receipts"),
+                (s::BILLING_READ, "View billing &amp; usage"),
+            ],
+        ),
+    ];
+    catalog
+        .iter()
+        .filter_map(|(cat, items)| {
+            let options: Vec<ScopeOption> = items
+                .iter()
+                .filter(|(sc, _)| allowed.contains(*sc))
+                .map(|(sc, label)| ScopeOption {
+                    scope: sc.to_string(),
+                    label: label.to_string(),
+                    checked: default_checked.iter().any(|d| d == sc),
+                })
+                .collect();
+            if options.is_empty() {
+                None
+            } else {
+                Some(ScopeGroup {
+                    category: cat.to_string(),
+                    options,
+                })
+            }
+        })
+        .collect()
+}
+
+/// Safe default scopes when the creator picks none — read-only, capped to role.
+fn default_readonly_scopes(role: &str) -> Vec<String> {
+    use crate::rbac::scope as s;
+    let allowed: std::collections::HashSet<String> = crate::rbac::scopes_for_role(role)
+        .into_iter()
+        .map(String::from)
+        .collect();
+    [
+        s::APP_READ,
+        s::HARNESS_READ,
+        s::RECEIPTS_READ,
+        s::BILLING_READ,
+    ]
+    .into_iter()
+    .filter(|sc| allowed.contains(*sc))
+    .map(String::from)
+    .collect()
 }
 
 // ── Form structs ────────────────────────────────────────────────────────
@@ -467,6 +605,10 @@ struct RegisterForm {
 #[derive(Deserialize)]
 struct CreateApiKeyForm {
     name: String,
+    /// Comma-separated scopes selected in the permission picker (populated by
+    /// the form's JS from the checkboxes). Empty → safe read-only default.
+    #[serde(default)]
+    scopes: Option<String>,
 }
 
 // ── Routes ──────────────────────────────────────────────────────────────
@@ -487,23 +629,15 @@ async fn tenant_name_slug(
 }
 
 /// Apps page: the tenant's multi-service deployments + per-service status.
-async fn apps_page(State(state): State<PlatformState>, headers: axum::http::HeaderMap) -> Response {
-    let claims = match extract_session_claims(&state, &headers) {
-        Some(c) => c,
-        None => return Redirect::to("/login").into_response(),
-    };
-    let tenant_id: Uuid = match claims.tenant_id.parse() {
-        Ok(id) => id,
-        Err(_) => return Redirect::to("/login").into_response(),
-    };
-    let (tenant_name, tenant_slug) = tenant_name_slug(&state, tenant_id, &claims.tenant_slug).await;
-
+/// Build the tenant's app rows (deployments + their services), newest first.
+/// Shared by the Apps page and the dashboard.
+async fn build_app_rows(state: &PlatformState, tenant_id: Uuid) -> Vec<AppRow> {
     let deployments =
         sqlx::query_as::<_, (Uuid, String, String, String, Option<serde_json::Value>)>(
             "SELECT id, name, provider, status, aws_meta
-         FROM app_deployments
-         WHERE tenant_id = $1 AND status != 'deprovisioned'
-         ORDER BY created_at DESC",
+             FROM app_deployments
+             WHERE tenant_id = $1 AND status != 'deprovisioned'
+             ORDER BY created_at DESC",
         )
         .bind(tenant_id)
         .fetch_all(&state.db)
@@ -547,6 +681,63 @@ async fn apps_page(State(state): State<PlatformState>, headers: axum::http::Head
             services,
         });
     }
+    apps
+}
+
+/// Recent proof receipts for the tenant, newest first, capped at `limit`.
+/// Shared by the Receipts page and the dashboard activity feed.
+async fn recent_receipts(state: &PlatformState, tenant_id: Uuid, limit: i64) -> Vec<ReceiptRow> {
+    let rows = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            bool,
+            chrono::DateTime<chrono::Utc>,
+            serde_json::Value,
+        ),
+    >(
+        "SELECT operation, actor, verified, created_at, receipt
+         FROM operation_receipts
+         WHERE tenant_id = $1
+         ORDER BY created_at DESC
+         LIMIT $2",
+    )
+    .bind(tenant_id)
+    .bind(limit)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    rows.into_iter()
+        .map(
+            |(operation, actor, verified, created_at, receipt)| ReceiptRow {
+                created_at: created_at.format("%Y-%m-%d %H:%M UTC").to_string(),
+                operation,
+                actor: actor.chars().take(8).collect(),
+                verified,
+                summary: receipt
+                    .get("result_summary")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            },
+        )
+        .collect()
+}
+
+async fn apps_page(State(state): State<PlatformState>, headers: axum::http::HeaderMap) -> Response {
+    let claims = match extract_session_claims(&state, &headers) {
+        Some(c) => c,
+        None => return Redirect::to("/login").into_response(),
+    };
+    let tenant_id: Uuid = match claims.tenant_id.parse() {
+        Ok(id) => id,
+        Err(_) => return Redirect::to("/login").into_response(),
+    };
+    let (tenant_name, tenant_slug) = tenant_name_slug(&state, tenant_id, &claims.tenant_slug).await;
+
+    let apps = build_app_rows(&state, tenant_id).await;
 
     // App-hosting billing summary (tier + deployed container units + charge).
     let summary = crate::billing::app_hosting::tenant_summary(&state.db, tenant_id).await;
@@ -643,44 +834,7 @@ async fn receipts_page(
     let (tenant_name, _tenant_slug) =
         tenant_name_slug(&state, tenant_id, &claims.tenant_slug).await;
 
-    let rows = sqlx::query_as::<
-        _,
-        (
-            String,
-            String,
-            bool,
-            chrono::DateTime<chrono::Utc>,
-            serde_json::Value,
-        ),
-    >(
-        "SELECT operation, actor, verified, created_at, receipt
-         FROM operation_receipts
-         WHERE tenant_id = $1
-         ORDER BY created_at DESC
-         LIMIT 50",
-    )
-    .bind(tenant_id)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
-
-    let receipts = rows
-        .into_iter()
-        .map(
-            |(operation, actor, verified, created_at, receipt)| ReceiptRow {
-                created_at: created_at.format("%Y-%m-%d %H:%M UTC").to_string(),
-                operation,
-                // Actor ids are long; show a short prefix.
-                actor: actor.chars().take(8).collect(),
-                verified,
-                summary: receipt
-                    .get("result_summary")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-            },
-        )
-        .collect();
+    let receipts = recent_receipts(&state, tenant_id, 50).await;
 
     HtmlTemplate(ReceiptsTemplate {
         tenant_name,
@@ -696,8 +850,10 @@ pub fn routes() -> Router<PlatformState> {
         .route("/receipts", get(receipts_page))
         .route("/register", get(register_page).post(register_submit))
         .route("/dashboard", get(dashboard_page))
+        .route("/dashboard/ask", post(dashboard_ask))
         .route("/settings", get(settings_page))
         .route("/settings/api-keys", post(create_api_key_submit))
+        .route("/settings/api-keys/{id}/revoke", post(revoke_api_key))
         .route("/billing/success", get(billing_success))
         .route("/billing/upgrade", get(billing_upgrade_page))
         .route("/billing/checkout", post(billing_checkout))
@@ -745,9 +901,14 @@ async fn login_submit(
 
     // Look up user by email
     let row = sqlx::query_as::<_, (Uuid, Uuid, String, String, String, bool)>(
+        // Email can exist across multiple tenants (a user may own several).
+        // Skip login-disabled placeholders (hash sentinel `!...`) and prefer an
+        // active account so a disabled row can't shadow the real one.
+        // TODO: real multi-tenant login (tenant selection / SSO) — policy TBD.
         "SELECT u.id, u.tenant_id, u.password_hash, u.role, t.slug, u.is_active
          FROM users u JOIN tenants t ON u.tenant_id = t.id
-         WHERE u.email = $1
+         WHERE u.email = $1 AND u.password_hash NOT LIKE '!%'
+         ORDER BY u.is_active DESC
          LIMIT 1",
     )
     .bind(&form.email)
@@ -1084,96 +1245,32 @@ async fn dashboard_page(
         )
     });
 
-    let plan_enum = crate::billing::Plan::parse(&plan);
     let stripe_subscription_status = stripe_sub_status.unwrap_or_else(|| "none".into());
 
-    // Fetch the latest available release version for update-available badge.
-    let latest_release_version: Option<String> = sqlx::query_scalar(
-        "SELECT version FROM releases WHERE status = 'available' ORDER BY created_at DESC LIMIT 1",
+    // Hosted apps + their services (the env at a glance) and the recent proof feed.
+    let apps = build_app_rows(&state, tenant_id).await;
+    let receipts = recent_receipts(&state, tenant_id, 6).await;
+
+    // Public MCP endpoint the operator points their AI at.
+    let mcp_url = std::env::var("AMOS__PUBLIC__MCP_URL")
+        .unwrap_or_else(|_| "https://platform.custom.amoslabs.com/mcp".to_string());
+
+    // Masked prefix of the most-recent active key (full value shown only at creation).
+    let key_prefix: Option<String> = sqlx::query_scalar(
+        "SELECT key_prefix FROM api_keys WHERE tenant_id = $1 AND is_active = TRUE \
+         ORDER BY created_at DESC LIMIT 1",
     )
+    .bind(tenant_id)
     .fetch_optional(&state.db)
     .await
     .ok()
     .flatten();
 
-    // Fetch harness instances (including endpoint info and version tracking).
-    let harness_rows = sqlx::query_as::<_, (Uuid, String, Option<String>, String, String, bool, Option<i32>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)>(
-        "SELECT id, status, subdomain, region, instance_size, healthy, external_port, internal_url, container_id, image_tag, previous_image_tag, name
-         FROM harness_instances WHERE tenant_id = $1 AND status != 'deprovisioned' ORDER BY created_at DESC"
-    )
-    .bind(tenant_id)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
-
-    let instances: Vec<HarnessInfo> = harness_rows
-        .into_iter()
-        .map(
-            |(
-                id,
-                status,
-                subdomain,
-                region,
-                instance_size,
-                healthy,
-                _external_port,
-                internal_url,
-                container_id,
-                image_tag,
-                previous_image_tag,
-                name,
-            )| {
-                // Prefer public subdomain URL over internal IP for the endpoint display.
-                let endpoint_url = subdomain
-                    .as_deref()
-                    .map(|s| format!("https://{}.custom.amoslabs.com", s))
-                    .or(internal_url);
-
-                // Show update badge when latest release differs from current image_tag,
-                // or when image_tag is unknown (NULL = pre-versioning harness).
-                let update_available = match (&latest_release_version, &image_tag) {
-                    (Some(latest), Some(current)) if latest != current => Some(latest.clone()),
-                    (Some(latest), None) => Some(latest.clone()),
-                    _ => None,
-                };
-
-                let image_tag_short = image_tag.as_ref().map(|t| truncate_version(t));
-                let update_available_short = update_available.as_ref().map(|t| truncate_version(t));
-
-                HarnessInfo {
-                    id: id.to_string()[..8].to_string(),
-                    full_id: id.to_string(),
-                    name,
-                    status,
-                    subdomain,
-                    region,
-                    instance_size,
-                    healthy,
-                    endpoint_url,
-                    container_id_short: container_id.map(|c| {
-                        if c.len() > 12 {
-                            c[..12].to_string()
-                        } else {
-                            c
-                        }
-                    }),
-                    image_tag,
-                    image_tag_short,
-                    previous_image_tag,
-                    update_available,
-                    update_available_short,
-                }
-            },
-        )
-        .collect();
-
-    // Fetch counts
     let user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE tenant_id = $1")
         .bind(tenant_id)
         .fetch_one(&state.db)
         .await
         .unwrap_or(0);
-
     let api_key_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE tenant_id = $1")
             .bind(tenant_id)
@@ -1185,18 +1282,15 @@ async fn dashboard_page(
         tenant_name,
         tenant_slug,
         plan,
-        plan_price: if plan_enum.is_paid() {
-            "Per harness".to_string()
-        } else {
-            "Free".to_string()
-        },
         stripe_subscription_status,
-        instances,
+        apps,
+        receipts,
+        mcp_url,
+        key_prefix,
         user_count,
         api_key_count,
         flash_message: query.msg,
         flash_error: query.error,
-        billing_enabled: state.stripe_client.is_some(),
     })
     .into_response()
 }
@@ -1242,8 +1336,19 @@ async fn settings_page_inner(
     let plan_enum = crate::billing::Plan::parse(&plan);
 
     // API keys
-    let key_rows = sqlx::query_as::<_, (String, String, bool, String)>(
-        "SELECT name, key_prefix, is_active, created_at::text
+    let key_rows = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            String,
+            Vec<String>,
+            bool,
+            String,
+            Option<String>,
+        ),
+    >(
+        "SELECT id::text, name, key_prefix, scopes, is_active, created_at::text, last_used_at::text
          FROM api_keys WHERE tenant_id = $1 ORDER BY created_at DESC",
     )
     .bind(tenant_id)
@@ -1253,12 +1358,17 @@ async fn settings_page_inner(
 
     let api_keys: Vec<ApiKeyInfo> = key_rows
         .into_iter()
-        .map(|(name, key_prefix, is_active, created_at)| ApiKeyInfo {
-            name,
-            key_prefix,
-            is_active,
-            created_at,
-        })
+        .map(
+            |(id, name, key_prefix, scopes, is_active, created_at, last_used_at)| ApiKeyInfo {
+                id,
+                name,
+                key_prefix,
+                scopes,
+                is_active,
+                created_at,
+                last_used_at,
+            },
+        )
         .collect();
 
     // Users
@@ -1293,8 +1403,11 @@ async fn settings_page_inner(
         stripe_subscription_status: stripe_sub_status.unwrap_or_else(|| "none".into()),
         has_stripe_customer: stripe_customer_id.is_some(),
         api_keys,
+        scope_groups: grantable_scope_groups(&claims.role),
         users,
         new_api_key,
+        mcp_url: std::env::var("AMOS__PUBLIC__MCP_URL")
+            .unwrap_or_else(|_| "https://platform.custom.amoslabs.com/mcp".to_string()),
         flash_message,
     })
     .into_response()
@@ -1342,7 +1455,27 @@ async fn create_api_key_submit(
     let (full_key, prefix, key_hash) = auth::generate_api_key();
     let key_id = Uuid::new_v4();
 
-    let scopes: Vec<String> = vec![];
+    // Parse the selected scopes (comma-separated from the picker), keep only
+    // valid ones, and CAP to the creator's role — a key can never exceed its
+    // creator. Empty selection → a safe read-only baseline (never full access).
+    let role_scopes: std::collections::HashSet<String> = crate::rbac::scopes_for_role(&claims.role)
+        .into_iter()
+        .map(String::from)
+        .collect();
+    let mut scopes: Vec<String> = form
+        .scopes
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty() && role_scopes.contains(*s))
+        .map(String::from)
+        .collect();
+    scopes.sort();
+    scopes.dedup();
+    if scopes.is_empty() {
+        scopes = default_readonly_scopes(&claims.role);
+    }
     let result = sqlx::query(
         "INSERT INTO api_keys (id, tenant_id, created_by, name, key_prefix, key_hash, scopes)
          VALUES ($1, $2, $3, $4, $5, $6, $7)",
@@ -1378,6 +1511,44 @@ async fn create_api_key_submit(
             .await
         }
     }
+}
+
+/// Revoke (deactivate) an API key. Owner/admin only; tenant-scoped.
+async fn revoke_api_key(
+    State(state): State<PlatformState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(key_id): axum::extract::Path<String>,
+) -> Response {
+    let claims = match extract_session_claims(&state, &headers) {
+        Some(c) => c,
+        None => return Redirect::to("/login").into_response(),
+    };
+    if claims.role != "owner" && claims.role != "admin" {
+        return settings_page_inner(
+            &state,
+            &headers,
+            None,
+            Some("Only owner or admin can revoke API keys.".into()),
+        )
+        .await;
+    }
+    let tenant_id: Uuid = match claims.tenant_id.parse() {
+        Ok(id) => id,
+        Err(_) => return Redirect::to("/login").into_response(),
+    };
+    let kid: Uuid = match key_id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return settings_page_inner(&state, &headers, None, Some("Invalid key id.".into()))
+                .await
+        }
+    };
+    let _ = sqlx::query("UPDATE api_keys SET is_active = FALSE WHERE id = $1 AND tenant_id = $2")
+        .bind(kid)
+        .bind(tenant_id)
+        .execute(&state.db)
+        .await;
+    settings_page_inner(&state, &headers, None, Some("API key revoked.".into())).await
 }
 
 // ── Harness Management ────────────────────────────────────────────────
@@ -2696,4 +2867,56 @@ impl<T: Template> IntoResponse for HtmlTemplate<T> {
             }
         }
     }
+}
+
+#[derive(Deserialize)]
+struct AskForm {
+    q: String,
+}
+
+/// In-browser `ask_amos` quick-question (read-only manager agent). The full
+/// agent experience is via the MCP from Claude Code/Desktop; this is a one-shot
+/// convenience for owners who want a quick answer without leaving the dashboard.
+async fn dashboard_ask(
+    State(state): State<PlatformState>,
+    headers: axum::http::HeaderMap,
+    Form(form): Form<AskForm>,
+) -> Response {
+    let claims = match extract_session_claims(&state, &headers) {
+        Some(c) => c,
+        None => return Redirect::to("/login").into_response(),
+    };
+    let answer = match crate::mcp::ask_amos::run(&state, &claims, &form.q).await {
+        Ok(v) => v
+            .get("answer")
+            .and_then(|a| a.as_str())
+            .unwrap_or("(no answer)")
+            .to_string(),
+        Err(e) => format!(
+            "The agent couldn't answer right now ({e:?}). For the full agent, connect Claude to your MCP endpoint from the dashboard."
+        ),
+    };
+    let esc = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    };
+    axum::response::Html(format!(
+        r#"<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Ask AMOS</title>
+<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f6f7f9;margin:0;color:#1f2733">
+<div style="max-width:760px;margin:0 auto;padding:32px 20px">
+  <a href="/dashboard" style="color:#3f6fe6;text-decoration:none;font-size:13px;font-weight:600">&larr; Back to dashboard</a>
+  <div style="margin-top:16px;background:#fff;border:1px solid #e6e8ee;border-radius:12px;padding:20px">
+    <div style="font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#69707d">You asked</div>
+    <div style="margin-top:4px;font-weight:600;color:#0E1420">{q}</div>
+    <div style="margin-top:18px;font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#69707d">AMOS agent (read-only)</div>
+    <div style="margin-top:6px;white-space:pre-wrap;line-height:1.55">{a}</div>
+  </div>
+  <p style="margin-top:14px;color:#69707d;font-size:13px">Want it to actually <em>do</em> things &mdash; deploy, edit finances, provision? <a href="/dashboard" style="color:#3f6fe6">Connect your AI</a> and ask it there.</p>
+</div></body>"#,
+        q = esc(&form.q),
+        a = esc(&answer),
+    ))
+    .into_response()
 }

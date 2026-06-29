@@ -4,17 +4,21 @@
 
 {% block body %}
 <div class="min-h-full bg-gray-50">
-  <!-- Navigation -->
   <nav class="border-b border-gray-200 bg-white">
-    <div class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
+    <div class="mx-auto max-w-6xl px-4 sm:px-6 lg:px-8">
       <div class="flex h-14 justify-between">
-        <div class="flex items-center space-x-8">
-          <span class="text-lg font-bold text-gray-900">AMOS</span>
-          <a href="/dashboard" class="border-b-2 border-transparent px-1 pt-1 text-sm font-medium text-gray-500 hover:border-gray-300 hover:text-gray-700">Dashboard</a>
-          <a href="/settings" class="border-b-2 border-transparent px-1 pt-1 text-sm font-medium text-gray-500 hover:border-gray-300 hover:text-gray-700">Settings</a>
+        <div class="flex items-center space-x-7">
+          <span class="text-base font-extrabold tracking-wide text-ink">AMOS</span>
+          <a href="/dashboard" class="border-b-2 border-transparent px-1 pt-1 text-sm font-medium text-gray-500 hover:text-gray-700">Dashboard</a>
+          <a href="/apps" class="border-b-2 border-transparent px-1 pt-1 text-sm font-medium text-gray-500 hover:text-gray-700">Environment</a>
+          <a href="/receipts" class="border-b-2 border-transparent px-1 pt-1 text-sm font-medium text-gray-500 hover:text-gray-700">Receipts</a>
+          <a href="/settings" class="border-b-2 border-transparent px-1 pt-1 text-sm font-medium text-gray-500 hover:text-gray-700">Settings</a>
         </div>
-        <div class="flex items-center">
+        <div class="flex items-center space-x-4">
           <span class="text-sm text-gray-500">{{ tenant_name }}</span>
+          <form action="/logout" method="POST" class="inline">
+            <button type="submit" class="text-sm text-gray-500 hover:text-gray-700">Sign out</button>
+          </form>
         </div>
       </div>
     </div>
@@ -25,12 +29,12 @@
       <a href="/dashboard" class="text-sm text-gray-500 hover:text-gray-700">&larr; Back to Dashboard</a>
     </div>
 
-    <h1 class="text-3xl font-bold text-gray-900">Self-Host AMOS</h1>
+    <h1 class="text-3xl font-extrabold tracking-tight text-ink">Self-Host AMOS</h1>
     <p class="mt-2 text-gray-600">Run your own AMOS harness on your infrastructure. Free forever, Apache 2.0 licensed.</p>
 
     <!-- Quick Start -->
     <div class="mt-8 rounded-lg border bg-white p-6 shadow-sm">
-      <h2 class="text-lg font-semibold text-gray-900 mb-1">Quick Start</h2>
+      <h2 class="text-lg font-bold text-ink mb-1">Quick Start</h2>
       <p class="text-sm text-gray-500 mb-4">Pull the image and run with Docker. Requires PostgreSQL and Redis.</p>
       <div class="rounded-md bg-gray-900 p-4 font-mono text-sm text-green-400 overflow-x-auto">
         <div class="text-gray-500"># Pull the latest AMOS harness image</div>
@@ -50,12 +54,12 @@
       <!-- macOS -->
       <div class="rounded-lg border bg-white shadow-sm">
         <div class="border-b px-6 py-4">
-          <h3 class="text-base font-semibold text-gray-900">macOS (Docker Desktop)</h3>
+          <h3 class="text-base font-bold text-ink">macOS (Docker Desktop)</h3>
         </div>
         <div class="px-6 py-5 space-y-4">
           <div>
             <h4 class="text-sm font-medium text-gray-700 mb-2">1. Install Docker Desktop</h4>
-            <p class="text-sm text-gray-500">Download from <a href="https://www.docker.com/products/docker-desktop/" target="_blank" class="text-indigo-600 hover:text-indigo-500 underline">docker.com</a> or install via Homebrew:</p>
+            <p class="text-sm text-gray-500">Download from <a href="https://www.docker.com/products/docker-desktop/" target="_blank" class="text-accent hover:opacity-80 underline">docker.com</a> or install via Homebrew:</p>
             <div class="mt-2 rounded-md bg-gray-900 p-3 font-mono text-sm text-green-400">brew install --cask docker</div>
           </div>
           <div>
@@ -89,12 +93,12 @@
       <!-- Windows / Linux -->
       <div class="rounded-lg border bg-white shadow-sm">
         <div class="border-b px-6 py-4">
-          <h3 class="text-base font-semibold text-gray-900">Windows &amp; Linux (Docker)</h3>
+          <h3 class="text-base font-bold text-ink">Windows &amp; Linux (Docker)</h3>
         </div>
         <div class="px-6 py-5 space-y-4">
           <div>
             <h4 class="text-sm font-medium text-gray-700 mb-2">1. Install Docker</h4>
-            <p class="text-sm text-gray-500"><strong>Windows:</strong> Install <a href="https://www.docker.com/products/docker-desktop/" target="_blank" class="text-indigo-600 hover:text-indigo-500 underline">Docker Desktop for Windows</a> (requires WSL2).</p>
+            <p class="text-sm text-gray-500"><strong>Windows:</strong> Install <a href="https://www.docker.com/products/docker-desktop/" target="_blank" class="text-accent hover:opacity-80 underline">Docker Desktop for Windows</a> (requires WSL2).</p>
             <p class="text-sm text-gray-500 mt-1"><strong>Linux:</strong> Install Docker Engine via your package manager.</p>
             <div class="mt-2 rounded-md bg-gray-900 p-3 font-mono text-sm text-green-400">
               <div class="text-gray-500"># Ubuntu/Debian</div>
@@ -135,7 +139,7 @@ volumes:
       <!-- CLI -->
       <div class="rounded-lg border bg-white shadow-sm">
         <div class="border-b px-6 py-4">
-          <h3 class="text-base font-semibold text-gray-900">CLI (amos-cli)</h3>
+          <h3 class="text-base font-bold text-ink">CLI (amos-cli)</h3>
         </div>
         <div class="px-6 py-5 space-y-4">
           <div>
@@ -166,7 +170,7 @@ volumes:
       <!-- Requirements -->
       <div class="rounded-lg border bg-white shadow-sm">
         <div class="border-b px-6 py-4">
-          <h3 class="text-base font-semibold text-gray-900">Requirements</h3>
+          <h3 class="text-base font-bold text-ink">Requirements</h3>
         </div>
         <div class="px-6 py-5">
           <div class="grid gap-4 sm:grid-cols-2">
@@ -192,11 +196,11 @@ volumes:
       </div>
 
       <!-- Help -->
-      <div class="rounded-lg border border-indigo-200 bg-indigo-50 p-6">
+      <div class="rounded-xl border border-[#cfddf9] bg-accent-soft p-6">
         <div class="flex items-start gap-4">
           <div>
-            <h3 class="text-sm font-semibold text-indigo-900">Need help?</h3>
-            <p class="mt-1 text-sm text-indigo-700">
+            <h3 class="text-sm font-bold text-ink">Need help?</h3>
+            <p class="mt-1 text-sm text-gray-600">
               Join our community or check the source code for detailed configuration options.
             </p>
             <div class="mt-3 flex gap-3">
@@ -205,7 +209,7 @@ volumes:
                 GitHub
               </a>
               <a href="/billing/upgrade"
-                 class="inline-flex items-center rounded-md bg-indigo-600 px-3 py-1.5 text-sm font-medium text-white shadow-sm hover:bg-indigo-500">
+                 class="inline-flex items-center rounded-md bg-ink px-3 py-1.5 text-sm font-medium text-white shadow-sm hover:bg-ink-soft">
                 Or let us host it for you &rarr;
               </a>
             </div>

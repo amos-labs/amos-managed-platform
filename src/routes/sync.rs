@@ -743,6 +743,18 @@ struct BalanceResponse {
     /// `invoice.paid` or initial checkout). May be null for tenants
     /// who haven't been on a paid plan.
     credits_granted_at: Option<DateTime<Utc>>,
+    /// Circuit-breaker: whether the harness may make shared-Bedrock calls
+    /// right now. False once credits are exhausted or billing is past-due.
+    /// The harness MUST honor this — it bounds runaway spend to one sync
+    /// interval. Older harnesses that ignore it still self-gate on the
+    /// balance reaching 0, so this is a tightening, not a regression.
+    allow_shared_bedrock: bool,
+    /// True specifically when the block is a zero balance (vs a billing
+    /// problem) — drives the "Set up a key" vs "Fix billing" CTA.
+    exhausted: bool,
+    /// Machine-readable gate reason (`ok` | `credits_exhausted` |
+    /// `billing_past_due` | `billing_disabled`).
+    gate_reason: crate::billing::guards::BedrockGateReason,
 }
 
 /// `GET /api/v1/sync/balance/:tenant_id` — read the tenant's current
@@ -770,8 +782,9 @@ async fn get_balance(
         }
     };
 
-    let row: Option<(i64, Option<DateTime<Utc>>)> = sqlx::query_as(
-        "SELECT credit_balance_microcents, credits_granted_at FROM tenants WHERE id = $1",
+    let row: Option<(i64, Option<DateTime<Utc>>, Option<String>)> = sqlx::query_as(
+        "SELECT credit_balance_microcents, credits_granted_at, stripe_subscription_status
+         FROM tenants WHERE id = $1",
     )
     .bind(tenant_id)
     .fetch_optional(&state.db)
@@ -779,7 +792,7 @@ async fn get_balance(
     .ok()
     .flatten();
 
-    let (balance, granted_at) = match row {
+    let (balance, granted_at, sub_status) = match row {
         Some(r) => r,
         None => {
             return (
@@ -794,12 +807,23 @@ async fn get_balance(
     // So $5.00 = 50_000 microcents.
     let usd = format!("{:.2}", balance as f64 / 10_000.0);
 
+    // Circuit-breaker: only gate when billing is actually configured. Self-hosted
+    // / dev deployments (no Stripe) default open so the gate never breaks them.
+    let decision = crate::billing::guards::shared_bedrock_decision(
+        state.stripe_client.is_some(),
+        balance,
+        sub_status.as_deref(),
+    );
+
     (
         StatusCode::OK,
         Json(BalanceResponse {
             credit_balance_microcents: balance,
             credit_balance_usd: usd,
             credits_granted_at: granted_at,
+            allow_shared_bedrock: decision.allow_shared_bedrock,
+            exhausted: decision.exhausted,
+            gate_reason: decision.reason,
         }),
     )
         .into_response()
@@ -866,11 +890,16 @@ mod tests {
             credit_balance_microcents: 42_500,
             credit_balance_usd: "4.25".into(),
             credits_granted_at: None,
+            allow_shared_bedrock: true,
+            exhausted: false,
+            gate_reason: crate::billing::guards::BedrockGateReason::Ok,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"credit_balance_microcents\":42500"));
         assert!(json.contains("\"credit_balance_usd\":\"4.25\""));
         assert!(json.contains("\"credits_granted_at\":null"));
+        assert!(json.contains("\"allow_shared_bedrock\":true"));
+        assert!(json.contains("\"gate_reason\":\"ok\""));
     }
 
     #[test]

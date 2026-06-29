@@ -40,7 +40,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let builder = ImageBuilder::new(config).await?;
 
     let req = BuildRequest {
-        context_dir: std::path::PathBuf::from(&context_dir),
+        context_dir: Some(std::path::PathBuf::from(&context_dir)),
+        git_repo: None,
+        git_ref: None,
         dockerfile,
         image_name: image_name.clone(),
         tag: tag.clone(),
