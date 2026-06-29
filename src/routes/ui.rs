@@ -340,8 +340,10 @@ struct SettingsTemplate {
     stripe_subscription_status: String,
     has_stripe_customer: bool,
     api_keys: Vec<ApiKeyInfo>,
+    scope_groups: Vec<ScopeGroup>,
     users: Vec<UserInfo>,
     new_api_key: Option<String>,
+    mcp_url: String,
     flash_message: Option<String>,
 }
 
@@ -442,10 +444,13 @@ struct HarnessInfo {
 }
 
 struct ApiKeyInfo {
+    id: String,
     name: String,
     key_prefix: String,
+    scopes: Vec<String>,
     is_active: bool,
     created_at: String,
+    last_used_at: Option<String>,
 }
 
 struct UserInfo {
@@ -453,6 +458,131 @@ struct UserInfo {
     name: Option<String>,
     role: String,
     is_active: bool,
+}
+
+/// One grantable scope in the key-create permission picker.
+struct ScopeOption {
+    scope: String,
+    label: String,
+    checked: bool,
+}
+
+/// Grantable scopes grouped by category.
+struct ScopeGroup {
+    category: String,
+    options: Vec<ScopeOption>,
+}
+
+/// The scope catalog (category → scope + plain-English label), filtered to what
+/// the creator's role can actually grant. A key can never exceed its creator's
+/// role, so we only ever show scopes the role already has. `default_checked`
+/// pre-ticks a safe read-only baseline.
+fn grantable_scope_groups(role: &str) -> Vec<ScopeGroup> {
+    use crate::rbac::scope as s;
+    let allowed: std::collections::HashSet<String> = crate::rbac::scopes_for_role(role)
+        .into_iter()
+        .map(String::from)
+        .collect();
+    let default_checked = default_readonly_scopes(role);
+    let catalog: &[(&str, &[(&str, &str)])] = &[
+        (
+            "App &amp; deploy",
+            &[
+                (s::APP_READ, "View apps, status &amp; logs"),
+                (s::APP_DEPLOY, "Build &amp; ship new code (deploy)"),
+                (s::APP_CONTROL, "Start / stop / restart apps"),
+            ],
+        ),
+        (
+            "Environments",
+            &[(
+                s::ENV_PROVISION,
+                "Create &amp; tear down preview / staging envs",
+            )],
+        ),
+        ("Build", &[(s::BUILD_RUN, "Build container images")]),
+        (
+            "Data",
+            &[
+                (s::DB_READ, "Read-only SQL on the app database"),
+                (s::DB_WRITE, "Write to the app database (sensitive)"),
+            ],
+        ),
+        (
+            "Storage",
+            &[
+                (s::STORAGE_READ, "Read files in the app's bucket"),
+                (s::STORAGE_WRITE, "Write &amp; delete files in the bucket"),
+            ],
+        ),
+        (
+            "Finance",
+            &[
+                (s::FINANCE_READ, "View budget vs actual vs live"),
+                (s::FINANCE_WRITE, "Edit budgets, actuals &amp; categories"),
+                (
+                    s::FINANCE_CONNECT,
+                    "Connect QuickBooks / Stripe credentials",
+                ),
+            ],
+        ),
+        (
+            "Harness",
+            &[
+                (s::HARNESS_READ, "View harness status &amp; logs"),
+                (s::HARNESS_PROVISION, "Provision harnesses"),
+                (s::HARNESS_CONTROL, "Start / stop / configure harnesses"),
+            ],
+        ),
+        (
+            "Audit &amp; billing",
+            &[
+                (s::RECEIPTS_READ, "View proof receipts"),
+                (s::BILLING_READ, "View billing &amp; usage"),
+            ],
+        ),
+    ];
+    catalog
+        .iter()
+        .filter_map(|(cat, items)| {
+            let options: Vec<ScopeOption> = items
+                .iter()
+                .filter(|(sc, _)| allowed.contains(*sc))
+                .map(|(sc, label)| ScopeOption {
+                    scope: sc.to_string(),
+                    label: label.to_string(),
+                    checked: default_checked.iter().any(|d| d == sc),
+                })
+                .collect();
+            if options.is_empty() {
+                None
+            } else {
+                Some(ScopeGroup {
+                    category: cat.to_string(),
+                    options,
+                })
+            }
+        })
+        .collect()
+}
+
+/// Safe default scopes when the creator picks none — read-only, capped to role.
+fn default_readonly_scopes(role: &str) -> Vec<String> {
+    use crate::rbac::scope as s;
+    let allowed: std::collections::HashSet<String> = crate::rbac::scopes_for_role(role)
+        .into_iter()
+        .map(String::from)
+        .collect();
+    [
+        s::APP_READ,
+        s::HARNESS_READ,
+        s::RECEIPTS_READ,
+        s::BILLING_READ,
+    ]
+    .into_iter()
+    .filter(|sc| allowed.contains(*sc))
+    .map(String::from)
+    .collect()
 }
 
 // ── Form structs ────────────────────────────────────────────────────────
@@ -475,6 +605,10 @@ struct RegisterForm {
 #[derive(Deserialize)]
 struct CreateApiKeyForm {
     name: String,
+    /// Comma-separated scopes selected in the permission picker (populated by
+    /// the form's JS from the checkboxes). Empty → safe read-only default.
+    #[serde(default)]
+    scopes: Option<String>,
 }
 
 // ── Routes ──────────────────────────────────────────────────────────────
@@ -719,6 +853,7 @@ pub fn routes() -> Router<PlatformState> {
         .route("/dashboard/ask", post(dashboard_ask))
         .route("/settings", get(settings_page))
         .route("/settings/api-keys", post(create_api_key_submit))
+        .route("/settings/api-keys/{id}/revoke", post(revoke_api_key))
         .route("/billing/success", get(billing_success))
         .route("/billing/upgrade", get(billing_upgrade_page))
         .route("/billing/checkout", post(billing_checkout))
@@ -1201,8 +1336,19 @@ async fn settings_page_inner(
     let plan_enum = crate::billing::Plan::parse(&plan);
 
     // API keys
-    let key_rows = sqlx::query_as::<_, (String, String, bool, String)>(
-        "SELECT name, key_prefix, is_active, created_at::text
+    let key_rows = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            String,
+            Vec<String>,
+            bool,
+            String,
+            Option<String>,
+        ),
+    >(
+        "SELECT id::text, name, key_prefix, scopes, is_active, created_at::text, last_used_at::text
          FROM api_keys WHERE tenant_id = $1 ORDER BY created_at DESC",
     )
     .bind(tenant_id)
@@ -1212,12 +1358,17 @@ async fn settings_page_inner(
 
     let api_keys: Vec<ApiKeyInfo> = key_rows
         .into_iter()
-        .map(|(name, key_prefix, is_active, created_at)| ApiKeyInfo {
-            name,
-            key_prefix,
-            is_active,
-            created_at,
-        })
+        .map(
+            |(id, name, key_prefix, scopes, is_active, created_at, last_used_at)| ApiKeyInfo {
+                id,
+                name,
+                key_prefix,
+                scopes,
+                is_active,
+                created_at,
+                last_used_at,
+            },
+        )
         .collect();
 
     // Users
@@ -1252,8 +1403,11 @@ async fn settings_page_inner(
         stripe_subscription_status: stripe_sub_status.unwrap_or_else(|| "none".into()),
         has_stripe_customer: stripe_customer_id.is_some(),
         api_keys,
+        scope_groups: grantable_scope_groups(&claims.role),
         users,
         new_api_key,
+        mcp_url: std::env::var("AMOS__PUBLIC__MCP_URL")
+            .unwrap_or_else(|_| "https://platform.custom.amoslabs.com/mcp".to_string()),
         flash_message,
     })
     .into_response()
@@ -1301,7 +1455,27 @@ async fn create_api_key_submit(
     let (full_key, prefix, key_hash) = auth::generate_api_key();
     let key_id = Uuid::new_v4();
 
-    let scopes: Vec<String> = vec![];
+    // Parse the selected scopes (comma-separated from the picker), keep only
+    // valid ones, and CAP to the creator's role — a key can never exceed its
+    // creator. Empty selection → a safe read-only baseline (never full access).
+    let role_scopes: std::collections::HashSet<String> = crate::rbac::scopes_for_role(&claims.role)
+        .into_iter()
+        .map(String::from)
+        .collect();
+    let mut scopes: Vec<String> = form
+        .scopes
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty() && role_scopes.contains(*s))
+        .map(String::from)
+        .collect();
+    scopes.sort();
+    scopes.dedup();
+    if scopes.is_empty() {
+        scopes = default_readonly_scopes(&claims.role);
+    }
     let result = sqlx::query(
         "INSERT INTO api_keys (id, tenant_id, created_by, name, key_prefix, key_hash, scopes)
          VALUES ($1, $2, $3, $4, $5, $6, $7)",
@@ -1337,6 +1511,44 @@ async fn create_api_key_submit(
             .await
         }
     }
+}
+
+/// Revoke (deactivate) an API key. Owner/admin only; tenant-scoped.
+async fn revoke_api_key(
+    State(state): State<PlatformState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(key_id): axum::extract::Path<String>,
+) -> Response {
+    let claims = match extract_session_claims(&state, &headers) {
+        Some(c) => c,
+        None => return Redirect::to("/login").into_response(),
+    };
+    if claims.role != "owner" && claims.role != "admin" {
+        return settings_page_inner(
+            &state,
+            &headers,
+            None,
+            Some("Only owner or admin can revoke API keys.".into()),
+        )
+        .await;
+    }
+    let tenant_id: Uuid = match claims.tenant_id.parse() {
+        Ok(id) => id,
+        Err(_) => return Redirect::to("/login").into_response(),
+    };
+    let kid: Uuid = match key_id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return settings_page_inner(&state, &headers, None, Some("Invalid key id.".into()))
+                .await
+        }
+    };
+    let _ = sqlx::query("UPDATE api_keys SET is_active = FALSE WHERE id = $1 AND tenant_id = $2")
+        .bind(kid)
+        .bind(tenant_id)
+        .execute(&state.db)
+        .await;
+    settings_page_inner(&state, &headers, None, Some("API key revoked.".into())).await
 }
 
 // ── Harness Management ────────────────────────────────────────────────
