@@ -1,18 +1,18 @@
 {% extends "base.html" %}
 
-{% block title %}Receipts - AMOS Platform{% endblock %}
+{% block title %}Receipts - AMOS{% endblock %}
 
 {% block body %}
-<div class="min-h-full">
+<div class="min-h-full bg-gray-50">
   <nav class="border-b border-gray-200 bg-white">
-    <div class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
+    <div class="mx-auto max-w-6xl px-4 sm:px-6 lg:px-8">
       <div class="flex h-14 justify-between">
-        <div class="flex items-center space-x-8">
-          <span class="text-lg font-bold text-gray-900">AMOS</span>
-          <a href="/dashboard" class="border-b-2 border-transparent px-1 pt-1 text-sm font-medium text-gray-500 hover:border-gray-300 hover:text-gray-700">Dashboard</a>
-          <a href="/apps" class="border-b-2 border-transparent px-1 pt-1 text-sm font-medium text-gray-500 hover:border-gray-300 hover:text-gray-700">Apps</a>
-          <a href="/receipts" class="border-b-2 border-indigo-500 px-1 pt-1 text-sm font-medium text-gray-900">Receipts</a>
-          <a href="/settings" class="border-b-2 border-transparent px-1 pt-1 text-sm font-medium text-gray-500 hover:border-gray-300 hover:text-gray-700">Settings</a>
+        <div class="flex items-center space-x-7">
+          <span class="text-base font-extrabold tracking-wide text-ink">AMOS</span>
+          <a href="/dashboard" class="border-b-2 border-transparent px-1 pt-1 text-sm font-medium text-gray-500 hover:text-gray-700">Dashboard</a>
+          <a href="/apps" class="border-b-2 border-transparent px-1 pt-1 text-sm font-medium text-gray-500 hover:text-gray-700">Environment</a>
+          <a href="/receipts" class="border-b-2 border-accent px-1 pt-1 text-sm font-medium text-ink">Receipts</a>
+          <a href="/settings" class="border-b-2 border-transparent px-1 pt-1 text-sm font-medium text-gray-500 hover:text-gray-700">Settings</a>
         </div>
         <div class="flex items-center space-x-4">
           <span class="text-sm text-gray-500">{{ tenant_name }}</span>
@@ -24,48 +24,65 @@
     </div>
   </nav>
 
-  <main class="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
-    <div class="mb-8">
-      <h1 class="text-2xl font-bold text-gray-900">Operation receipts</h1>
-      <p class="mt-1 text-sm text-gray-500">Proof-carrying record of every consequential action taken in your environment — what was done, who did it, and whether it verified.</p>
+  <main class="mx-auto max-w-4xl px-4 py-7 sm:px-6 lg:px-8">
+    <div class="mb-5 flex flex-wrap items-end justify-between gap-3">
+      <div>
+        <h1 class="text-2xl font-extrabold tracking-tight text-ink">Activity &amp; proof</h1>
+        <p class="mt-1 max-w-2xl text-sm text-gray-500">A proof-carrying record of every consequential action your AI took — what was done, who did it, and whether it verified.</p>
+      </div>
+      {% if !receipts.is_empty() %}
+      <input id="rfilter" type="text" placeholder="Filter by operation…" class="w-56 rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-800 outline-none focus:border-accent" />
+      {% endif %}
     </div>
 
     {% if receipts.is_empty() %}
-    <div class="rounded-md border border-dashed border-gray-300 bg-white p-8 text-center text-sm text-gray-500">
-      No operations recorded yet. Actions like <code>deploy_app</code> and <code>build_image</code> emit a receipt here.
+    <div class="rounded-xl border-2 border-dashed border-gray-300 bg-white p-10 text-center">
+      <p class="text-sm font-medium text-ink">No activity yet.</p>
+      <p class="mt-1 text-sm text-gray-500">Every governed action your AI takes — <span class="font-mono text-xs">deploy</span>, <span class="font-mono text-xs">set_finance_budget</span>, <span class="font-mono text-xs">db_write</span> — lands here with a proof receipt.</p>
     </div>
     {% else %}
-    <div class="overflow-hidden rounded-lg border border-gray-200 bg-white shadow-sm">
-      <table class="min-w-full divide-y divide-gray-100">
-        <thead class="bg-gray-50">
-          <tr>
-            <th class="px-5 py-2.5 text-left text-xs font-medium uppercase tracking-wide text-gray-400">When</th>
-            <th class="px-5 py-2.5 text-left text-xs font-medium uppercase tracking-wide text-gray-400">Operation</th>
-            <th class="px-5 py-2.5 text-left text-xs font-medium uppercase tracking-wide text-gray-400">Verified</th>
-            <th class="px-5 py-2.5 text-left text-xs font-medium uppercase tracking-wide text-gray-400">Summary</th>
-            <th class="px-5 py-2.5 text-left text-xs font-medium uppercase tracking-wide text-gray-400">Actor</th>
-          </tr>
-        </thead>
-        <tbody class="divide-y divide-gray-50">
-          {% for r in receipts %}
-          <tr>
-            <td class="whitespace-nowrap px-5 py-2.5 text-sm text-gray-500">{{ r.created_at }}</td>
-            <td class="px-5 py-2.5 text-sm font-medium text-gray-900"><code>{{ r.operation }}</code></td>
-            <td class="px-5 py-2.5 text-sm">
-              {% if r.verified %}
-              <span class="inline-flex items-center rounded-full bg-green-100 px-2 py-0.5 text-xs font-medium text-green-700">verified</span>
-              {% else %}
-              <span class="inline-flex items-center rounded-full bg-red-100 px-2 py-0.5 text-xs font-medium text-red-700">failed</span>
-              {% endif %}
-            </td>
-            <td class="px-5 py-2.5 text-sm text-gray-700">{{ r.summary }}</td>
-            <td class="px-5 py-2.5 text-sm text-gray-400">{{ r.actor }}</td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
+    <div class="overflow-hidden rounded-xl border border-gray-200 bg-white shadow-sm">
+      {% for r in receipts %}
+      <div class="rcpt-row flex items-center gap-3 border-b border-gray-100 px-5 py-3 last:border-0" data-op="{{ r.operation }}">
+        {% if r.verified %}
+        <span class="flex h-5 w-5 flex-none items-center justify-center rounded-full bg-verified-soft text-[11px] font-extrabold text-verified">✓</span>
+        {% else %}
+        <span class="flex h-5 w-5 flex-none items-center justify-center rounded-full bg-red-50 text-[11px] font-extrabold text-red-600">!</span>
+        {% endif %}
+        <div class="min-w-0 flex-1">
+          <div class="flex items-center gap-2">
+            <span class="font-mono text-[13px] font-semibold text-ink">{{ r.operation }}</span>
+            {% if r.verified %}
+            <span class="rounded-full bg-verified-soft px-2 py-0.5 text-[10px] font-semibold text-verified">verified</span>
+            {% else %}
+            <span class="rounded-full bg-red-50 px-2 py-0.5 text-[10px] font-semibold text-red-600">failed</span>
+            {% endif %}
+          </div>
+          {% if r.summary != "" %}<div class="mt-0.5 truncate text-xs text-gray-500">{{ r.summary }}</div>{% endif %}
+        </div>
+        <span class="flex-none text-right text-[11px] text-gray-400">{{ r.created_at }}<br><span class="text-gray-300">{{ r.actor }}</span></span>
+      </div>
+      {% endfor %}
     </div>
+    <p id="rnomatch" class="hidden px-1 py-6 text-center text-sm text-gray-400">No receipts match that operation.</p>
     {% endif %}
   </main>
 </div>
+
+<script>
+  (function () {
+    var f = document.getElementById('rfilter');
+    if (!f) return;
+    var rows = Array.prototype.slice.call(document.querySelectorAll('.rcpt-row'));
+    var none = document.getElementById('rnomatch');
+    f.addEventListener('input', function () {
+      var q = f.value.trim().toLowerCase(); var shown = 0;
+      rows.forEach(function (r) {
+        var match = (r.getAttribute('data-op') || '').toLowerCase().indexOf(q) !== -1;
+        r.style.display = match ? '' : 'none'; if (match) shown++;
+      });
+      if (none) none.classList.toggle('hidden', shown !== 0);
+    });
+  })();
+</script>
 {% endblock %}
