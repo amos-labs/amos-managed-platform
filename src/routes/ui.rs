@@ -54,6 +54,8 @@ fn extract_client_ip(headers: &axum::http::HeaderMap) -> String {
 }
 
 /// Truncate a version/image tag for display (e.g., "sha-f73ede4..." → "sha-f73ed...").
+// Retained for the upcoming Apps/Receipts page redesign (version display).
+#[allow(dead_code)]
 fn truncate_version(v: &str) -> String {
     if v.len() > 16 {
         format!("{}...", &v[..13])
@@ -312,14 +314,20 @@ struct DashboardTemplate {
     tenant_name: String,
     tenant_slug: String,
     plan: String,
-    plan_price: String,
     stripe_subscription_status: String,
-    instances: Vec<HarnessInfo>,
+    /// Hosted apps + their services (the env at a glance).
+    apps: Vec<AppRow>,
+    /// Recent proof receipts (what the AI did) — newest first, capped.
+    receipts: Vec<ReceiptRow>,
+    /// Public MCP endpoint the operator points their AI at.
+    mcp_url: String,
+    /// Masked prefix of an existing API key (the full value is shown only once
+    /// at creation); `None` when the tenant has no key yet.
+    key_prefix: Option<String>,
     user_count: i64,
     api_key_count: i64,
     flash_message: Option<String>,
     flash_error: Option<String>,
-    billing_enabled: bool,
 }
 
 #[derive(Template)]
@@ -487,23 +495,15 @@ async fn tenant_name_slug(
 }
 
 /// Apps page: the tenant's multi-service deployments + per-service status.
-async fn apps_page(State(state): State<PlatformState>, headers: axum::http::HeaderMap) -> Response {
-    let claims = match extract_session_claims(&state, &headers) {
-        Some(c) => c,
-        None => return Redirect::to("/login").into_response(),
-    };
-    let tenant_id: Uuid = match claims.tenant_id.parse() {
-        Ok(id) => id,
-        Err(_) => return Redirect::to("/login").into_response(),
-    };
-    let (tenant_name, tenant_slug) = tenant_name_slug(&state, tenant_id, &claims.tenant_slug).await;
-
+/// Build the tenant's app rows (deployments + their services), newest first.
+/// Shared by the Apps page and the dashboard.
+async fn build_app_rows(state: &PlatformState, tenant_id: Uuid) -> Vec<AppRow> {
     let deployments =
         sqlx::query_as::<_, (Uuid, String, String, String, Option<serde_json::Value>)>(
             "SELECT id, name, provider, status, aws_meta
-         FROM app_deployments
-         WHERE tenant_id = $1 AND status != 'deprovisioned'
-         ORDER BY created_at DESC",
+             FROM app_deployments
+             WHERE tenant_id = $1 AND status != 'deprovisioned'
+             ORDER BY created_at DESC",
         )
         .bind(tenant_id)
         .fetch_all(&state.db)
@@ -547,6 +547,63 @@ async fn apps_page(State(state): State<PlatformState>, headers: axum::http::Head
             services,
         });
     }
+    apps
+}
+
+/// Recent proof receipts for the tenant, newest first, capped at `limit`.
+/// Shared by the Receipts page and the dashboard activity feed.
+async fn recent_receipts(state: &PlatformState, tenant_id: Uuid, limit: i64) -> Vec<ReceiptRow> {
+    let rows = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            bool,
+            chrono::DateTime<chrono::Utc>,
+            serde_json::Value,
+        ),
+    >(
+        "SELECT operation, actor, verified, created_at, receipt
+         FROM operation_receipts
+         WHERE tenant_id = $1
+         ORDER BY created_at DESC
+         LIMIT $2",
+    )
+    .bind(tenant_id)
+    .bind(limit)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    rows.into_iter()
+        .map(
+            |(operation, actor, verified, created_at, receipt)| ReceiptRow {
+                created_at: created_at.format("%Y-%m-%d %H:%M UTC").to_string(),
+                operation,
+                actor: actor.chars().take(8).collect(),
+                verified,
+                summary: receipt
+                    .get("result_summary")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            },
+        )
+        .collect()
+}
+
+async fn apps_page(State(state): State<PlatformState>, headers: axum::http::HeaderMap) -> Response {
+    let claims = match extract_session_claims(&state, &headers) {
+        Some(c) => c,
+        None => return Redirect::to("/login").into_response(),
+    };
+    let tenant_id: Uuid = match claims.tenant_id.parse() {
+        Ok(id) => id,
+        Err(_) => return Redirect::to("/login").into_response(),
+    };
+    let (tenant_name, tenant_slug) = tenant_name_slug(&state, tenant_id, &claims.tenant_slug).await;
+
+    let apps = build_app_rows(&state, tenant_id).await;
 
     // App-hosting billing summary (tier + deployed container units + charge).
     let summary = crate::billing::app_hosting::tenant_summary(&state.db, tenant_id).await;
@@ -643,44 +700,7 @@ async fn receipts_page(
     let (tenant_name, _tenant_slug) =
         tenant_name_slug(&state, tenant_id, &claims.tenant_slug).await;
 
-    let rows = sqlx::query_as::<
-        _,
-        (
-            String,
-            String,
-            bool,
-            chrono::DateTime<chrono::Utc>,
-            serde_json::Value,
-        ),
-    >(
-        "SELECT operation, actor, verified, created_at, receipt
-         FROM operation_receipts
-         WHERE tenant_id = $1
-         ORDER BY created_at DESC
-         LIMIT 50",
-    )
-    .bind(tenant_id)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
-
-    let receipts = rows
-        .into_iter()
-        .map(
-            |(operation, actor, verified, created_at, receipt)| ReceiptRow {
-                created_at: created_at.format("%Y-%m-%d %H:%M UTC").to_string(),
-                operation,
-                // Actor ids are long; show a short prefix.
-                actor: actor.chars().take(8).collect(),
-                verified,
-                summary: receipt
-                    .get("result_summary")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-            },
-        )
-        .collect();
+    let receipts = recent_receipts(&state, tenant_id, 50).await;
 
     HtmlTemplate(ReceiptsTemplate {
         tenant_name,
@@ -696,6 +716,7 @@ pub fn routes() -> Router<PlatformState> {
         .route("/receipts", get(receipts_page))
         .route("/register", get(register_page).post(register_submit))
         .route("/dashboard", get(dashboard_page))
+        .route("/dashboard/ask", post(dashboard_ask))
         .route("/settings", get(settings_page))
         .route("/settings/api-keys", post(create_api_key_submit))
         .route("/billing/success", get(billing_success))
@@ -745,9 +766,14 @@ async fn login_submit(
 
     // Look up user by email
     let row = sqlx::query_as::<_, (Uuid, Uuid, String, String, String, bool)>(
+        // Email can exist across multiple tenants (a user may own several).
+        // Skip login-disabled placeholders (hash sentinel `!...`) and prefer an
+        // active account so a disabled row can't shadow the real one.
+        // TODO: real multi-tenant login (tenant selection / SSO) — policy TBD.
         "SELECT u.id, u.tenant_id, u.password_hash, u.role, t.slug, u.is_active
          FROM users u JOIN tenants t ON u.tenant_id = t.id
-         WHERE u.email = $1
+         WHERE u.email = $1 AND u.password_hash NOT LIKE '!%'
+         ORDER BY u.is_active DESC
          LIMIT 1",
     )
     .bind(&form.email)
@@ -1084,96 +1110,32 @@ async fn dashboard_page(
         )
     });
 
-    let plan_enum = crate::billing::Plan::parse(&plan);
     let stripe_subscription_status = stripe_sub_status.unwrap_or_else(|| "none".into());
 
-    // Fetch the latest available release version for update-available badge.
-    let latest_release_version: Option<String> = sqlx::query_scalar(
-        "SELECT version FROM releases WHERE status = 'available' ORDER BY created_at DESC LIMIT 1",
+    // Hosted apps + their services (the env at a glance) and the recent proof feed.
+    let apps = build_app_rows(&state, tenant_id).await;
+    let receipts = recent_receipts(&state, tenant_id, 6).await;
+
+    // Public MCP endpoint the operator points their AI at.
+    let mcp_url = std::env::var("AMOS__PUBLIC__MCP_URL")
+        .unwrap_or_else(|_| "https://platform.custom.amoslabs.com/mcp".to_string());
+
+    // Masked prefix of the most-recent active key (full value shown only at creation).
+    let key_prefix: Option<String> = sqlx::query_scalar(
+        "SELECT key_prefix FROM api_keys WHERE tenant_id = $1 AND is_active = TRUE \
+         ORDER BY created_at DESC LIMIT 1",
     )
+    .bind(tenant_id)
     .fetch_optional(&state.db)
     .await
     .ok()
     .flatten();
 
-    // Fetch harness instances (including endpoint info and version tracking).
-    let harness_rows = sqlx::query_as::<_, (Uuid, String, Option<String>, String, String, bool, Option<i32>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)>(
-        "SELECT id, status, subdomain, region, instance_size, healthy, external_port, internal_url, container_id, image_tag, previous_image_tag, name
-         FROM harness_instances WHERE tenant_id = $1 AND status != 'deprovisioned' ORDER BY created_at DESC"
-    )
-    .bind(tenant_id)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
-
-    let instances: Vec<HarnessInfo> = harness_rows
-        .into_iter()
-        .map(
-            |(
-                id,
-                status,
-                subdomain,
-                region,
-                instance_size,
-                healthy,
-                _external_port,
-                internal_url,
-                container_id,
-                image_tag,
-                previous_image_tag,
-                name,
-            )| {
-                // Prefer public subdomain URL over internal IP for the endpoint display.
-                let endpoint_url = subdomain
-                    .as_deref()
-                    .map(|s| format!("https://{}.custom.amoslabs.com", s))
-                    .or(internal_url);
-
-                // Show update badge when latest release differs from current image_tag,
-                // or when image_tag is unknown (NULL = pre-versioning harness).
-                let update_available = match (&latest_release_version, &image_tag) {
-                    (Some(latest), Some(current)) if latest != current => Some(latest.clone()),
-                    (Some(latest), None) => Some(latest.clone()),
-                    _ => None,
-                };
-
-                let image_tag_short = image_tag.as_ref().map(|t| truncate_version(t));
-                let update_available_short = update_available.as_ref().map(|t| truncate_version(t));
-
-                HarnessInfo {
-                    id: id.to_string()[..8].to_string(),
-                    full_id: id.to_string(),
-                    name,
-                    status,
-                    subdomain,
-                    region,
-                    instance_size,
-                    healthy,
-                    endpoint_url,
-                    container_id_short: container_id.map(|c| {
-                        if c.len() > 12 {
-                            c[..12].to_string()
-                        } else {
-                            c
-                        }
-                    }),
-                    image_tag,
-                    image_tag_short,
-                    previous_image_tag,
-                    update_available,
-                    update_available_short,
-                }
-            },
-        )
-        .collect();
-
-    // Fetch counts
     let user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE tenant_id = $1")
         .bind(tenant_id)
         .fetch_one(&state.db)
         .await
         .unwrap_or(0);
-
     let api_key_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE tenant_id = $1")
             .bind(tenant_id)
@@ -1185,18 +1147,15 @@ async fn dashboard_page(
         tenant_name,
         tenant_slug,
         plan,
-        plan_price: if plan_enum.is_paid() {
-            "Per harness".to_string()
-        } else {
-            "Free".to_string()
-        },
         stripe_subscription_status,
-        instances,
+        apps,
+        receipts,
+        mcp_url,
+        key_prefix,
         user_count,
         api_key_count,
         flash_message: query.msg,
         flash_error: query.error,
-        billing_enabled: state.stripe_client.is_some(),
     })
     .into_response()
 }
@@ -2696,4 +2655,56 @@ impl<T: Template> IntoResponse for HtmlTemplate<T> {
             }
         }
     }
+}
+
+#[derive(Deserialize)]
+struct AskForm {
+    q: String,
+}
+
+/// In-browser `ask_amos` quick-question (read-only manager agent). The full
+/// agent experience is via the MCP from Claude Code/Desktop; this is a one-shot
+/// convenience for owners who want a quick answer without leaving the dashboard.
+async fn dashboard_ask(
+    State(state): State<PlatformState>,
+    headers: axum::http::HeaderMap,
+    Form(form): Form<AskForm>,
+) -> Response {
+    let claims = match extract_session_claims(&state, &headers) {
+        Some(c) => c,
+        None => return Redirect::to("/login").into_response(),
+    };
+    let answer = match crate::mcp::ask_amos::run(&state, &claims, &form.q).await {
+        Ok(v) => v
+            .get("answer")
+            .and_then(|a| a.as_str())
+            .unwrap_or("(no answer)")
+            .to_string(),
+        Err(e) => format!(
+            "The agent couldn't answer right now ({e:?}). For the full agent, connect Claude to your MCP endpoint from the dashboard."
+        ),
+    };
+    let esc = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    };
+    axum::response::Html(format!(
+        r#"<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Ask AMOS</title>
+<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f6f7f9;margin:0;color:#1f2733">
+<div style="max-width:760px;margin:0 auto;padding:32px 20px">
+  <a href="/dashboard" style="color:#3f6fe6;text-decoration:none;font-size:13px;font-weight:600">&larr; Back to dashboard</a>
+  <div style="margin-top:16px;background:#fff;border:1px solid #e6e8ee;border-radius:12px;padding:20px">
+    <div style="font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#69707d">You asked</div>
+    <div style="margin-top:4px;font-weight:600;color:#0E1420">{q}</div>
+    <div style="margin-top:18px;font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#69707d">AMOS agent (read-only)</div>
+    <div style="margin-top:6px;white-space:pre-wrap;line-height:1.55">{a}</div>
+  </div>
+  <p style="margin-top:14px;color:#69707d;font-size:13px">Want it to actually <em>do</em> things &mdash; deploy, edit finances, provision? <a href="/dashboard" style="color:#3f6fe6">Connect your AI</a> and ask it there.</p>
+</div></body>"#,
+        q = esc(&form.q),
+        a = esc(&answer),
+    ))
+    .into_response()
 }

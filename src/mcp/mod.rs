@@ -49,7 +49,7 @@ pub fn routes() -> Router<PlatformState> {
 // ── JSON-RPC transport ──────────────────────────────────────────────────
 
 /// `ask_amos` — natural-language manager front door (embedded Bedrock loop).
-mod ask_amos;
+pub(crate) mod ask_amos;
 
 /// Finance engine — governed `finance_*` verb surface (reference business engine).
 pub mod finance;

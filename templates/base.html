@@ -5,6 +5,16 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>{% block title %}AMOS Platform{% endblock %}</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    // AMOS brand palette — shared across pages (matches amoslabs.com).
+    tailwind.config = {
+      theme: { extend: { colors: {
+        ink: '#0E1420', 'ink-soft': '#1b2a44',
+        accent: '#3f6fe6', 'accent-soft': '#eaf0fd',
+        verified: '#1f9d57', 'verified-soft': '#e7f6ed',
+      } } }
+    };
+  </script>
   <style>
     [x-cloak] { display: none !important; }
   </style>
