@@ -86,6 +86,8 @@ aws-sdk-cloudwatchlogs = "1"
 aws-sdk-secretsmanager = "1"
 # ask_amos: embedded Bedrock (Claude) manager loop over the read-only control verbs.
 aws-sdk-bedrockruntime = "1"
+# Transactional email (password-reset links) via SES. Config-gated on AMOS__EMAIL__FROM.
+aws-sdk-sesv2 = "1"
 aws-smithy-types = "1"
 # Usage metering: per-service CpuReserved/MemoryReserved/NetworkTxBytes from
 # Container Insights -> exact unit-hours + egress for app-hosting billing.

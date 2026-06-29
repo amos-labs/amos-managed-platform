@@ -2949,8 +2949,8 @@ async fn forgot_password_submit(
         .flatten();
 
         if let Some(uid) = user_id {
-            let (_raw, hash) = auth::generate_reset_token();
-            let _ = sqlx::query(
+            let (raw, hash) = auth::generate_reset_token();
+            let inserted = sqlx::query(
                 "INSERT INTO password_reset_tokens (user_id, token_hash, expires_at)
                  VALUES ($1, $2, NOW() + INTERVAL '24 hours')",
             )
@@ -2959,6 +2959,18 @@ async fn forgot_password_submit(
             .execute(&state.db)
             .await;
             info!(user_id = %uid, "Password reset requested");
+
+            // Deliver the link by email when a mailer is configured. Errors are
+            // logged and swallowed — the HTTP response stays the same neutral
+            // message regardless, so account existence is never revealed.
+            if inserted.is_ok() {
+                if let Some(mailer) = &state.mailer {
+                    let reset_url = format!("{}/reset-password?token={}", public_app_url(), raw);
+                    if let Err(e) = mailer.send_password_reset(email, &reset_url).await {
+                        warn!(user_id = %uid, "Failed to send password-reset email: {e}");
+                    }
+                }
+            }
         }
     }
 

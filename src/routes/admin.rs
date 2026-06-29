@@ -192,6 +192,7 @@ pub fn routes() -> Router<PlatformState> {
         .route("/admin/tenants/{id}", get(get_tenant))
         .route("/admin/tenants/{id}/upgrade", post(upgrade_plan))
         .route("/admin/users/reset-link", post(generate_reset_link))
+        .route("/admin/tenants/{tenant_id}/users", post(create_tenant_user))
         .route("/admin/tenants/{id}/provision", post(provision_harness))
         .route("/admin/harnesses/{id}/restart", post(restart_harness))
         .route("/admin/harnesses/{id}/redeploy", post(redeploy_harness))
@@ -659,6 +660,164 @@ async fn generate_reset_link(
     Ok(Json(ResetLinkResponse {
         reset_url,
         expires_at,
+    }))
+}
+
+/// Normalize a requested role to one of the three valid roles, or `None` if it
+/// isn't a recognized role. Case-insensitive, trims whitespace.
+fn normalize_role(role: &str) -> Option<&'static str> {
+    match role.trim().to_ascii_lowercase().as_str() {
+        "owner" => Some("owner"),
+        "admin" => Some("admin"),
+        "member" => Some("member"),
+        _ => None,
+    }
+}
+
+#[derive(Deserialize)]
+struct CreateUserRequest {
+    email: String,
+    name: String,
+    role: String,
+}
+
+#[derive(Serialize)]
+struct CreateUserResponse {
+    user_id: Uuid,
+    reset_url: String,
+    emailed: bool,
+    role: String,
+}
+
+/// POST /api/v1/admin/tenants/{tenant_id}/users
+///
+/// Admin-only: add a user to a tenant. Productizes the manual onboarding done
+/// by hand for the first Compliance customer. Creates the user with a random
+/// password and an email-verified, active row, then mints a single-use 24h
+/// reset token so the user sets their own password (emailed if a mailer is
+/// configured, otherwise the link is returned for out-of-band delivery).
+///
+/// When `role == "owner"`, any existing owner of the tenant is demoted to
+/// `admin` first, preserving the single-owner invariant billing relies on. All
+/// of this happens in one transaction.
+async fn create_tenant_user(
+    _auth: AdminAuth,
+    State(state): State<PlatformState>,
+    Path(tenant_id): Path<Uuid>,
+    Json(req): Json<CreateUserRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let bad_request = |msg: &str| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse { error: msg.into() }),
+        )
+    };
+    let internal = |e: sqlx::Error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Database error: {e}"),
+            }),
+        )
+    };
+
+    let email = req.email.trim().to_string();
+    let name = req.name.trim().to_string();
+    let role = normalize_role(&req.role)
+        .ok_or_else(|| bad_request("role must be one of: owner, admin, member"))?;
+    if !email.contains('@') {
+        return Err(bad_request("a valid email address is required"));
+    }
+    if name.is_empty() {
+        return Err(bad_request("name is required"));
+    }
+
+    let throwaway_password = crate::auth::generate_reset_token().0;
+    let password_hash = crate::auth::hash_password(&throwaway_password).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to hash password: {e}"),
+            }),
+        )
+    })?;
+
+    let mut tx = state.db.begin().await.map_err(internal)?;
+
+    // Single-owner invariant: demote any existing owner before adding a new one.
+    if role == "owner" {
+        sqlx::query("UPDATE users SET role = 'admin' WHERE tenant_id = $1 AND role = 'owner'")
+            .bind(tenant_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(internal)?;
+    }
+
+    let insert = sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO users (id, tenant_id, email, name, password_hash, role, email_verified, is_active)
+         VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, TRUE, TRUE)
+         RETURNING id",
+    )
+    .bind(tenant_id)
+    .bind(&email)
+    .bind(&name)
+    .bind(&password_hash)
+    .bind(role)
+    .fetch_one(&mut *tx)
+    .await;
+
+    let user_id = match insert {
+        Ok(id) => id,
+        Err(e) => {
+            // Per-tenant unique (tenant_id, email) violation → 409.
+            if e.to_string().contains("users_tenant_id_email_key") {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(ErrorResponse {
+                        error: format!(
+                            "a user with email '{email}' already exists for this tenant"
+                        ),
+                    }),
+                ));
+            }
+            return Err(internal(e));
+        }
+    };
+
+    let (raw, hash) = crate::auth::generate_reset_token();
+    sqlx::query(
+        "INSERT INTO password_reset_tokens (user_id, token_hash, expires_at)
+         VALUES ($1, $2, NOW() + INTERVAL '24 hours')",
+    )
+    .bind(user_id)
+    .bind(&hash)
+    .execute(&mut *tx)
+    .await
+    .map_err(internal)?;
+
+    tx.commit().await.map_err(internal)?;
+
+    let reset_url = format!(
+        "{}/reset-password?token={}",
+        crate::routes::ui::public_app_url(),
+        raw
+    );
+
+    // Email the link if a mailer is configured; never fail the request on a
+    // send error (the link is still returned for out-of-band delivery).
+    let mut emailed = false;
+    if let Some(mailer) = &state.mailer {
+        match mailer.send_password_reset(&email, &reset_url).await {
+            Ok(()) => emailed = true,
+            Err(e) => tracing::warn!(%user_id, "Failed to email reset link: {e}"),
+        }
+    }
+
+    Ok(Json(CreateUserResponse {
+        user_id,
+        reset_url,
+        emailed,
+        role: role.to_string(),
     }))
 }
 
@@ -1241,4 +1400,23 @@ async fn get_stats(
         active_harnesses,
         harnesses_by_plan,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_role;
+
+    #[test]
+    fn normalize_role_accepts_the_three_roles_case_insensitively() {
+        assert_eq!(normalize_role("owner"), Some("owner"));
+        assert_eq!(normalize_role("ADMIN"), Some("admin"));
+        assert_eq!(normalize_role("  Member "), Some("member"));
+    }
+
+    #[test]
+    fn normalize_role_rejects_unknown_roles() {
+        assert_eq!(normalize_role("superuser"), None);
+        assert_eq!(normalize_role(""), None);
+        assert_eq!(normalize_role("owner; drop"), None);
+    }
 }

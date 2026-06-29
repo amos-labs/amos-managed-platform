@@ -119,6 +119,9 @@ pub struct PlatformState {
     /// finance service. The `finance_*` MCP verbs proxy to this behind `finance:*`
     /// scopes + proof receipts.
     pub finance: Arc<dyn crate::mcp::finance::FinanceEngineClient>,
+    /// Transactional email sender (SES). `None` unless `AMOS__EMAIL__FROM` is
+    /// set; when present, password-reset links are emailed to the user.
+    pub mailer: Option<Arc<crate::email::Mailer>>,
     /// In-flight manifest `deploy`s, keyed `deployment_id → deploy_id`, so a
     /// second deploy for the same app returns `already_deploying` cleanly
     /// instead of spawning a colliding job (which previously no-op'd into a
@@ -320,6 +323,29 @@ impl PlatformState {
                 }
             };
 
+        // Transactional email (SES) — only when AMOS__EMAIL__FROM is configured.
+        // Loading the AWS config is skipped entirely when email is disabled.
+        let mailer = if std::env::var("AMOS__EMAIL__FROM")
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+        {
+            let aws_conf = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                .load()
+                .await;
+            match crate::email::Mailer::from_env(&aws_conf) {
+                Some(m) => {
+                    info!("Mailer initialized (SES password-reset email enabled)");
+                    Some(Arc::new(m))
+                }
+                None => None,
+            }
+        } else {
+            info!(
+                "Mailer not configured (AMOS__EMAIL__FROM not set; reset links delivered by admin)"
+            );
+            None
+        };
+
         Ok(Self {
             db,
             redis,
@@ -335,6 +361,7 @@ impl PlatformState {
             stripe_client,
             stripe_config,
             finance,
+            mailer,
             in_flight_deploys: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         })
     }
