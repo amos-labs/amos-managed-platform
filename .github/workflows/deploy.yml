@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [main]
 
+# Serialize deploys per ref so two quick merges to main can't run concurrent
+# ECS rollouts against the same service (that race left the service flapping).
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   AWS_REGION: us-east-1
   ECR_REGISTRY: 637423327454.dkr.ecr.us-east-1.amazonaws.com
@@ -17,6 +23,20 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # ============================================================================
+  # PROBE: confirm GitHub-hosted arm64 runners are available to this repo.
+  # The deploy job builds on arm64 (Fargate runs arm64); this proves the runner
+  # exists before a merge relies on it. Safe to remove once deploys are proven.
+  # ============================================================================
+  arm-runner-check:
+    name: arm64 runner probe
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Report architecture
+        run: |
+          echo "arch=$(uname -m)"   # expect aarch64
+          test "$(uname -m)" = "aarch64"
+
   # ============================================================================
   # GATE 1: Lint + Unit Tests + Security Audit
   # ============================================================================
@@ -149,7 +169,10 @@ jobs:
   # ============================================================================
   deploy:
     name: Build & Deploy to ECS
-    runs-on: ubuntu-latest
+    # Native arm64 runner so the image matches the Fargate runtimePlatform
+    # (ARM64). Building linux/amd64 here produced an unpullable image:
+    # "image Manifest does not contain descriptor matching platform linux/arm64".
+    runs-on: ubuntu-24.04-arm
     needs: integration-test
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
 
@@ -181,7 +204,7 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64
+          platforms: linux/arm64
           push: true
           tags: |
             ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:sha-${{ github.sha }}
