@@ -2627,6 +2627,20 @@ struct CheckoutForm {
     plan: Option<String>,
 }
 
+/// Public, browser-reachable base URL of the dashboard (no trailing slash),
+/// used to build Stripe redirect (success/cancel) URLs. Prefers
+/// `AMOS__PUBLIC__APP_URL`, then the provisioning `ECS_PLATFORM_URL`, and falls
+/// back to the prod host. Never derive this from `server.host:port` — in prod
+/// that is the bind address `0.0.0.0:4000`, unreachable from a browser.
+fn public_app_url() -> String {
+    std::env::var("AMOS__PUBLIC__APP_URL")
+        .or_else(|_| std::env::var("ECS_PLATFORM_URL"))
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim_end_matches('/').to_string())
+        .unwrap_or_else(|| "https://app.amoslabs.com".to_string())
+}
+
 /// `POST /billing/checkout` — create Stripe Checkout session for plan upgrade.
 async fn billing_checkout(
     State(state): State<PlatformState>,
@@ -2716,16 +2730,11 @@ async fn billing_checkout(
         }
     };
 
-    let base_url = format!(
-        "{}://{}:{}",
-        if state.config.server.port == 443 {
-            "https"
-        } else {
-            "http"
-        },
-        state.config.server.host,
-        state.config.server.port
-    );
+    // Stripe redirect URLs must be reachable from the customer's browser, so
+    // use the public dashboard URL — never `server.host:port`, which in prod is
+    // the bind address `0.0.0.0:4000` and would strand a paying customer on a
+    // dead page after checkout.
+    let base_url = public_app_url();
     // App-tier checkouts begin + cancel from the Apps page; harness-size
     // checkouts use the upgrade page.
     let is_app_tier = plan.starts_with("app_");
