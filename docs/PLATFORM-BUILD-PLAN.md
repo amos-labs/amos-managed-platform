@@ -52,8 +52,13 @@ The runtime-data successor to packages.
 ### P3 — Reseller / partner model + Stripe Connect  *(the channel — v1)*
 - **Partner entity** + **partner → child-tenant** link + **attribution** (which partner sold which tenant).
 - **Stripe Connect**: partner onboarding (Express), rev-share split on each child tenant's subscription, payout + reporting.
-- **Billing entitlements**: base CRM SKU + per-engine/app add-ons; entitlement checks gate engine enablement.
-- **Acceptance:** a partner is onboarded to Connect; a child tenant's $X/mo subscription splits to the partner automatically; attribution is queryable.
+- **Billing model — "smart infra" + licensed software** (two axes):
+  - **Smart infra** — the tiered base ($99–$899: compute + the MCP operator + *bundled* engines like finance & marketing). ~40% margin; the differentiated substrate, not commodity hosting. **Every tenant pays this.**
+  - **Licensed software** — net-new AMOS products (the CRM, designated premium engines) as separate subscription line items on top. SaaS margin — where value is captured. CRM license = **flat fee + seat bands** (≤10, ≤50, …).
+  - A per-item **`designation` flag** decides bundled-into-infra vs. licensed (bundle finance/marketing + all MCP access now; the CRM is licensed). Preserves the lever to meter later.
+  - **Bring-your-own apps (Cuspr/Nuvola, any dev) pay smart infra only** — no software license; they run their own business model. AMOS as neutral smart infra.
+  - **Rev-share applies to the license margin, not infra.** Entitlement checks gate licensed products/engines.
+- **Acceptance:** a partner is onboarded to Connect; a child tenant's license line splits to the partner automatically (infra is not shared); attribution is queryable.
 
 ### P4 — Permission tiers / the fence  *(governance — makes self-mod sellable)*
 Generalize RBAC + proofgate from a global flag to **per-actor/path policy** (this is proofgate#11 / the "dentist scenario," productized).
