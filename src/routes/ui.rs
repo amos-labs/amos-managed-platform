@@ -390,7 +390,6 @@ struct AppsTemplate {
     tenant_slug: String,
     apps: Vec<AppRow>,
     /// App-hosting billing summary.
-    on_app_tier: bool,
     plan_display: String,
     deployed_units: u32,
     included_units: u32,
@@ -400,7 +399,15 @@ struct AppsTemplate {
     period_unit_hours: String,
     period_egress_gb: String,
     period_charge: String,
-    /// Selectable hosting tiers (shown when the tenant is not yet on one).
+    /// Whether the tenant has an ACTIVE (paying) Stripe subscription. Drives the
+    /// plan-summary vs. subscribe view — a plan can be set without an active
+    /// subscription (e.g. onboarded before payment), and such a tenant still
+    /// needs to be able to subscribe.
+    subscription_active: bool,
+    /// Plan is set but there's no active subscription yet → show a prompt to
+    /// finish paying, alongside the tiers.
+    needs_payment: bool,
+    /// Selectable hosting tiers (shown when there's no active subscription).
     tiers: Vec<TierCard>,
 }
 
@@ -847,11 +854,23 @@ async fn apps_page(State(state): State<PlatformState>, headers: axum::http::Head
     })
     .collect();
 
+    // A plan can be set without an active subscription (e.g. a tenant onboarded
+    // before paying). Only an active/trialing Stripe subscription counts as
+    // "subscribed"; otherwise keep showing the subscribe path so they can pay.
+    let sub_status: String = sqlx::query_scalar(
+        "SELECT COALESCE(stripe_subscription_status, 'none') FROM tenants WHERE id = $1",
+    )
+    .bind(tenant_id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or_else(|_| "none".to_string());
+    let subscription_active = matches!(sub_status.as_str(), "active" | "trialing");
+    let needs_payment = on_app_tier && !subscription_active;
+
     HtmlTemplate(AppsTemplate {
         tenant_name,
         tenant_slug,
         apps,
-        on_app_tier,
         plan_display,
         deployed_units: summary.deployed_units,
         included_units,
@@ -860,6 +879,8 @@ async fn apps_page(State(state): State<PlatformState>, headers: axum::http::Head
         period_unit_hours,
         period_egress_gb,
         period_charge,
+        subscription_active,
+        needs_payment,
         tiers,
     })
     .into_response()

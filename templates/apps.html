@@ -30,7 +30,7 @@
       <p class="mt-1 max-w-2xl text-sm text-gray-500">Everything your AI runs for you in <span class="font-medium text-gray-700">{{ tenant_slug }}</span> — apps, dashboards, data jobs, preview environments. Tell your AI to build or deploy something and it shows up here; it operates these through its MCP tools, proof-carried.</p>
     </div>
 
-    {% if on_app_tier %}
+    {% if subscription_active %}
     <div class="mb-8 flex flex-wrap items-center gap-6 rounded-xl border border-[#cfddf9] bg-accent-soft px-5 py-4">
       <div>
         <div class="text-[11px] font-semibold uppercase tracking-wide text-accent">Plan</div>
@@ -54,8 +54,16 @@
     </div>
     {% else %}
     <div class="mb-8">
+      {% if needs_payment %}
+      <div class="mb-4 rounded-xl border border-[#f0d3ad] bg-[#fdf3e6] px-5 py-3 text-sm text-ink">
+        <span class="font-semibold">Your {{ plan_display }} plan isn't active yet.</span> Add a payment method below to activate it.
+      </div>
+      <h2 class="text-sm font-bold text-ink">Activate your plan</h2>
+      <p class="mt-1 text-sm text-gray-500">Subscribe to finish setting up — you can change plans anytime.</p>
+      {% else %}
       <h2 class="text-sm font-bold text-ink">Choose a hosting plan</h2>
       <p class="mt-1 text-sm text-gray-500">Pick a plan to host + operate your environment — you can change it anytime.</p>
+      {% endif %}
       <div class="mt-4 grid gap-4 sm:grid-cols-3">
         {% for tier in tiers %}
         <div class="flex flex-col rounded-xl border border-gray-200 bg-white p-5 shadow-sm">
