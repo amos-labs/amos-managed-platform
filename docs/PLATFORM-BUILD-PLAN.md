@@ -61,12 +61,12 @@ The runtime-data successor to packages.
   - Entitlement checks gate the marketing engine + each module. Keep the **designation lever** (bundle vs. charge) per new capability. Prices kept deliberately low — automation-driven cost-to-serve → undercut incumbents → volume (the North Star's "volume first").
 - **Acceptance:** a partner is onboarded to Connect; a child tenant's license line splits to the partner automatically (infra is not shared); attribution is queryable.
 
-### P4 — Permission tiers / the fence  *(governance — makes self-mod sellable)*
-Generalize RBAC + proofgate from a global flag to **per-actor/path policy** (this is proofgate#11 / the "dentist scenario," productized).
-- Three tiers: **AMOS-core** (protected — billing, isolation, platform internals, other tenants), **reseller** (may shape the template they sell), **builder** (may customize their own instance: their views/fields/workflows).
-- Enforced on every self-modification (which collections/views/automations/engines an actor may change).
-- Owner-approval escalation for out-of-scope requests; **every change proof-carrying** (receipt).
-- **Acceptance:** a builder-scoped actor can add a field/view but is structurally blocked (with a clear message) from touching billing, isolation, or another tenant.
+### P4 — The core/module boundary + sandbox  *(governance — structural, not policy)*
+The demarcation of what's editable is **architectural, not a path-permission fence**: the **core is locked** (platform, engines, marketing/CRM internals, billing, isolation, other tenants); **everyone builds in the module layer.** This single boundary simultaneously (a) fences self-modification, (b) keeps upgrades clean — modules are additive overlays on an unchanged core, so P5 rarely conflicts — and (c) sets the rev line (core = AMOS; modules = partner/user). It supersedes the old "generalize RBAC to per-actor/path policy" framing (proofgate#11 / the "dentist scenario") — the module boundary *is* the answer.
+- **The work:** a **module contract** (what a module may read / write / hook — this is P1, the component/template system) + a **sandbox** so a module structurally cannot reach core internals, another tenant, or billing/isolation (even buggy/adversarial).
+- **One boundary, three scopes:** AMOS owns the core → partners build vertical modules → builders build their own modules. Owner-approval escalation only for the rare cross-boundary request; **every change proof-carrying**.
+- **The core must expose the right extension points** so *most* customization genuinely happens in modules — if users keep needing to change core, the boundary leaks.
+- **Acceptance:** a builder builds a module (fields/views/automations, or a whole module) and it works; the same actor is *structurally* unable (not just policy-denied) to reach the core, billing, isolation, or another tenant.
 
 ### P5 — Upgrade / overlay engine  *(pull model, Claude-mediated)*
 - **Template versioning**; tenant customizations stored as **additive overlays** (from P1).
