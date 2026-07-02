@@ -43,7 +43,7 @@ Build each as a library component = `{ collection schema, canvas views, automati
 - Compose the components above + enable the **finance engine** (for job-costing).
 - Seed data (stages, example records for demo/trial).
 - This is the **SKU a builder buys**. Versioned (feeds P5 upgrades).
-- **Pricing:** the builder pays **smart infra** (tiered base, includes MCP + finance/marketing engines) **+ a CRM license** on top — **flat fee + seat bands** (≤10 users, ≤50, …). The license is the value-capture and the reseller rev-share lever; infra is not shared. To run the CRM you start on AMOS ($99+). See `PLATFORM-BUILD-PLAN.md` P3.
+- **Pricing (≈ $499/mo all-in):** **smart infra** $99 (the brain, incl. the finance engine) + the **marketing engine incl. generic CRM** $299 (AMOS's flagship add-on, a HubSpot-replacement) + the **construction module** $99 (partner-built — 30% to AMOS, 70% partner). Smart infra + marketing/CRM are AMOS rev; the construction vertical is the partner-rev layer. Note: the CRM lives *inside* the marketing engine (not standalone); construction is a module on top. See `PLATFORM-BUILD-PLAN.md` P3.
 - **Acceptance:** `apply_template(construction-crm)` on a fresh tenant yields a complete, usable CRM.
 
 ## Phase 3 — The AI operator layer

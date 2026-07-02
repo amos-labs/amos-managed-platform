@@ -52,12 +52,13 @@ The runtime-data successor to packages.
 ### P3 — Reseller / partner model + Stripe Connect  *(the channel — v1)*
 - **Partner entity** + **partner → child-tenant** link + **attribution** (which partner sold which tenant).
 - **Stripe Connect**: partner onboarding (Express), rev-share split on each child tenant's subscription, payout + reporting.
-- **Billing model — "smart infra" + licensed software** (two axes):
-  - **Smart infra** — the tiered base ($99–$899: compute + the MCP operator + *bundled* engines like finance & marketing). ~40% margin; the differentiated substrate, not commodity hosting. **Every tenant pays this.**
-  - **Licensed software** — net-new AMOS products (the CRM, designated premium engines) as separate subscription line items on top. SaaS margin — where value is captured. CRM license = **flat fee + seat bands** (≤10, ≤50, …).
-  - A per-item **`designation` flag** decides bundled-into-infra vs. licensed (bundle finance/marketing + all MCP access now; the CRM is licensed). Preserves the lever to meter later.
-  - **Bring-your-own apps (Cuspr/Nuvola, any dev) pay smart infra only** — no software license; they run their own business model. AMOS as neutral smart infra.
-  - **Rev-share applies to the license margin, not infra.** Entitlement checks gate licensed products/engines.
+- **Billing model — the smart-infra stack** (layered; a seller quotes one number):
+  - **Smart infra — "the brain"** ($99 Starter / $349 Pro / $899 Compliance): the MCP operator + automated QA + audit trail + the **finance engine** built in. Every tenant pays this. AMOS rev.
+  - **Marketing engine (incl. the generic CRM)** — AMOS's flagship built product (HubSpot-replacement: campaigns, landing pages, automation + a full CRM). A **licensed upsell from $299/mo**, NOT in the base. AMOS rev.
+  - **Vertical modules** (construction, …) — **partner-built** add-ons layered on the marketing engine, **from $99/mo**, rev-split **30% AMOS / 70% partner** (the partner owns the domain layer + sells it; AMOS keeps a platform cut; shifts toward AMOS while AMOS is doing the building).
+  - **Full construction CRM ≈ $499/mo all-in** ($99 infra + $299 marketing/CRM + $99 construction module).
+  - **Bring-your-own apps (Cuspr/Nuvola, any dev) pay smart infra only** — no software license; their own model.
+  - Entitlement checks gate the marketing engine + each module. Keep the **designation lever** (bundle vs. charge) per new capability. Prices kept deliberately low — automation-driven cost-to-serve → undercut incumbents → volume (the North Star's "volume first").
 - **Acceptance:** a partner is onboarded to Connect; a child tenant's license line splits to the partner automatically (infra is not shared); attribution is queryable.
 
 ### P4 — Permission tiers / the fence  *(governance — makes self-mod sellable)*
